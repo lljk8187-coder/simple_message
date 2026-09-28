@@ -144,6 +144,9 @@ class Session:
         self.ticket = ticket
         self.private_key = private_key          # int scalar, or None
         self.ts_sign = ts_sign or ''
+        # Runtime note, set by server.pool_fill consumers: which account's
+        # materials this session borrowed when it owns none. Never persisted.
+        self.borrowed = ''
 
     @classmethod
     def from_dict(cls, d):

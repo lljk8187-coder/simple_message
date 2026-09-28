@@ -72,6 +72,27 @@ def pool_refresh(store, ticket, private_key, guard, source=''):
     store.pool_put(ticket, private_key, guard, source)
 
 
+def reborrows(store, hub):
+    """Re-apply pool materials to every account that runs on borrowed ones.
+
+    The pool changes whenever a fresh harvest or a material-bearing import
+    lands; sessions built earlier keep the old borrowed ticket until this runs,
+    and an expired borrowed ticket means silent send failures for those
+    accounts. Accounts that own their materials are never touched.
+    """
+    for row in store.list_accounts():
+        name = row['name']
+        fields = store.get_account(name) or {}
+        if fields.get('ticket') or fields.get('private_key') or _guard_present(fields):
+            continue                        # owns its materials — untouched
+        filled, source = pool_fill(store, fields)
+        if not source:
+            continue
+        sess = api.Session.from_dict(filled)
+        sess.borrowed = source
+        hub.attach(name, sess)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = 'tk-message-demo/1.0'
     protocol_version = 'HTTP/1.1'
@@ -231,6 +252,7 @@ class Handler(BaseHTTPRequestHandler):
             guard, tier = api.ticket_guard_headers(sess, '/v1/message/send') if sess else (None, None)
             a['write_tier'] = tier
             a['writable'] = guard is not None
+            a['write_borrowed'] = (getattr(sess, 'borrowed', '') or '') if sess else ''
             out.append(a)
         self._json({'accounts': out})
 
@@ -269,6 +291,7 @@ class Handler(BaseHTTPRequestHandler):
             'guard': guard_in or {}, 'ticket': body.get('ticket') or '',
             'private_key': private_key, 'ts_sign': body.get('ts_sign') or '',
         })
+        reborrows(self.store, self.hub)     # other borrowers pick up new pool materials
         borrowed_guard = fields['guard']
         if isinstance(borrowed_guard, str):
             try:
@@ -284,6 +307,7 @@ class Handler(BaseHTTPRequestHandler):
             guard=borrowed_guard, ticket=(fields['ticket'] or ''),
             private_key=fields['private_key'], ts_sign=(fields['ts_sign'] or ''),
         )
+        sess.borrowed = borrowed or ''
         self.store.save_account(name, sess, info)
         self.hub.attach(name, sess)
         try:
@@ -302,6 +326,8 @@ class Handler(BaseHTTPRequestHandler):
         row.pop('cookie', None)
         row['status'] = self.hub.status.get(name, {}).get('state', 'idle')
         row['stats'] = self.store.stats(name)
+        sess = self.hub.sessions.get(name)
+        row['write_borrowed'] = (getattr(sess, 'borrowed', '') or '') if sess else ''
         self._json(row)
 
     def h_drop_account(self, q, name):
@@ -461,10 +487,12 @@ class Handler(BaseHTTPRequestHandler):
         self.store.save_account(name, sess, info)
         self.hub.attach(name, sess)
         # A successful harvest produces a complete, fresh set of signing
-        # materials — remember them as the shared pool for cookie-only imports.
+        # materials — remember them as the shared pool for cookie-only imports,
+        # and hand the new materials to every account currently borrowing.
         pool_refresh(self.store, sess.ticket,
                      ('%064x' % sess.private_key) if sess.private_key else '',
                      sess.guard or {}, source=name)
+        reborrows(self.store, self.hub)
         try:
             self.hub.sync_conversations(name)
         except Exception as e:
