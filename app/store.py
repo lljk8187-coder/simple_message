@@ -250,6 +250,8 @@ class Store:
             for m in msgs:
                 if not m or not m.get('msg_id'):
                     continue
+                if m.get('kind') == 'command':
+                    continue    # session-control events are not chat bubbles
                 cur = self._db.execute(
                     'SELECT 1 FROM messages WHERE account=? AND msg_id=?',
                     (account, m['msg_id'])).fetchone()

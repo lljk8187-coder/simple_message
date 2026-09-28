@@ -266,6 +266,10 @@ def parse_message(entry, my_uid):
     micros = pb.one(it, 4) or 0
     millis = pb.one(it, 10) or (micros // 1000 if micros else 0)
     ext = pb.pairs(pb.all_of(it, 9))
+    # f8 can also carry session-control events ({"command_type":1,...}) instead of
+    # chat text. They travel the same stream, have no client_message_id, and used
+    # to land in the store as empty bubbles — tag them so they can be filtered.
+    kind = 'command' if 'command_type' in (j if isinstance(j, dict) else {}) else 'text'
     return {
         'msg_id': str(pb.one(it, 3) or ''),
         'conv_id': pb.text(pb.blob(it, 1)) or '',
@@ -273,6 +277,7 @@ def parse_message(entry, my_uid):
         'outgoing': str(sender) == str(my_uid),
         'text': body,
         'awe_type': awe,
+        'kind': kind,
         'ms': int(millis),
         'us': int(micros),
         'ext': ext,
