@@ -180,8 +180,8 @@
 
 <script>
 const $ = s => document.querySelector(s);
-let ACCOUNTS = [], ACCT = null, CONVS = [], CUR = null, MSGS = [], SEEN = new Set();
-let UNREAD = {}, LOADING = false, ES = null, POLL = null;
+let ACCOUNTS = [], ACCT = null, CONVS = [], CUR = null, SEEN = new Set();
+let UNREAD = {}, LOADING = false, ES = null, POLL = null, LAST_REQUESTED_US = null;
 
 function toast(m, err) {
   const t = $('#toast'); t.textContent = m; t.className = 'show';
@@ -242,7 +242,7 @@ function setStatus(state, detail){
 }
 async function switchAccount(name){
   if (ACCT === name) return;
-  ACCT = name; CONVS = []; CUR = null; MSGS = []; SEEN = new Set(); UNREAD = {};
+  ACCT = name; CONVS = []; CUR = null; SEEN = new Set(); UNREAD = {}; LAST_REQUESTED_US = null;
   const meta = ACCOUNTS.find(a => a.name === name);
   $('#who').textContent = meta ? ((meta.nickname||meta.username||'') + ' · ' + meta.uid) : '';
   $('#msgs').innerHTML = '<div class="empty">加载中…</div>';
@@ -301,7 +301,7 @@ function renderConvs(){
 // ------------------------------------------------------------------ messages
 async function openConv(c){
   if (!c) return;
-  CUR = c; MSGS = []; SEEN = new Set(); delete UNREAD[c.conv_id];
+  CUR = c; SEEN = new Set(); LAST_REQUESTED_US = null; delete UNREAD[c.conv_id];
   $('#chatTitle').textContent = c.peer_nickname || c.peer_unique || ('uid ' + c.peer_uid);
   $('#chatSub').textContent = `uid ${c.peer_uid} · short_id ${c.short_id}`;
   $('#text').disabled = $('#sendBtn').disabled = false;
@@ -321,49 +321,71 @@ async function loadMsgs(beforeUs){
     const prevH = box.scrollHeight, prevTop = box.scrollTop;
     const d = await jget(`/api/accounts/${encodeURIComponent(ACCT)}/messages?` + q);
     const frag = document.createDocumentFragment();
-    let lastKey = beforeUs ? null : (box.dataset.firstKey || null);
-    d.messages.forEach(m => { appendMsg(frag, m, beforeUs ? 'prepend' : 'append'); });
-    if (beforeUs) {
+    d.messages.forEach(m => appendMsg(frag, m));
+    if (beforeUs && d.messages.length) {
       box.insertBefore(frag, box.firstChild);
-      box.scrollTop = box.scrollHeight - prevH + prevTop;
+      box.scrollTop = box.scrollHeight - prevH + prevTop;   // keep the viewport put
     } else {
       box.appendChild(frag);
-      box.scrollTop = box.scrollHeight;
+      if (!beforeUs) box.scrollTop = box.scrollHeight;
     }
-    $('#histHint').textContent = d.messages.length ? '' : '没有更多历史';
+    rebuildDaySeps();
+    $('#histHint').textContent = beforeUs
+      ? (d.messages.length ? '' : '已经到最早了')
+      : '';
   } catch (e) {
     toast('消息加载失败：' + e.message, true);
   } finally { LOADING = false; }
 }
 const PENDING = {};   // client_message_id -> optimistic bubble awaiting confirmation
 
-function appendMsg(container, m, mode){
-  // If this is the server's echo of something we just sent, upgrade the bubble we
-  // already showed instead of adding a duplicate.
+// Message order is kept by the DOM itself, so the scroll handler reads the oldest
+// rendered message straight from it. (An earlier version tracked a separate array
+// and never updated it when prepending — which made "load older" refetch the same
+// page forever and look like history had run out.)
+function oldestLoadedUs(){
+  const first = $('#msgs').querySelector('.msg');
+  return first ? Number(first.dataset.us || 0) : 0;
+}
+
+function rebuildDaySeps(){
+  const box = $('#msgs');
+  box.querySelectorAll('.daysep').forEach(e => e.remove());
+  let last = null;
+  Array.from(box.children).forEach(el => {
+    if (!el.classList.contains('msg')) return;
+    const day = el.dataset.day;
+    if (day && day !== last) {
+      const sep = document.createElement('div');
+      sep.className = 'daysep';
+      sep.textContent = day;
+      box.insertBefore(sep, el);
+      last = day;
+    }
+  });
+}
+
+function appendMsg(container, m){
+  // server echo of something we just sent -> upgrade the bubble already on screen
   if (m.cid && PENDING[m.cid]) {
     const el = PENDING[m.cid];
     delete PENDING[m.cid];
     el.classList.remove('pending');
+    el.dataset.us = m.us;
+    el.dataset.ms = m.ms;
+    el.dataset.day = dayLabel(m.ms);
     const meta = el.querySelector('.meta');
     if (meta) meta.textContent = fmtTime(m.ms);
     SEEN.add(m.msg_id);
-    if (mode !== 'prepend') MSGS.push(m);
     return;
   }
   if (SEEN.has(m.msg_id)) return;
   SEEN.add(m.msg_id);
-  if (mode !== 'prepend') MSGS.push(m);
-  const day = dayLabel(m.ms);
-  const last = container.lastElementChild;
-  const lastDay = last && last.dataset ? last.dataset.day : null;
-  if (mode !== 'prepend' && day !== lastDay) {
-    const sep = document.createElement('div');
-    sep.className = 'daysep'; sep.textContent = day; sep.dataset.day = day;
-    container.appendChild(sep);
-  }
   const el = document.createElement('div');
   el.className = 'msg ' + (m.outgoing ? 'out' : 'in');
-  el.dataset.day = day;
+  el.dataset.day = dayLabel(m.ms);
+  el.dataset.us = m.us;
+  el.dataset.ms = m.ms;
   el.innerHTML = `<div class="bubble">${esc(m.text || '(空)')}</div>
                   <div class="meta">${fmtTime(m.ms)}</div>`;
   container.appendChild(el);
@@ -385,7 +407,7 @@ function onIncoming(e){
     const box = $('#msgs');
     const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
     const frag = document.createDocumentFragment();
-    e.messages.forEach(m => appendMsg(frag, m, 'append'));
+    e.messages.forEach(m => appendMsg(frag, m));
     box.appendChild(frag);
     if (atBottom) box.scrollTop = box.scrollHeight;
   } else {
@@ -463,10 +485,13 @@ window.addEventListener('keydown', e => { if (e.key === 'Escape') $('#modal').cl
 // scroll to top -> load older
 $('#msgs').addEventListener('scroll', () => {
   const box = $('#msgs');
-  if (box.scrollTop < 60 && MSGS.length && !LOADING) {
-    const oldest = MSGS[0];
-    if (oldest) loadMsgs(oldest.us);
-  }
+  if (box.scrollTop >= 60 || LOADING || !CUR) return;
+  const anchor = oldestLoadedUs();
+  // If the anchor has not moved since the last request, we are at the beginning:
+  // asking again would just repeat the same page.
+  if (!anchor || anchor === LAST_REQUESTED_US) return;
+  LAST_REQUESTED_US = anchor;
+  loadMsgs(anchor);
 });
 
 (async () => {
