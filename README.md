@@ -177,8 +177,15 @@ f7 = "1132b10:master"    f8 = { f<命令号>: 载荷 }    f9 = device_id    f11 
 | 会话列表 | 203 | 10001 | `/v2/message/get_by_user_init` | `{f1:0}` |
 | 历史消息 | 301 | 10007 | `/v1/message/get_by_conversation` | `{f1 会话id, f2:1, f3 short_id, f4:1, f5 锚点微秒, f6 条数}` |
 | 增量心跳 | 204 | 10040 | `/v1/message/get_by_user_combo` | `{f1:{f1:0, f2 游标, f3:50, f4:8}}` |
+| 陌生人列表 | 1001 | — | `/v1/stranger/get_conversation_list` | f8 内层 **f1000**：`{f1 cursor, f2 count, f3 show_total_unread}` |
 | 发送 | 100 | — | `/v1/message/send` | 见下 |
 | 用户资料 | — | — | `GET www.tiktok.com/tiktok/v1/im/user/profile/?aid=1988&user_ids=[...]` | 批量，JSON 返回 |
+
+**陌生人列表（1001）**：响应 f6 的内层 tag 也是 **f1000**（不是 1001）——
+`{f1 next_cursor, f2 has_more, f3 total_unread（消息请求未读总数）, f4 StrangerConversation[]}`。
+`300 v1/conversation/get_list` 是同义的老端点：即使按它自己的 proto 定义
+（`cursor/count/show_total_unread`）正确构造也恒被 200001 拒绝，**不要用**。
+两自有账号实测 `total_unread=0`、列表为空，与 web 端一致。
 
 **会话列表响应有两个平行数组**，用会话 id 关联：
 
