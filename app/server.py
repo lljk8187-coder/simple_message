@@ -66,8 +66,21 @@ def pool_fill(store, fields):
 
 def pool_refresh(store, ticket, private_key, guard, source=''):
     """Remember a complete set of signing materials as the shared pool, so the
-    next cookie-only import can send without running the harvest wizard itself."""
+    next cookie-only import can send without running the harvest wizard itself.
+
+    A partial incoming set must never clobber a more complete one — importing an
+    account that carries only a ticket would otherwise downgrade a tier-B pool
+    (ticket + key) to ticket-only and silently strip everyone's write ability.
+    """
+    def score(t, pk, g):
+        return (1 if t else 0) + (1 if pk else 0) + (1 if g else 0)
+
     if not (ticket or private_key or guard):
+        return
+    old = store.pool_get()
+    if old and score(ticket, private_key, guard) < score(
+            old.get('ticket'), old.get('private_key'),
+            _guard_present({'guard': old.get('guard')})):
         return
     store.pool_put(ticket, private_key, guard, source)
 
