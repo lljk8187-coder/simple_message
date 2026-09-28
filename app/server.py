@@ -255,13 +255,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({'error': 'unknown conversation (no short_id)'}, 404)
         result = api.send_message(self.client, sess, conv_id, conv['short_id'], text)
         if result.get('ok'):
-            # read-back is not instant on this API; let the poller pick it up
-            self.hub._last_msgs[name] = 0
+            # read-back is not instantaneous on this API, so poll this conversation
+            # hard for the next few seconds rather than waiting out a whole interval
+            self.hub.nudge(name, conv_id)
         self._json(result)
 
     def h_focus(self, q, name):
         if name in self.hub.sessions:
-            self.hub.focus[name] = (self._body().get('conv_id') or '')
+            conv_id = (self._body().get('conv_id') or '')
+            self.hub.nudge(name, conv_id)       # pull it now, don't wait for the tick
         self._json({'ok': True})
 
     def _require(self, name):

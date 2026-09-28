@@ -265,6 +265,7 @@ def parse_message(entry, my_uid):
     sender = pb.one(it, 7) or 0
     micros = pb.one(it, 4) or 0
     millis = pb.one(it, 10) or (micros // 1000 if micros else 0)
+    ext = pb.pairs(pb.all_of(it, 9))
     return {
         'msg_id': str(pb.one(it, 3) or ''),
         'conv_id': pb.text(pb.blob(it, 1)) or '',
@@ -274,7 +275,10 @@ def parse_message(entry, my_uid):
         'awe_type': awe,
         'ms': int(millis),
         'us': int(micros),
-        'ext': pb.pairs(pb.all_of(it, 9)),
+        'ext': ext,
+        # the id we generated when sending; lets a client match its own optimistic
+        # bubble against the message that eventually comes back from the server
+        'cid': ext.get('s:client_message_id') or '',
     }
 
 

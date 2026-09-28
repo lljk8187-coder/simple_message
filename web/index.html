@@ -58,6 +58,7 @@
           word-break:break-word}
   .msg.in .bubble{background:var(--in);border:1px solid var(--line);border-bottom-left-radius:4px}
   .msg.out .bubble{background:var(--out);color:var(--outfg);border-bottom-right-radius:4px}
+  .msg.pending .bubble{opacity:.55}
   .meta{font-size:11px;color:var(--fg3);margin-top:3px}
   .daysep{align-self:center;font-size:11.5px;color:var(--fg3);padding:6px 10px}
   .empty{margin:auto;color:var(--fg3);font-size:13px;text-align:center;padding:24px;line-height:1.9}
@@ -334,7 +335,21 @@ async function loadMsgs(beforeUs){
     toast('消息加载失败：' + e.message, true);
   } finally { LOADING = false; }
 }
+const PENDING = {};   // client_message_id -> optimistic bubble awaiting confirmation
+
 function appendMsg(container, m, mode){
+  // If this is the server's echo of something we just sent, upgrade the bubble we
+  // already showed instead of adding a duplicate.
+  if (m.cid && PENDING[m.cid]) {
+    const el = PENDING[m.cid];
+    delete PENDING[m.cid];
+    el.classList.remove('pending');
+    const meta = el.querySelector('.meta');
+    if (meta) meta.textContent = fmtTime(m.ms);
+    SEEN.add(m.msg_id);
+    if (mode !== 'prepend') MSGS.push(m);
+    return;
+  }
   if (SEEN.has(m.msg_id)) return;
   SEEN.add(m.msg_id);
   if (mode !== 'prepend') MSGS.push(m);
@@ -352,6 +367,17 @@ function appendMsg(container, m, mode){
   el.innerHTML = `<div class="bubble">${esc(m.text || '(空)')}</div>
                   <div class="meta">${fmtTime(m.ms)}</div>`;
   container.appendChild(el);
+}
+
+function appendOptimistic(text){
+  const box = $('#msgs');
+  if (!box) return null;
+  const el = document.createElement('div');
+  el.className = 'msg out pending';
+  el.innerHTML = `<div class="bubble">${esc(text)}</div><div class="meta">发送中…</div>`;
+  box.appendChild(el);
+  box.scrollTop = box.scrollHeight;
+  return el;
 }
 function onIncoming(e){
   const involve = CUR && e.conv_id === CUR.conv_id;
@@ -374,17 +400,24 @@ $('#sendform').onsubmit = async ev => {
   const text = $('#text').value.trim();
   if (!text || !CUR || !ACCT) return;
   $('#sendBtn').disabled = true;
+  $('#text').value = '';
+  const bubble = appendOptimistic(text);      // show it now, confirm it later
   try {
     const r = await jpost(`/api/accounts/${encodeURIComponent(ACCT)}/send`,
                           { conv_id: CUR.conv_id, text });
     if (r.ok) {
-      toast(`已发送 · 档位 ${r.tier || '?'} · 信任结果 ${r.guard_result ?? '?'}（回执稍后由同步补齐）`);
-      $('#text').value = '';
+      if (bubble) PENDING[r.client_message_id] = bubble;
+      toast(`已发送 · 档位 ${r.tier || '?'} · 信任结果 ${r.guard_result ?? '?'}`);
     } else {
+      if (bubble) bubble.remove();
+      $('#text').value = text;
       toast('发送被拒：' + (r.biz_msg || r.biz_code), true);
     }
-  } catch (e) { toast('发送失败：' + e.message, true); }
-  finally { $('#sendBtn').disabled = false; }
+  } catch (e) {
+    if (bubble) bubble.remove();
+    $('#text').value = text;
+    toast('发送失败：' + e.message, true);
+  } finally { $('#sendBtn').disabled = false; }
 };
 
 // ------------------------------------------------------------------ controls

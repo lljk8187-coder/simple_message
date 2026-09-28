@@ -29,6 +29,8 @@ DEFAULTS = {
     'default_device_id': '7689040904044463629',
     'list_interval': 60,           # seconds between conversation-list refreshes
     'msg_interval': 12,            # seconds between message polls
+    'focus_interval': 4,           # seconds between polls of the conversation on screen
+    'focus_page_size': 12,         # messages fetched per focus poll
     'poll_conversations': 8,       # how many recent conversations get polled
     'poll_page_size': 20,
     'access_log': True,

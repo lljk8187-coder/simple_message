@@ -66,6 +66,7 @@ class Hub:
         self.status = {}            # name -> {'state','detail','ts'}
         self._last_list = {}        # name -> monotonic ts
         self._last_msgs = {}
+        self._last_focus = {}
         self._stop = threading.Event()
         self._thread = None
 
@@ -131,9 +132,28 @@ class Hub:
             self._last_list[name] = now
             self.sync_conversations(name)
 
+        # The conversation currently on screen gets a much tighter loop — that is
+        # where a user actually notices latency. Everything else keeps the slow cadence.
+        focused = self.focus.get(name)
+        if focused and now - self._last_focus.get(name, 0) >= cfg['focus_interval']:
+            self._last_focus[name] = now
+            self.sync_conversation(name, focused, cfg['focus_page_size'])
+
         if now - self._last_msgs.get(name, 0) >= cfg['msg_interval']:
             self._last_msgs[name] = now
             self.sync_recent_messages(name)
+
+    def nudge(self, name, conv_id=None):
+        """Poll this account on the next tick, focused conversation first.
+
+        Called right after a send: the server needs a moment before the new
+        message is visible to reads, so waiting out the normal interval would add
+        a full cycle on top of that delay.
+        """
+        if conv_id:
+            self.focus[name] = conv_id
+        self._last_focus[name] = 0
+        self._last_msgs[name] = 0
 
     def sync_conversations(self, name):
         sess = self.sessions[name]
@@ -170,38 +190,51 @@ class Hub:
         except Exception as e:
             self._set_status(name, 'warn', 'profile lookup failed: %s' % e)
 
-    def sync_recent_messages(self, name):
-        """Poll the focused conversation first, then the most recent ones."""
+    def sync_conversation(self, name, conv_id, limit=None):
+        """Poll one conversation; safe to call directly from a request handler."""
+        convs = self.store.list_conversations(name)
+        row = next((c for c in convs if c['conv_id'] == conv_id), None)
+        if not row:
+            return []
+        return self._poll_conversation(name, row['conv_id'], row['short_id'],
+                                       limit or self.config['poll_page_size'])
+
+    def _poll_conversation(self, name, conv_id, short_id, limit):
         sess = self.sessions[name]
+        try:
+            msgs, _ = api.list_messages(self.client, sess, conv_id, short_id, limit=limit)
+        except Exception as e:
+            self._set_status(name, 'warn', 'message poll failed: %s' % e)
+            return []
+        fresh = self.store.save_messages(name, msgs)
+        if fresh:
+            self.store.save_conversations(name, [{
+                'conv_id': conv_id, 'short_id': short_id,
+                'peer_uid': api.peer_of(conv_id, sess.uid),
+                'updated_ms': max((m['ms'] for m in fresh), default=0),
+                'last': max(fresh, key=lambda m: m['ms']),
+            }])
+            self.bus.publish({'type': 'message', 'account': name,
+                              'conv_id': conv_id, 'messages': fresh})
+        return fresh
+
+    def sync_recent_messages(self, name):
+        """Round-robin the most recent conversations.
+
+        The focused conversation is skipped here — it already has its own faster
+        loop, and polling it twice per cycle would just double the requests.
+        """
         targets = []
         focused = self.focus.get(name)
-        if focused:
-            row = [c for c in self.store.list_conversations(name) if c['conv_id'] == focused]
-            if row:
-                targets.append({'conv_id': row[0]['conv_id'], 'short_id': row[0]['short_id']})
         for c in self.store.active_conversations(name, limit=self.config['poll_conversations']):
-            if all(t['conv_id'] != c['conv_id'] for t in targets):
-                targets.append(c)
-
+            if focused and c['conv_id'] == focused:
+                continue
+            targets.append(c)
         for t in targets:
             if self._stop.is_set():
                 return
-            try:
-                msgs, _ = api.list_messages(self.client, sess, t['conv_id'], t['short_id'],
-                                            limit=self.config['poll_page_size'])
-            except Exception as e:
-                self._set_status(name, 'warn', 'message poll failed: %s' % e)
-                continue
-            fresh = self.store.save_messages(name, msgs)
-            if fresh:
-                self.store.save_conversations(name, [{
-                    'conv_id': t['conv_id'], 'short_id': t['short_id'],
-                    'peer_uid': api.peer_of(t['conv_id'], sess.uid),
-                    'updated_ms': max((m['ms'] for m in fresh), default=0),
-                    'last': max(fresh, key=lambda m: m['ms']),
-                }])
-                self.bus.publish({'type': 'message', 'account': name,
-                                  'conv_id': t['conv_id'], 'messages': fresh})
+            self._poll_conversation(name, t['conv_id'], t['short_id'],
+                                    self.config['poll_page_size'])
             time.sleep(0.35)          # be gentle between conversations
 
     # ---------------------------------------------------------- one-shot ops
