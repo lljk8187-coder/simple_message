@@ -329,6 +329,59 @@ def list_conversations(client, sess):
     return convs, {'next_cursor': str(pb.one(payload, 3) or ''), 'meta': meta}
 
 
+def combo_poll(client, sess, cursor):
+    """cmd 204: the site's own incremental sync — and it is a real one.
+
+    Send the last cursor; the reply carries everything newer **plus per-
+    conversation unread counts** (measured: an hour-old cursor returned four
+    full message entries and a status blob; a current cursor returns a 117-byte
+    empty tick). Envelope: f8 → f204 → f1{f1:0, f2:cursor, f3:50, f4:8}.
+
+    Reply payload (inside f8 → f204):
+      f1      the incremental container: f2 = repeated message entries
+              (same shape as 301's), f5 = next cursor, f6 = poll interval,
+              f9 = repeated {f1 short_id, f4 conv_id, f5 unread, f6 total, f7 ts}
+      f5      next cursor (echo)
+
+    Returns (ok, new_cursor, interval, messages, unread_list).
+    """
+    inner = pb.vint(1, 0) + pb.vint(2, int(cursor)) + pb.vint(3, 50) + pb.vint(4, 8)
+    payload = pb.sub(1, inner)
+    body = envelope(204, payload, sess)
+    try:
+        _, raw, _ = client.post(IM_API + '/v1/message/get_by_user_combo',
+                                headers=_proto_headers(sess), body=body)
+    except Exception:
+        return False, cursor, None, [], []
+    fields, meta = unwrap(raw, 204)
+    if fields is None or meta.get('biz_code') != 0:
+        return False, cursor, None, [], []
+
+    messages, unread, interval = [], [], None
+    inc = pb.blob(fields, 1)
+    if inc:
+        it = pb.parse(inc)
+        for _, _, _, bl in pb.all_of(it, 2):
+            m = parse_message(bl, sess.uid)
+            if m and (m['conv_id'] or m['text'] or m['msg_id']):
+                messages.append(m)
+        v = pb.one(it, 6)
+        interval = int(v) if v else None
+        for _, _, _, bl in pb.all_of(it, 9):
+            u = pb.parse(bl)
+            if not u:
+                continue
+            unread.append({
+                'short_id': str(pb.one(u, 1) or ''),
+                'conv_id': pb.text(pb.blob(u, 4)) or '',
+                'unread': int(pb.one(u, 5) or 0),
+                'total': int(pb.one(u, 6) or 0),
+                'ts': int(pb.one(u, 7) or 0),
+            })
+    new_cursor = pb.one(fields, 5) or (messages[-1]['us'] if messages else cursor)
+    return True, int(new_cursor), interval, messages, unread
+
+
 def peer_of(conv_id, my_uid):
     """Conversation ids look like 0:1:<uidA>:<uidB>; the peer is the other one.
 

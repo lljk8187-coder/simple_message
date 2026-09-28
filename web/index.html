@@ -281,10 +281,28 @@ function dayLabel(ms){
   if(d.toDateString()===y.toDateString()) return '昨天';
   return d.getFullYear()+'/'+p2(d.getMonth()+1)+'/'+p2(d.getDate());
 }
-async function jget(u){ const r=await fetch(u); const j=await r.json().catch(()=>({error:'bad json'}));
+// ---------------------------------------------------------------- auth helper
+// When the server has an access_token configured it answers 401 for every /api
+// call. Ask once, keep it in localStorage, retry; EventSource can't send
+// headers, so it takes the token as a query parameter instead.
+let AUTH = localStorage.getItem('hub_token') || '';
+function authHeaders(){ return AUTH ? { 'Authorization': 'Bearer ' + AUTH } : {}; }
+async function needAuth(){
+  const t = prompt('此服务已开启访问鉴权，请输入 access_token：');
+  if (t === null) throw new Error('未提供 access_token');
+  AUTH = t.trim(); localStorage.setItem('hub_token', AUTH);
+  if (ES) { ES.close(); ES = null; }
+  connectEvents();
+}
+
+async function jget(u){ const r=await fetch(u,{headers:authHeaders()}); 
+  if(r.status===401){ await needAuth(); return jget(u); }
+  const j=await r.json().catch(()=>({error:'bad json'}));
   if(j.error) throw new Error(j.error + (j.detail? ' · '+j.detail : '')); return j; }
-async function jpost(u,b){ const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},
-  body:JSON.stringify(b||{})}); const j=await r.json().catch(()=>({error:'bad json'}));
+async function jpost(u,b){ const r=await fetch(u,{method:'POST',headers:Object.assign({'Content-Type':'application/json'},authHeaders()),
+  body:JSON.stringify(b||{})});
+  if(r.status===401){ await needAuth(); return jpost(u,b); }
+  const j=await r.json().catch(()=>({error:'bad json'}));
   if(j.error) throw new Error(j.error + (j.detail? ' · '+j.detail : '')); return j; }
 
 // ---------------------------------------------------------------- accounts
@@ -329,7 +347,7 @@ async function switchAccount(name){
 function hookEvents(){
   if (ES) { ES.close(); ES = null; }
   if (!ACCT) return;
-  ES = new EventSource('/api/events?account=' + encodeURIComponent(ACCT));
+  ES = new EventSource('/api/events?account=' + encodeURIComponent(ACCT) + (AUTH ? '&token=' + encodeURIComponent(AUTH) : ''));
   ES.onmessage = ev => {
     let e; try { e = JSON.parse(ev.data); } catch (_) { return; }
     if (e.type === 'status') setStatus(e.state, e.detail);

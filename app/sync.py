@@ -67,6 +67,8 @@ class Hub:
         self._last_list = {}        # name -> monotonic ts
         self._last_msgs = {}
         self._last_focus = {}
+        self._combo_cursor = {}     # name -> µs cursor from the 204 probe
+        self._probe_skips = {}      # name -> consecutive quiet probes
         self._stop = threading.Event()
         self._thread = None
 
@@ -141,6 +143,33 @@ class Hub:
 
         if now - self._last_msgs.get(name, 0) >= cfg['msg_interval']:
             self._last_msgs[name] = now
+            # The 204 combo IS the incremental protocol: one request per tick
+            # carries any newer messages plus per-conversation unread counts.
+            # Full re-reads stay as a safety net (every 10th quiet tick, plus
+            # whenever the probe fails).
+            ok, new_cursor, interval, messages, unread = api.combo_poll(
+                self.client, sess, self._combo_cursor.get(name) or
+                int(time.time() * 1_000_000) - 600_000_000)
+            if ok:
+                self._combo_cursor[name] = new_cursor
+                if unread:
+                    self.store.apply_unread(name, unread)
+                    self.bus.publish({'type': 'conversations', 'account': name})
+                if messages:
+                    self.store.save_messages(name, messages)
+                    grouped = {}
+                    for m in messages:
+                        grouped.setdefault(m['conv_id'], []).append(m)
+                    for conv_id, msgs in grouped.items():
+                        self.bus.publish({'type': 'message', 'account': name,
+                                          'conv_id': conv_id, 'messages': msgs})
+                    self.bus.publish({'type': 'conversations', 'account': name})
+                self._probe_skips[name] = 0
+                return
+            self._probe_skips[name] = self._probe_skips.get(name, 0) + 1
+            if self._probe_skips[name] < 10:
+                return
+            self._probe_skips[name] = 0
             self.sync_recent_messages(name)
 
     def nudge(self, name, conv_id=None):

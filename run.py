@@ -34,6 +34,10 @@ DEFAULTS = {
     'poll_conversations': 8,       # how many recent conversations get polled
     'poll_page_size': 20,
     'access_log': True,
+    # When set, every /api call (except /api/health and the static page) must
+    # present this token via `Authorization: Bearer <token>` or `?token=`.
+    # Empty by default: local use needs no auth; set it before exposing the port.
+    'access_token': '',
 }
 
 

@@ -93,6 +93,23 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
+
+        # Optional bearer auth. Static pages stay open so the browser can load
+        # the front end; everything under /api requires the token when one is
+        # configured. With no token configured (the default) this is a no-op.
+        token = self.config.get('access_token') or ''
+        if token and path.startswith('/api/') and path != '/api/health':
+            supplied = ''
+            auth = self.headers.get('Authorization') or ''
+            if auth.startswith('Bearer '):
+                supplied = auth[len('Bearer '):].strip()
+            if not supplied:
+                supplied = (query.get('token') or [''])[0]
+            if supplied != token:
+                self._json({'error': 'unauthorized'}, 401,
+                           extra={'WWW-Authenticate': 'Bearer'})
+                return
+
         for m, pattern, handler in self.ROUTES:
             if m != method:
                 continue

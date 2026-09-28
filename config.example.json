@@ -8,5 +8,6 @@
   "msg_interval": 12,
   "poll_conversations": 8,
   "poll_page_size": 20,
-  "access_log": true
+  "access_log": true,
+  "access_token": ""
 }

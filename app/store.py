@@ -186,6 +186,24 @@ class Store:
                      c.get('updated_ms') or 0, now, c.get('unread')))
             self._db.commit()
 
+    def apply_unread(self, account, unread_list):
+        """Authoritative unread counts pushed by the 204 combo (f9 entries).
+
+        Keyed on short_id with a conv_id fallback, because the server reports
+        both and older rows may predate a short_id.
+        """
+        with self._lock:
+            for u in unread_list:
+                if u.get('short_id'):
+                    self._db.execute(
+                        'UPDATE conversations SET unread=? WHERE account=? AND short_id=?',
+                        (u.get('unread'), account, u['short_id']))
+                if u.get('conv_id'):
+                    self._db.execute(
+                        'UPDATE conversations SET unread=? WHERE account=? AND conv_id=?',
+                        (u.get('unread'), account, u['conv_id']))
+            self._db.commit()
+
     def list_conversations(self, account):
         # NB: select columns explicitly. `c.*` plus `p.avatar AS peer_avatar` yields two
         # columns with the same name, and sqlite3.Row resolves that to the first (NULL).
