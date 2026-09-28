@@ -1,0 +1,252 @@
+"""SQLite persistence: accounts, conversations, messages.
+
+A single connection guarded by a lock keeps this dependency-free and good enough
+for a handful of accounts. Swap for a pool if it ever becomes a bottleneck.
+"""
+import json
+import os
+import sqlite3
+import threading
+import time
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS accounts (
+  name       TEXT PRIMARY KEY,
+  uid        TEXT NOT NULL,
+  username   TEXT,
+  nickname   TEXT,
+  avatar     TEXT,
+  region     TEXT,
+  cookie     TEXT,
+  device_id  TEXT,
+  ticket     TEXT,
+  guard      TEXT,
+  created_at INTEGER,
+  updated_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS conversations (
+  account     TEXT NOT NULL,
+  conv_id     TEXT NOT NULL,
+  short_id    TEXT,
+  peer_uid    TEXT,
+  peer_name   TEXT,
+  peer_avatar TEXT,
+  last_text   TEXT,
+  last_ms     INTEGER,
+  last_from_me INTEGER,
+  updated_ms  INTEGER,
+  synced_ms   INTEGER,
+  PRIMARY KEY (account, conv_id)
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+  account   TEXT NOT NULL,
+  conv_id   TEXT NOT NULL,
+  msg_id    TEXT NOT NULL,
+  sender    TEXT,
+  outgoing  INTEGER,
+  text      TEXT,
+  ms        INTEGER,
+  us        INTEGER,
+  awe_type  INTEGER,
+  cid       TEXT,
+  PRIMARY KEY (account, msg_id)
+);
+CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(account, conv_id, us);
+
+CREATE TABLE IF NOT EXISTS profiles (
+  account  TEXT NOT NULL,
+  uid      TEXT NOT NULL,
+  nickname TEXT,
+  unique_id TEXT,
+  avatar   TEXT,
+  fetched_ms INTEGER,
+  PRIMARY KEY (account, uid)
+);
+"""
+
+
+class Store:
+    def __init__(self, path):
+        os.makedirs(os.path.dirname(os.path.abspath(path)) or '.', exist_ok=True)
+        self._lock = threading.RLock()
+        self._db = sqlite3.connect(path, check_same_thread=False)
+        self._db.row_factory = sqlite3.Row
+        with self._lock:
+            self._db.executescript(SCHEMA)
+            self._db.commit()
+
+    # ------------------------------------------------------------ accounts
+
+    def save_account(self, name, sess, profile=None):
+        p = profile or {}
+        now = int(time.time() * 1000)
+        with self._lock:
+            self._db.execute(
+                """INSERT INTO accounts (name, uid, username, nickname, avatar, region,
+                       cookie, device_id, ticket, guard, created_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(name) DO UPDATE SET
+                     uid=excluded.uid, username=excluded.username, nickname=excluded.nickname,
+                     avatar=excluded.avatar, region=excluded.region, cookie=excluded.cookie,
+                     device_id=excluded.device_id, ticket=excluded.ticket, guard=excluded.guard,
+                     updated_at=excluded.updated_at""",
+                (name, sess.uid, sess.username, sess.nickname or p.get('nickname', ''),
+                 sess.avatar or p.get('avatar', ''), sess.region, sess.cookie,
+                 sess.device_id, sess.ticket, json.dumps(sess.guard or {}), now, now))
+            self._db.commit()
+
+    def get_account(self, name):
+        with self._lock:
+            row = self._db.execute('SELECT * FROM accounts WHERE name=?', (name,)).fetchone()
+        return dict(row) if row else None
+
+    def list_accounts(self):
+        with self._lock:
+            rows = self._db.execute(
+                'SELECT name, uid, username, nickname, avatar, region, updated_at '
+                'FROM accounts ORDER BY updated_at DESC').fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_account(self, name):
+        with self._lock:
+            for sql in ('DELETE FROM accounts WHERE name=?',
+                        'DELETE FROM conversations WHERE account=?',
+                        'DELETE FROM messages WHERE account=?',
+                        'DELETE FROM profiles WHERE account=?'):
+                self._db.execute(sql, (name,))
+            self._db.commit()
+
+    # ---------------------------------------------------------- profiles
+
+    def get_profiles(self, account):
+        with self._lock:
+            rows = self._db.execute('SELECT * FROM profiles WHERE account=?',
+                                    (account,)).fetchall()
+        return {r['uid']: dict(r) for r in rows}
+
+    def save_profiles(self, account, profiles):
+        now = int(time.time() * 1000)
+        with self._lock:
+            for uid, p in (profiles or {}).items():
+                self._db.execute(
+                    """INSERT INTO profiles (account, uid, nickname, unique_id, avatar, fetched_ms)
+                       VALUES (?,?,?,?,?,?)
+                       ON CONFLICT(account, uid) DO UPDATE SET
+                         nickname=excluded.nickname, unique_id=excluded.unique_id,
+                         avatar=excluded.avatar, fetched_ms=excluded.fetched_ms""",
+                    (account, uid, p.get('nickname', ''), p.get('unique_id', ''),
+                     p.get('avatar', ''), now))
+            self._db.commit()
+
+    # ----------------------------------------------------- conversations
+
+    def save_conversations(self, account, convs):
+        now = int(time.time() * 1000)
+        with self._lock:
+            for c in convs:
+                last = c.get('last') or {}
+                self._db.execute(
+                    """INSERT INTO conversations
+                         (account, conv_id, short_id, peer_uid, last_text, last_ms,
+                          last_from_me, updated_ms, synced_ms)
+                       VALUES (?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(account, conv_id) DO UPDATE SET
+                         short_id=excluded.short_id, peer_uid=excluded.peer_uid,
+                         last_text=COALESCE(excluded.last_text, conversations.last_text),
+                         last_ms=MAX(COALESCE(excluded.last_ms,0), COALESCE(conversations.last_ms,0)),
+                         last_from_me=COALESCE(excluded.last_from_me, conversations.last_from_me),
+                         updated_ms=excluded.updated_ms, synced_ms=excluded.synced_ms""",
+                    (account, c['conv_id'], c.get('short_id', ''), c.get('peer_uid', ''),
+                     last.get('text'), last.get('ms'), 1 if last.get('outgoing') else 0,
+                     c.get('updated_ms') or 0, now))
+            self._db.commit()
+
+    def list_conversations(self, account):
+        # NB: select columns explicitly. `c.*` plus `p.avatar AS peer_avatar` yields two
+        # columns with the same name, and sqlite3.Row resolves that to the first (NULL).
+        # ORDER BY last_ms, not updated_ms: the list payload reports the *same*
+        # updated_ms for every conversation, so ordering by it is meaningless.
+        with self._lock:
+            rows = self._db.execute(
+                """SELECT c.account, c.conv_id, c.short_id, c.peer_uid,
+                          c.last_text, c.last_ms, c.last_from_me, c.updated_ms, c.synced_ms,
+                          p.nickname  AS peer_nickname,
+                          p.unique_id AS peer_unique,
+                          p.avatar    AS peer_avatar
+                     FROM conversations c
+                     LEFT JOIN profiles p ON p.account = c.account AND p.uid = c.peer_uid
+                    WHERE c.account = ?
+                    ORDER BY COALESCE(c.last_ms, c.updated_ms, 0) DESC""",
+                (account,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def active_conversations(self, account, limit=6):
+        with self._lock:
+            rows = self._db.execute(
+                'SELECT conv_id, short_id FROM conversations WHERE account=? '
+                'ORDER BY COALESCE(last_ms, updated_ms, 0) DESC LIMIT ?',
+                (account, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+    def missing_profiles(self, account, limit=50):
+        with self._lock:
+            rows = self._db.execute(
+                """SELECT c.peer_uid FROM conversations c
+                   LEFT JOIN profiles p ON p.account=c.account AND p.uid=c.peer_uid
+                  WHERE c.account=? AND c.peer_uid<>'' AND p.uid IS NULL
+                  LIMIT ?""", (account, limit)).fetchall()
+        return [r['peer_uid'] for r in rows]
+
+    # ---------------------------------------------------------- messages
+
+    def save_messages(self, account, msgs):
+        """Insert messages; return the ones that were genuinely new."""
+        fresh = []
+        with self._lock:
+            for m in msgs:
+                if not m or not m.get('msg_id'):
+                    continue
+                cur = self._db.execute(
+                    'SELECT 1 FROM messages WHERE account=? AND msg_id=?',
+                    (account, m['msg_id'])).fetchone()
+                if cur:
+                    continue
+                self._db.execute(
+                    """INSERT OR IGNORE INTO messages
+                         (account, conv_id, msg_id, sender, outgoing, text, ms, us, awe_type, cid)
+                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (account, m.get('conv_id', ''), m['msg_id'], m.get('sender', ''),
+                     1 if m.get('outgoing') else 0, m.get('text', ''), m.get('ms') or 0,
+                     m.get('us') or 0, m.get('awe_type') or 0,
+                     (m.get('ext') or {}).get('s:client_message_id')))
+                fresh.append(m)
+            self._db.commit()
+        return fresh
+
+    def list_messages(self, account, conv_id, limit=30, before_us=None):
+        sql = ('SELECT * FROM messages WHERE account=? AND conv_id=?')
+        args = [account, conv_id]
+        if before_us:
+            sql += ' AND us < ?'
+            args.append(int(before_us))
+        sql += ' ORDER BY us DESC LIMIT ?'
+        args.append(int(limit))
+        with self._lock:
+            rows = self._db.execute(sql, args).fetchall()
+        return [dict(r) for r in reversed(rows)]
+
+    def has_messages(self, account, conv_id):
+        with self._lock:
+            row = self._db.execute('SELECT COUNT(1) AS n FROM messages WHERE account=? AND conv_id=?',
+                                   (account, conv_id)).fetchone()
+        return (row['n'] or 0) > 0
+
+    def stats(self, account):
+        with self._lock:
+            c = self._db.execute('SELECT COUNT(1) n FROM conversations WHERE account=?',
+                                 (account,)).fetchone()['n']
+            m = self._db.execute('SELECT COUNT(1) n FROM messages WHERE account=?',
+                                 (account,)).fetchone()['n']
+        return {'conversations': c, 'messages': m}

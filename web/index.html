@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tk-message-demo</title>
+<style>
+  :root{
+    --bg:#f4f5f7; --panel:#fff; --panel2:#fafbfc; --line:#e5e7eb; --fg:#111827;
+    --fg2:#6b7280; --fg3:#9ca3af; --accent:#2563eb; --accent-soft:#eff6ff;
+    --in:#fff; --out:#2563eb; --outfg:#fff; --r:12px;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{ --bg:#0f1115; --panel:#161a20; --panel2:#1b2027; --line:#272d36; --fg:#e8eaed;
+           --fg2:#9aa2ad; --fg3:#6b7280; --accent:#3b82f6; --accent-soft:#1a2333;
+           --in:#1e242c; --out:#2563eb; }
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{font:14px/1.6 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+       background:var(--bg);color:var(--fg);overflow:hidden}
+  header{height:54px;display:flex;align-items:center;gap:10px;padding:0 16px;
+         background:var(--panel);border-bottom:1px solid var(--line)}
+  .brand{font-weight:600;font-size:15px}
+  select,.btn{font:inherit;font-size:13px;padding:6px 10px;border-radius:8px;
+              border:1px solid var(--line);background:var(--panel2);color:var(--fg);cursor:pointer}
+  .btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  .btn:disabled{opacity:.5;cursor:default}
+  .dot{width:8px;height:8px;border-radius:50%;background:#9ca3af}
+  .dot.ok{background:#22c55e}.dot.warn{background:#f59e0b}.dot.error{background:#ef4444}
+  .spacer{flex:1}
+  main{display:flex;height:calc(100% - 54px)}
+  aside{width:320px;flex:0 0 320px;background:var(--panel);border-right:1px solid var(--line);
+        overflow-y:auto}
+  .conv{display:flex;gap:11px;padding:11px 14px;cursor:pointer;border-bottom:1px solid var(--line)}
+  .conv:hover{background:var(--panel2)}
+  .conv.active{background:var(--accent-soft)}
+  .avatar{width:40px;height:40px;flex:0 0 40px;border-radius:50%;overflow:hidden;
+          display:grid;place-items:center;font-size:13px;font-weight:600;color:#fff;
+          background:var(--accent)}
+  .avatar img{width:100%;height:100%;object-fit:cover}
+  .cbody{min-width:0;flex:1}
+  .ctop{display:flex;align-items:baseline;gap:6px}
+  .cname{font-weight:500;font-size:13.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .ctime{margin-left:auto;font-size:11px;color:var(--fg3);flex:0 0 auto}
+  .clast{font-size:12.5px;color:var(--fg2);white-space:nowrap;overflow:hidden;
+         text-overflow:ellipsis;margin-top:1px}
+  .unread{display:inline-block;min-width:17px;height:17px;line-height:17px;padding:0 5px;
+          border-radius:9px;background:#ef4444;color:#fff;font-size:11px;text-align:center;margin-left:6px}
+  section#chat{flex:1;display:flex;flex-direction:column;min-width:0;background:var(--bg)}
+  .chead{height:52px;display:flex;align-items:center;gap:10px;padding:0 16px;background:var(--panel);
+         border-bottom:1px solid var(--line)}
+  .ctitle{font-weight:500}.csub{font-size:11.5px;color:var(--fg3)}
+  #msgs{flex:1;overflow-y:auto;padding:18px;display:flex;flex-direction:column;gap:9px}
+  .msg{max-width:64%;display:flex;flex-direction:column}
+  .msg.in{align-self:flex-start}.msg.out{align-self:flex-end;align-items:flex-end}
+  .bubble{padding:8px 12px;border-radius:var(--r);font-size:13.5px;white-space:pre-wrap;
+          word-break:break-word}
+  .msg.in .bubble{background:var(--in);border:1px solid var(--line);border-bottom-left-radius:4px}
+  .msg.out .bubble{background:var(--out);color:var(--outfg);border-bottom-right-radius:4px}
+  .meta{font-size:11px;color:var(--fg3);margin-top:3px}
+  .daysep{align-self:center;font-size:11.5px;color:var(--fg3);padding:6px 10px}
+  .empty{margin:auto;color:var(--fg3);font-size:13px;text-align:center;padding:24px;line-height:1.9}
+  .empty code{background:var(--panel);border:1px solid var(--line);padding:1px 5px;border-radius:5px;
+              font-size:12px}
+  form#sendform{display:flex;gap:10px;padding:12px 16px;background:var(--panel);
+                border-top:1px solid var(--line)}
+  input#text{flex:1;font:inherit;font-size:13.5px;padding:9px 13px;border-radius:10px;
+             border:1px solid var(--line);background:var(--panel2);color:var(--fg);outline:none}
+  input#text:focus{border-color:var(--accent)}
+  #modal{position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;place-items:center;z-index:50}
+  #modal.show{display:grid}
+  .card{width:min(620px,92vw);max-height:88vh;overflow:auto;background:var(--panel);
+        border-radius:16px;padding:22px 24px;border:1px solid var(--line)}
+  .card h3{margin:0 0 4px;font-size:16px;font-weight:600}
+  .card p.hint{margin:4px 0 14px;font-size:12.5px;color:var(--fg2);line-height:1.8}
+  .field{margin-bottom:12px}
+  .field label{display:block;font-size:12.5px;color:var(--fg2);margin-bottom:5px}
+  textarea,input[type=text]{width:100%;font:13px/1.5 ui-monospace,Menlo,Consolas,monospace;
+            padding:9px 11px;border-radius:9px;border:1px solid var(--line);
+            background:var(--panel2);color:var(--fg);outline:none;resize:vertical}
+  textarea:focus,input[type=text]:focus{border-color:var(--accent)}
+  details summary{cursor:pointer;font-size:12.5px;color:var(--fg2);margin:10px 0}
+  .row{display:flex;gap:10px;justify-content:flex-end;margin-top:16px}
+  #toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%);background:#111827;color:#fff;
+         font-size:12.5px;padding:9px 16px;border-radius:9px;opacity:0;transition:opacity .2s;
+         pointer-events:none;z-index:60;max-width:80vw}
+  #toast.show{opacity:.94}
+  .topbar{display:flex;align-items:center;gap:8px;padding:10px 14px;border-bottom:1px solid var(--line)}
+</style>
+</head>
+<body>
+<header>
+  <span class="brand">tk-message-demo</span>
+  <span class="dot" id="statusDot" title="sync status"></span>
+  <select id="acctSel" style="min-width:170px"><option value="">（无账号）</option></select>
+  <button class="btn" id="btnSync">同步</button>
+  <span class="spacer"></span>
+  <span style="font-size:12px;color:var(--fg3)" id="who"></span>
+  <button class="btn primary" id="btnAdd">添加账号</button>
+</header>
+
+<main>
+  <aside>
+    <div class="topbar">
+      <input type="text" id="filter" placeholder="搜索会话 / 昵称" style="font-family:inherit;font-size:13px">
+    </div>
+    <div id="convs"></div>
+  </aside>
+  <section id="chat">
+    <div class="chead">
+      <div>
+        <div class="ctitle" id="chatTitle">选择一个会话</div>
+        <div class="csub" id="chatSub"></div>
+      </div>
+      <span class="spacer"></span>
+      <span class="csub" id="histHint"></span>
+    </div>
+    <div id="msgs"><div class="empty" id="welcome"></div></div>
+    <form id="sendform">
+      <input id="text" placeholder="输入消息，回车发送" autocomplete="off" disabled>
+      <button class="btn primary" type="submit" id="sendBtn" disabled>发送</button>
+    </form>
+  </section>
+</main>
+
+<div id="modal">
+  <div class="card">
+    <h3>添加账号</h3>
+    <p class="hint">
+      需要一个已登录的 <b>tiktok.com</b> 会话 cookie。在浏览器里打开 devtools →
+      Application/存储 → Cookies → <code>https://www.tiktok.com</code>，全选复制；
+      或从任意一个发往 <code>tiktok.com</code> 的请求里复制 <code>Cookie</code> 请求头。
+      必须包含 <code>sessionid</code>。
+    </p>
+    <div class="field">
+      <label>Cookie</label>
+      <textarea id="fCookie" rows="5" placeholder="tt_chain_token=…; sessionid=…; uid_tt=…"></textarea>
+    </div>
+    <div class="field">
+      <label>账号名（留空则用用户名）</label>
+      <input type="text" id="fName" placeholder="jakson">
+    </div>
+    <details>
+      <summary>高级：发送所需的 guard 头与 ticket（只读可不填）</summary>
+      <div class="field">
+        <label>device_id（默认沿用本机观测值）</label>
+        <input type="text" id="fDevice" placeholder="留空使用默认值">
+      </div>
+      <div class="field">
+        <label>ticket</label>
+        <input type="text" id="fTicket" placeholder="64 位十六进制">
+      </div>
+      <div class="field">
+        <label>tt-ticket-guard-public-key</label>
+        <input type="text" id="fPk">
+      </div>
+      <div class="field">
+        <label>tt-ticket-guard-client-data</label>
+        <textarea id="fCd" rows="3"></textarea>
+      </div>
+    </details>
+    <div class="row">
+      <button class="btn" id="btnCancel">取消</button>
+      <button class="btn primary" id="btnSave">验证并保存</button>
+    </div>
+  </div>
+</div>
+<div id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+let ACCOUNTS = [], ACCT = null, CONVS = [], CUR = null, MSGS = [], SEEN = new Set();
+let UNREAD = {}, LOADING = false, ES = null, POLL = null;
+
+function toast(m, err) {
+  const t = $('#toast'); t.textContent = m; t.className = 'show';
+  t.style.background = err ? '#b91c1c' : '#111827';
+  clearTimeout(t._h); t._h = setTimeout(() => t.className = '', 3200);
+}
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
+function p2(n){ return String(n).padStart(2,'0'); }
+function fmtTime(ms){
+  if(!ms) return '';
+  const d=new Date(ms), n=new Date();
+  return d.toDateString()===n.toDateString()
+    ? p2(d.getHours())+':'+p2(d.getMinutes())
+    : (d.getMonth()+1)+'-'+p2(d.getDate())+' '+p2(d.getHours())+':'+p2(d.getMinutes());
+}
+function dayLabel(ms){
+  const d=new Date(ms), n=new Date();
+  if(d.toDateString()===n.toDateString()) return '今天';
+  const y=new Date(n.getTime()-86400000);
+  if(d.toDateString()===y.toDateString()) return '昨天';
+  return d.getFullYear()+'/'+p2(d.getMonth()+1)+'/'+p2(d.getDate());
+}
+async function jget(u){ const r=await fetch(u); const j=await r.json().catch(()=>({error:'bad json'}));
+  if(j.error) throw new Error(j.error + (j.detail? ' · '+j.detail : '')); return j; }
+async function jpost(u,b){ const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify(b||{})}); const j=await r.json().catch(()=>({error:'bad json'}));
+  if(j.error) throw new Error(j.error + (j.detail? ' · '+j.detail : '')); return j; }
+
+// ---------------------------------------------------------------- accounts
+async function loadAccounts(select) {
+  const d = await jget('/api/accounts');
+  ACCOUNTS = d.accounts || [];
+  const sel = $('#acctSel');
+  sel.innerHTML = ACCOUNTS.length ? '' : '<option value="">（无账号）</option>';
+  ACCOUNTS.forEach(a => {
+    const o = document.createElement('option');
+    o.value = a.name;
+    o.textContent = (a.nickname || a.username || a.name) + ' · ' + a.uid.slice(-6);
+    sel.appendChild(o);
+  });
+  const want = select || ACCT || (ACCOUNTS[0] && ACCOUNTS[0].name);
+  if (want && ACCOUNTS.some(a => a.name === want)) { sel.value = want; await switchAccount(want); }
+  else { ACCT = null; renderWelcome(); }
+}
+function renderWelcome(){
+  $('#convs').innerHTML = '';
+  $('#msgs').innerHTML = '<div class="empty">还没有账号。<br>点右上角 <code>添加账号</code> 粘贴一个已登录的 cookie 即可开始。<br>' +
+    '<span style="font-size:12px;color:var(--fg3)">只读功能仅需 cookie；发送还需 guard 头与 ticket（可选填）。</span></div>';
+  $('#chatTitle').textContent = '选择一个会话';
+  $('#chatSub').textContent = '';
+  $('#text').disabled = $('#sendBtn').disabled = true;
+  setStatus('idle');
+}
+function setStatus(state, detail){
+  const d = $('#statusDot');
+  d.className = 'dot' + (state==='ok'?' ok':state==='warn'||state==='error'?' '+state:'');
+  d.title = (state||'idle') + (detail? ' · '+detail : '');
+}
+async function switchAccount(name){
+  if (ACCT === name) return;
+  ACCT = name; CONVS = []; CUR = null; MSGS = []; SEEN = new Set(); UNREAD = {};
+  const meta = ACCOUNTS.find(a => a.name === name);
+  $('#who').textContent = meta ? ((meta.nickname||meta.username||'') + ' · ' + meta.uid) : '';
+  $('#msgs').innerHTML = '<div class="empty">加载中…</div>';
+  hookEvents();
+  await loadConvs();
+}
+function hookEvents(){
+  if (ES) { ES.close(); ES = null; }
+  if (!ACCT) return;
+  ES = new EventSource('/api/events?account=' + encodeURIComponent(ACCT));
+  ES.onmessage = ev => {
+    let e; try { e = JSON.parse(ev.data); } catch (_) { return; }
+    if (e.type === 'status') setStatus(e.state, e.detail);
+    else if (e.type === 'conversations') loadConvs(true);
+    else if (e.type === 'message') onIncoming(e);
+  };
+  ES.onerror = () => setStatus('warn', 'event stream reconnecting');
+}
+
+// ------------------------------------------------------------ conversations
+async function loadConvs(quiet){
+  if (!ACCT) return;
+  try {
+    const d = await jget(`/api/accounts/${encodeURIComponent(ACCT)}/conversations`);
+    CONVS = d.conversations || [];
+    renderConvs();
+    if (!quiet && !CUR && CONVS.length) openConv(CONVS[0]);
+  } catch (e) { if (!quiet) toast('会话列表失败：' + e.message, true); }
+}
+function renderConvs(){
+  const kw = ($('#filter').value || '').trim().toLowerCase();
+  const box = $('#convs'); box.innerHTML = '';
+  const list = CONVS.filter(c => !kw ||
+    (c.peer_nickname||'').toLowerCase().includes(kw) ||
+    (c.peer_unique||'').toLowerCase().includes(kw) ||
+    (c.peer_uid||'').includes(kw) ||
+    (c.last_text||'').toLowerCase().includes(kw));
+  if (!list.length) { box.innerHTML = '<div class="empty">' + (kw ? '没有匹配的会话' : '暂无会话') + '</div>'; return; }
+  list.forEach(c => {
+    const name = c.peer_nickname || c.peer_unique || ('uid ' + c.peer_uid);
+    const el = document.createElement('div');
+    el.className = 'conv' + (CUR && CUR.conv_id === c.conv_id ? ' active' : '');
+    el.innerHTML =
+      `<div class="avatar">${c.peer_avatar ? `<img src="${esc(c.peer_avatar)}" alt="">` : esc(String(c.peer_uid).slice(-2))}</div>
+       <div class="cbody">
+         <div class="ctop"><span class="cname">${esc(name)}</span>
+           <span class="ctime">${fmtTime(c.last_ms || c.updated_ms)}</span></div>
+         <div class="clast">${c.last_from_me ? '我：' : ''}${esc(c.last_text || '(无消息)')}
+           ${UNREAD[c.conv_id] ? `<span class="unread">${UNREAD[c.conv_id]}</span>` : ''}</div>
+       </div>`;
+    el.onclick = () => openConv(c);
+    box.appendChild(el);
+  });
+}
+
+// ------------------------------------------------------------------ messages
+async function openConv(c){
+  if (!c) return;
+  CUR = c; MSGS = []; SEEN = new Set(); delete UNREAD[c.conv_id];
+  $('#chatTitle').textContent = c.peer_nickname || c.peer_unique || ('uid ' + c.peer_uid);
+  $('#chatSub').textContent = `uid ${c.peer_uid} · short_id ${c.short_id}`;
+  $('#text').disabled = $('#sendBtn').disabled = false;
+  $('#msgs').innerHTML = '<div class="empty">加载消息…</div>';
+  renderConvs();
+  jpost(`/api/accounts/${encodeURIComponent(ACCT)}/focus`, { conv_id: c.conv_id }).catch(()=>{});
+  await loadMsgs();
+}
+async function loadMsgs(beforeUs){
+  if (!ACCT || !CUR || LOADING) return;
+  LOADING = true;
+  const box = $('#msgs');
+  try {
+    const q = new URLSearchParams({ conv_id: CUR.conv_id, limit: 30 });
+    if (beforeUs) q.set('before_us', String(beforeUs));
+    if (!beforeUs) box.innerHTML = '';
+    const prevH = box.scrollHeight, prevTop = box.scrollTop;
+    const d = await jget(`/api/accounts/${encodeURIComponent(ACCT)}/messages?` + q);
+    const frag = document.createDocumentFragment();
+    let lastKey = beforeUs ? null : (box.dataset.firstKey || null);
+    d.messages.forEach(m => { appendMsg(frag, m, beforeUs ? 'prepend' : 'append'); });
+    if (beforeUs) {
+      box.insertBefore(frag, box.firstChild);
+      box.scrollTop = box.scrollHeight - prevH + prevTop;
+    } else {
+      box.appendChild(frag);
+      box.scrollTop = box.scrollHeight;
+    }
+    $('#histHint').textContent = d.messages.length ? '' : '没有更多历史';
+  } catch (e) {
+    toast('消息加载失败：' + e.message, true);
+  } finally { LOADING = false; }
+}
+function appendMsg(container, m, mode){
+  if (SEEN.has(m.msg_id)) return;
+  SEEN.add(m.msg_id);
+  if (mode !== 'prepend') MSGS.push(m);
+  const day = dayLabel(m.ms);
+  const last = container.lastElementChild;
+  const lastDay = last && last.dataset ? last.dataset.day : null;
+  if (mode !== 'prepend' && day !== lastDay) {
+    const sep = document.createElement('div');
+    sep.className = 'daysep'; sep.textContent = day; sep.dataset.day = day;
+    container.appendChild(sep);
+  }
+  const el = document.createElement('div');
+  el.className = 'msg ' + (m.outgoing ? 'out' : 'in');
+  el.dataset.day = day;
+  el.innerHTML = `<div class="bubble">${esc(m.text || '(空)')}</div>
+                  <div class="meta">${fmtTime(m.ms)}</div>`;
+  container.appendChild(el);
+}
+function onIncoming(e){
+  const involve = CUR && e.conv_id === CUR.conv_id;
+  if (involve) {
+    const box = $('#msgs');
+    const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
+    const frag = document.createDocumentFragment();
+    e.messages.forEach(m => appendMsg(frag, m, 'append'));
+    box.appendChild(frag);
+    if (atBottom) box.scrollTop = box.scrollHeight;
+  } else {
+    UNREAD[e.conv_id] = (UNREAD[e.conv_id] || 0) + (e.messages || []).length;
+  }
+  loadConvs(true);
+}
+
+// --------------------------------------------------------------------- send
+$('#sendform').onsubmit = async ev => {
+  ev.preventDefault();
+  const text = $('#text').value.trim();
+  if (!text || !CUR || !ACCT) return;
+  $('#sendBtn').disabled = true;
+  try {
+    const r = await jpost(`/api/accounts/${encodeURIComponent(ACCT)}/send`,
+                          { conv_id: CUR.conv_id, text });
+    if (r.ok) {
+      toast('已发送 · guard=' + (r.guard_result ?? '?') + '（回执稍后由同步补齐）');
+      $('#text').value = '';
+    } else {
+      toast('发送被拒：' + (r.biz_msg || r.biz_code), true);
+    }
+  } catch (e) { toast('发送失败：' + e.message, true); }
+  finally { $('#sendBtn').disabled = false; }
+};
+
+// ------------------------------------------------------------------ controls
+$('#acctSel').onchange = e => switchAccount(e.target.value);
+$('#filter').oninput = renderConvs;
+$('#btnSync').onclick = async () => {
+  if (!ACCT) return;
+  try { const d = await jpost(`/api/accounts/${encodeURIComponent(ACCT)}/sync`); toast('已同步 ' + (d.conversations||0) + ' 个会话'); }
+  catch (e) { toast('同步失败：' + e.message, true); }
+};
+$('#btnAdd').onclick = () => $('#modal').classList.add('show');
+$('#btnCancel').onclick = () => $('#modal').classList.remove('show');
+$('#btnSave').onclick = async () => {
+  const btn = $('#btnSave'); btn.disabled = true;
+  try {
+    const guard = {};
+    if ($('#fPk').value.trim()) guard['tt-ticket-guard-public-key'] = $('#fPk').value.trim();
+    if ($('#fCd').value.trim()) guard['tt-ticket-guard-client-data'] = $('#fCd').value.trim();
+    if (guard['tt-ticket-guard-public-key']) {
+      guard['tt-ticket-guard-version'] = '2';
+      guard['tt-ticket-guard-iteration-version'] = '0';
+      guard['tt-ticket-guard-web-version'] = '1';
+    }
+    const r = await jpost('/api/accounts', {
+      cookie: $('#fCookie').value.trim(),
+      name: $('#fName').value.trim(),
+      device_id: $('#fDevice').value.trim(),
+      ticket: $('#fTicket').value.trim(),
+      guard,
+    });
+    toast('已添加 ' + r.username + '（' + (r.writable ? '可读可写' : '仅只读') + '）');
+    $('#modal').classList.remove('show');
+    ['fCookie','fName','fTicket','fPk','fCd','fDevice'].forEach(id => $('#'+id).value = '');
+    ACCT = null;
+    await loadAccounts(r.name);
+  } catch (e) { toast('添加失败：' + e.message, true); }
+  finally { btn.disabled = false; }
+};
+window.addEventListener('keydown', e => { if (e.key === 'Escape') $('#modal').classList.remove('show'); });
+
+// scroll to top -> load older
+$('#msgs').addEventListener('scroll', () => {
+  const box = $('#msgs');
+  if (box.scrollTop < 60 && MSGS.length && !LOADING) {
+    const oldest = MSGS[0];
+    if (oldest) loadMsgs(oldest.us);
+  }
+});
+
+(async () => {
+  try { await loadAccounts(); } catch (e) { toast('读取账号失败：' + e.message, true); renderWelcome(); }
+  POLL = setInterval(() => { if (ACCT) loadConvs(true); }, 30000);
+})();
+</script>
+</body>
+</html>

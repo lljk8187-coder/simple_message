@@ -1,0 +1,12 @@
+{
+  "host": "127.0.0.1",
+  "port": 8788,
+  "proxy": null,
+  "data_dir": "data",
+  "default_device_id": "7689040904044463629",
+  "list_interval": 60,
+  "msg_interval": 12,
+  "poll_conversations": 8,
+  "poll_page_size": 20,
+  "access_log": true
+}

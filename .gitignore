@@ -1,0 +1,14 @@
+# runtime state — never commit
+data/
+config.json
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# editors / os
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
