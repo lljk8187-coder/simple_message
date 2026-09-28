@@ -10,6 +10,7 @@ import urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 from . import client as api
+from . import harvest
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'web')
 
@@ -22,6 +23,7 @@ class Handler(BaseHTTPRequestHandler):
     store = None
     client = None
     config = None
+    _pending = None     # harvest.Pending
 
     # ------------------------------------------------------------- helpers
 
@@ -44,8 +46,9 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
-    def _json(self, obj, code=200):
-        self._send(code, json.dumps(obj, ensure_ascii=False, default=str))
+    def _json(self, obj, code=200, extra=None):
+        self._send(code, json.dumps(obj, ensure_ascii=False, default=str),
+                   extra=extra)
 
     def _err(self, e, code=500):
         if isinstance(e, api.ApiError):
@@ -78,6 +81,11 @@ class Handler(BaseHTTPRequestHandler):
         ('POST', r'^/api/accounts/(?P<name>[^/]+)/send$', 'send'),
         ('POST', r'^/api/accounts/(?P<name>[^/]+)/focus$', 'focus'),
         ('GET', r'^/api/events$', 'events'),
+        ('GET', r'^/api/harvest$', 'harvest_get'),
+        ('POST', r'^/api/harvest$', 'harvest_post'),
+        ('DELETE', r'^/api/harvest$', 'harvest_clear'),
+        ('GET', r'^/api/harvest/script$', 'harvest_script'),
+        ('POST', r'^/api/harvest/apply$', 'harvest_apply'),
         ('GET', r'^/api/health$', 'health'),
     ]
 
@@ -110,6 +118,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         self._dispatch('DELETE')
+
+    def do_OPTIONS(self):
+        # /api/harvest is posted to from the TikTok page, so a Private Network
+        # Access preflight can land here even though the beacon itself is no-cors.
+        self._send(204, b'', 'text/plain', {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type',
+            'Access-Control-Allow-Private-Network': 'true',
+        })
 
     # -------------------------------------------------------------- handlers
 
@@ -266,6 +284,92 @@ class Handler(BaseHTTPRequestHandler):
             self.hub.nudge(name, conv_id)       # pull it now, don't wait for the tick
         self._json({'ok': True})
 
+    # ------------------------------------------------------- harvest (credentials)
+
+    CORS = {'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Private-Network': 'true'}
+
+    def h_harvest_script(self, q):
+        """The console script the user pastes into the signed-in TikTok page."""
+        base = 'http://' + (self.headers.get('Host') or '127.0.0.1:8788')
+        self._send(200, harvest.build_script(base),
+                   'text/plain; charset=utf-8', self.CORS)
+
+    def h_harvest_post(self, q):
+        """Receives the page's report. Text/plain body: a beacon cannot set JSON."""
+        payload = self._body()
+        if not isinstance(payload, dict) or not payload:
+            return self._json({'error': 'empty or unparseable payload'}, 400, self.CORS)
+        rec = self._pending.put(payload)
+        self._json({'ok': True, 'received_at': rec['received_at'],
+                    'summary': harvest.summarise(payload)}, extra=self.CORS)
+
+    def h_harvest_get(self, q):
+        rec = self._pending.get()
+        if not rec:
+            return self._json({'pending': None})
+        self._json({'pending': {'received_at': rec['received_at'],
+                                'summary': harvest.summarise(rec['payload']),
+                                'raw': rec['payload']}})
+
+    def h_harvest_clear(self, q):
+        self._pending.clear()
+        self._json({'ok': True})
+
+    def h_harvest_apply(self, q):
+        """Attach a harvest to an account, creating it if the cookie is supplied."""
+        rec = self._pending.get()
+        if not rec:
+            return self._json({'error': 'nothing has been harvested yet'}, 400)
+        p = rec['payload']
+        body = self._body()
+
+        name = (body.get('name') or '').strip()
+        cookie = ' '.join((body.get('cookie') or '').split())
+
+        existing = self.store.get_account(name) if name else None
+        prev = api.Session.from_dict(existing) if existing else None
+        if prev:
+            cookie = cookie or prev.cookie
+        if not cookie:
+            return self._json({
+                'error': 'a cookie is required — the session id is HttpOnly, so the page '
+                         'script cannot read it; paste it once here'}, 400)
+
+        private_key = None
+        key_text = (p.get('private_key') or '').strip()
+        if key_text:
+            try:
+                private_key = api.signing.parse_private_key(key_text)
+            except Exception as e:
+                return self._json({'error': 'harvested private key not understood: %s' % e}, 400)
+
+        info = api.verify_cookie(self.client, cookie)
+        if not name:
+            name = info['username'] or info['uid']
+
+        sess = api.Session(
+            cookie=cookie,
+            device_id=(body.get('device_id') or (prev.device_id if prev else '')
+                       or self.config['default_device_id']),
+            uid=info['uid'], username=info['username'], nickname=info['nickname'],
+            region=info['region'],
+            guard=(prev.guard if prev else {}),
+            ticket=(p.get('ticket') or (prev.ticket if prev else '')),
+            private_key=private_key or (prev.private_key if prev else None),
+            ts_sign=(p.get('ts_sign') or (prev.ts_sign if prev else '')),
+        )
+        self.store.save_account(name, sess, info)
+        self.hub.attach(name, sess)
+        try:
+            self.hub.sync_conversations(name)
+        except Exception as e:
+            self.hub._set_status(name, 'warn', 'initial sync failed: %s' % e)
+        _, tier = api.ticket_guard_headers(sess, '/v1/message/send')
+        self._pending.clear()
+        self._json({'ok': True, 'name': name, 'uid': info['uid'],
+                    'username': info['username'], 'write_tier': tier})
+
     def _require(self, name):
         if name not in self.hub.sessions:
             raise api.ApiError('account %r is not loaded' % name)
@@ -309,4 +413,5 @@ def create_server(host, port, hub, store, client, config):
     Handler.store = store
     Handler.client = client
     Handler.config = config
+    Handler._pending = harvest.Pending()
     return ThreadingHTTPServer((host, port), Handler)
