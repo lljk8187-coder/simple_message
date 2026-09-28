@@ -21,6 +21,8 @@ CREATE TABLE IF NOT EXISTS accounts (
   device_id  TEXT,
   ticket     TEXT,
   guard      TEXT,
+  private_key TEXT,
+  ts_sign    TEXT,
   created_at INTEGER,
   updated_at INTEGER
 );
@@ -75,26 +77,38 @@ class Store:
         self._db.row_factory = sqlite3.Row
         with self._lock:
             self._db.executescript(SCHEMA)
+            self._migrate()
             self._db.commit()
+
+    def _migrate(self):
+        """Add columns introduced after the first release, so an old hub.db keeps working."""
+        cols = {r['name'] for r in self._db.execute('PRAGMA table_info(accounts)')}
+        for name, ddl in (('private_key', 'TEXT'), ('ts_sign', 'TEXT')):
+            if name not in cols:
+                self._db.execute('ALTER TABLE accounts ADD COLUMN %s %s' % (name, ddl))
 
     # ------------------------------------------------------------ accounts
 
     def save_account(self, name, sess, profile=None):
         p = profile or {}
+        d = sess.to_dict()
         now = int(time.time() * 1000)
         with self._lock:
             self._db.execute(
                 """INSERT INTO accounts (name, uid, username, nickname, avatar, region,
-                       cookie, device_id, ticket, guard, created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                       cookie, device_id, ticket, guard, private_key, ts_sign,
+                       created_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(name) DO UPDATE SET
                      uid=excluded.uid, username=excluded.username, nickname=excluded.nickname,
                      avatar=excluded.avatar, region=excluded.region, cookie=excluded.cookie,
                      device_id=excluded.device_id, ticket=excluded.ticket, guard=excluded.guard,
+                     private_key=excluded.private_key, ts_sign=excluded.ts_sign,
                      updated_at=excluded.updated_at""",
                 (name, sess.uid, sess.username, sess.nickname or p.get('nickname', ''),
                  sess.avatar or p.get('avatar', ''), sess.region, sess.cookie,
-                 sess.device_id, sess.ticket, json.dumps(sess.guard or {}), now, now))
+                 sess.device_id, sess.ticket, json.dumps(sess.guard or {}),
+                 d['private_key'], d['ts_sign'], now, now))
             self._db.commit()
 
     def get_account(self, name):

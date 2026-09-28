@@ -134,8 +134,10 @@ class Handler(BaseHTTPRequestHandler):
             a['status'] = st.get('state', 'idle')
             a['status_detail'] = st.get('detail', '')
             a['stats'] = self.store.stats(a['name'])
-            a['writable'] = bool(self.hub.sessions.get(a['name']) and
-                                 self.hub.sessions[a['name']].guard)
+            sess = self.hub.sessions.get(a['name'])
+            guard, tier = api.ticket_guard_headers(sess, '/v1/message/send') if sess else (None, None)
+            a['write_tier'] = tier
+            a['writable'] = guard is not None
             out.append(a)
         self._json({'accounts': out})
 
@@ -147,6 +149,14 @@ class Handler(BaseHTTPRequestHandler):
         cookie = ' '.join(cookie.split())
         name = (body.get('name') or '').strip()
 
+        private_key = None
+        key_text = (body.get('private_key') or '').strip()
+        if key_text:
+            try:
+                private_key = api.signing.parse_private_key(key_text)
+            except Exception as e:
+                return self._json({'error': 'private key not understood: %s' % e}, 400)
+
         info = api.verify_cookie(self.client, cookie)
         if not name:
             name = info['username'] or info['uid']
@@ -156,6 +166,7 @@ class Handler(BaseHTTPRequestHandler):
             uid=info['uid'], username=info['username'], nickname=info['nickname'],
             region=info['region'],
             guard=body.get('guard') or {}, ticket=(body.get('ticket') or ''),
+            private_key=private_key, ts_sign=(body.get('ts_sign') or ''),
         )
         self.store.save_account(name, sess, info)
         self.hub.attach(name, sess)
@@ -163,8 +174,9 @@ class Handler(BaseHTTPRequestHandler):
             self.hub.sync_conversations(name)
         except Exception as e:
             self.hub._set_status(name, 'warn', 'initial sync failed: %s' % e)
+        _, tier = api.ticket_guard_headers(sess, '/v1/message/send') if sess else (None, None)
         self._json({'name': name, 'uid': info['uid'], 'username': info['username'],
-                    'writable': bool(sess.guard)})
+                    'write_tier': tier, 'writable': tier is not None})
 
     def h_account_detail(self, q, name):
         row = self.store.get_account(name)
@@ -228,8 +240,10 @@ class Handler(BaseHTTPRequestHandler):
     def h_send(self, q, name):
         self._require(name)
         sess = self.hub.sessions[name]
-        if not sess.guard:
-            return self._json({'error': 'this account has no guard headers; sending disabled'}, 400)
+        guard, tier = api.ticket_guard_headers(sess, '/v1/message/send')
+        if guard is None:
+            return self._json({'error': 'no write credentials for this account '
+                                        '(needs guard headers, or ticket + ts_sign + private key)'}, 400)
         body = self._body()
         conv_id = (body.get('conv_id') or '').strip()
         text = (body.get('text') or '').strip()

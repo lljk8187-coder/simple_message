@@ -4,6 +4,7 @@ Everything here was established empirically against a live session; see the
 project README for the field map. No signature is implemented because the read
 path needs none and the write path can reuse captured guard headers.
 """
+import base64
 import json
 import os
 import time
@@ -13,6 +14,7 @@ import urllib.request
 import uuid
 
 from . import proto as pb
+from . import signing
 
 IM_API = 'https://im-api.tiktok.com'
 WEB = 'https://www.tiktok.com'
@@ -117,10 +119,20 @@ class HttpClient:
 # ----------------------------------------------------------------- session
 
 class Session:
-    """One account's credentials plus the derived request headers."""
+    """One account's credentials plus the derived request headers.
+
+    Two ways to authenticate a write, in order of preference:
+
+      tier B — sign locally from `ticket` + `ts_sign` + `private_key`
+      tier A — replay the captured `guard` headers verbatim
+
+    Tier B survives longer and is not tied to one captured request; tier A needs
+    no key material at all. Reads need neither.
+    """
 
     def __init__(self, cookie, device_id, uid, username='', region='',
-                 guard=None, ticket='', nickname='', avatar=''):
+                 guard=None, ticket='', nickname='', avatar='',
+                 private_key=None, ts_sign=''):
         self.cookie = cookie
         self.device_id = str(device_id)
         self.uid = str(uid)
@@ -130,26 +142,37 @@ class Session:
         self.region = region
         self.guard = dict(guard or {})
         self.ticket = ticket
+        self.private_key = private_key          # int scalar, or None
+        self.ts_sign = ts_sign or ''
 
     @classmethod
     def from_dict(cls, d):
         guard = d.get('guard') or {}
-        if isinstance(guard, str):          # guard is stored as JSON text in SQLite
+        if isinstance(guard, str):              # guard is stored as JSON text in SQLite
             try:
                 guard = json.loads(guard) or {}
             except Exception:
                 guard = {}
+        key = d.get('private_key') or ''
+        if isinstance(key, str) and key:
+            try:
+                key = signing.parse_private_key(key)
+            except Exception:
+                key = None
         return cls(cookie=d.get('cookie') or '', device_id=d.get('device_id') or '',
                    uid=d.get('uid') or '', username=d.get('username') or '',
                    region=d.get('region') or '', guard=guard,
                    ticket=d.get('ticket') or '', nickname=d.get('nickname') or '',
-                   avatar=d.get('avatar') or '')
+                   avatar=d.get('avatar') or '', private_key=key or None,
+                   ts_sign=d.get('ts_sign') or '')
 
     def to_dict(self):
         return {'cookie': self.cookie, 'device_id': self.device_id, 'uid': self.uid,
                 'username': self.username, 'nickname': self.nickname,
                 'avatar': self.avatar, 'region': self.region, 'guard': self.guard,
-                'ticket': self.ticket}
+                'ticket': self.ticket,
+                'private_key': ('%064x' % self.private_key) if self.private_key else '',
+                'ts_sign': self.ts_sign}
 
     @property
     def ms_token(self):
@@ -370,8 +393,59 @@ def user_profiles(client, sess, uids):
 
 # --------------------------------------------------------------------- write
 
+def ts_sign_from_guard(sess):
+    """The companion token rides inside the captured client-data as base64 JSON.
+
+    Recovering it here means an account imported with only tier A material can be
+    upgraded to tier B just by adding a private key.
+    """
+    blob = (sess.guard or {}).get('tt-ticket-guard-client-data')
+    if not blob:
+        return ''
+    try:
+        return (json.loads(base64.b64decode(blob).decode('utf-8')) or {}).get('ts_sign') or ''
+    except Exception:
+        return ''
+
+
+def signable(sess):
+    return bool(sess.ticket and sess.private_key and (sess.ts_sign or ts_sign_from_guard(sess)))
+
+
+def ticket_guard_headers(sess, path, timestamp=None):
+    """Build `tt-ticket-guard-*` headers for `path`.
+
+    Returns (headers, tier). Tier B signs the request locally; tier A replays the
+    captured set. Tier A is bound to the path it was captured for, so a mismatch
+    is a real risk there — tier B has no such constraint.
+    """
+    ts_sign = sess.ts_sign or ts_sign_from_guard(sess)
+    if sess.private_key and sess.ticket and ts_sign:
+        ts = int(timestamp if timestamp is not None else time.time())
+        payload = ('ticket=%s&path=%s&timestamp=%d' % (sess.ticket, path, ts)).encode('utf-8')
+        der = signing.sign(payload, sess.private_key)
+        client_data = {
+            'ts_sign': ts_sign,
+            'req_content': 'ticket,path,timestamp',
+            'req_sign': base64.b64encode(der).decode('ascii'),
+            'timestamp': ts,
+        }
+        return {
+            'tt-ticket-guard-public-key':
+                base64.b64encode(signing.public_key_raw(sess.private_key)).decode('ascii'),
+            'tt-ticket-guard-client-data':
+                base64.b64encode(json.dumps(client_data, separators=(',', ':')).encode('utf-8')).decode('ascii'),
+            'tt-ticket-guard-version': '2',
+            'tt-ticket-guard-iteration-version': '0',
+            'tt-ticket-guard-web-version': '1',
+        }, 'B'
+    if sess.guard:
+        return dict(sess.guard), 'A'
+    return None, None
+
+
 def send_message(client, sess, conv_id, short_id, text):
-    """cmd 100. Tier A: reuse captured guard headers; no private key involved."""
+    """cmd 100. Signs locally when possible, otherwise replays captured headers."""
     cid = str(uuid.uuid4())
     ext = b''
     for k, v in (('s:client_message_id', cid), ('deprecated', cid),
@@ -383,7 +457,9 @@ def send_message(client, sess, conv_id, short_id, text):
                + pb.s(7, sess.ticket) + pb.s(8, cid))
     body = envelope(100, payload, sess, with_sub=False, feature=True)
     headers = _proto_headers(sess)
-    headers.update({k: v for k, v in (sess.guard or {}).items() if v})
+    guard, tier = ticket_guard_headers(sess, '/v1/message/send')
+    if guard:
+        headers.update(guard)
     query = ('?aid=1988&version_code=1.0.0&app_name=tiktok_web&device_platform=web_pc'
              '&msToken=' + urllib.parse.quote(sess.ms_token, safe=''))
     status, raw, resp_headers = client.post(IM_API + '/v1/message/send' + query,
@@ -400,6 +476,7 @@ def send_message(client, sess, conv_id, short_id, text):
         'biz_code': meta.get('biz_code'),
         'biz_msg': meta.get('biz_msg'),
         'guard_result': guard_result,
+        'tier': tier,
         'client_message_id': cid,
     }
 
