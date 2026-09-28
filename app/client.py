@@ -319,6 +319,10 @@ def list_conversations(client, sess):
             'peer_uid': peer_of(conv_id, sess.uid),
             'participants': parts,
             'updated_ms': int(pb.one(it, 13) or 0),
+            # server-side unread count (badge). Confirmed by diffing two snapshots
+            # around a single incoming message: 40 -> 41, exactly +1, on this and
+            # on v1/conversation/list (2006) which reports the identical value.
+            'unread': int(pb.one(it, 11) or 0),
             'last': newest.get(conv_id),
         })
     convs.sort(key=lambda c: c['updated_ms'], reverse=True)

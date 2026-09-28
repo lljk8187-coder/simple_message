@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS conversations (
   last_from_me INTEGER,
   updated_ms  INTEGER,
   synced_ms   INTEGER,
+  unread      INTEGER,
   PRIMARY KEY (account, conv_id)
 );
 
@@ -86,6 +87,13 @@ class Store:
         for name, ddl in (('private_key', 'TEXT'), ('ts_sign', 'TEXT')):
             if name not in cols:
                 self._db.execute('ALTER TABLE accounts ADD COLUMN %s %s' % (name, ddl))
+        ccols = {r['name'] for r in self._db.execute('PRAGMA table_info(conversations)')}
+        if 'unread' not in ccols:
+            self._db.execute('ALTER TABLE conversations ADD COLUMN unread INTEGER')
+            # conversations seen before this column existed have a meaningful count
+            # waiting on the server; 0 here would look authoritative until the next
+            # list sync, so start them at NULL (rendered as "unknown") instead.
+            self._db.execute('UPDATE conversations SET unread = NULL')
 
     # ------------------------------------------------------------ accounts
 
@@ -164,17 +172,18 @@ class Store:
                 self._db.execute(
                     """INSERT INTO conversations
                          (account, conv_id, short_id, peer_uid, last_text, last_ms,
-                          last_from_me, updated_ms, synced_ms)
-                       VALUES (?,?,?,?,?,?,?,?,?)
+                          last_from_me, updated_ms, synced_ms, unread)
+                       VALUES (?,?,?,?,?,?,?,?,?,?)
                        ON CONFLICT(account, conv_id) DO UPDATE SET
                          short_id=excluded.short_id, peer_uid=excluded.peer_uid,
                          last_text=COALESCE(excluded.last_text, conversations.last_text),
                          last_ms=MAX(COALESCE(excluded.last_ms,0), COALESCE(conversations.last_ms,0)),
                          last_from_me=COALESCE(excluded.last_from_me, conversations.last_from_me),
-                         updated_ms=excluded.updated_ms, synced_ms=excluded.synced_ms""",
+                         updated_ms=excluded.updated_ms, synced_ms=excluded.synced_ms,
+                         unread=COALESCE(excluded.unread, conversations.unread)""",
                     (account, c['conv_id'], c.get('short_id', ''), c.get('peer_uid', ''),
                      last.get('text'), last.get('ms'), 1 if last.get('outgoing') else 0,
-                     c.get('updated_ms') or 0, now))
+                     c.get('updated_ms') or 0, now, c.get('unread')))
             self._db.commit()
 
     def list_conversations(self, account):
@@ -186,6 +195,7 @@ class Store:
             rows = self._db.execute(
                 """SELECT c.account, c.conv_id, c.short_id, c.peer_uid,
                           c.last_text, c.last_ms, c.last_from_me, c.updated_ms, c.synced_ms,
+                          c.unread,
                           p.nickname  AS peer_nickname,
                           p.unique_id AS peer_unique,
                           p.avatar    AS peer_avatar

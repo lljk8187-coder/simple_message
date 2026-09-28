@@ -258,7 +258,7 @@
 <script>
 const $ = s => document.querySelector(s);
 let ACCOUNTS = [], ACCT = null, CONVS = [], CUR = null, SEEN = new Set();
-let UNREAD = {}, LOADING = false, ES = null, POLL = null, LAST_REQUESTED_US = null;
+let SEEN_BASE = {}, LOADING = false, ES = null, POLL = null, LAST_REQUESTED_US = null;
 
 function toast(m, err) {
   const t = $('#toast'); t.textContent = m; t.className = 'show';
@@ -319,7 +319,7 @@ function setStatus(state, detail){
 }
 async function switchAccount(name){
   if (ACCT === name) return;
-  ACCT = name; CONVS = []; CUR = null; SEEN = new Set(); UNREAD = {}; LAST_REQUESTED_US = null;
+  ACCT = name; CONVS = []; CUR = null; SEEN = new Set(); SEEN_BASE = {}; LAST_REQUESTED_US = null;
   const meta = ACCOUNTS.find(a => a.name === name);
   $('#who').textContent = meta ? ((meta.nickname||meta.username||'') + ' · ' + meta.uid) : '';
   $('#msgs').innerHTML = '<div class="empty">加载中…</div>';
@@ -360,6 +360,10 @@ function renderConvs(){
   if (!list.length) { box.innerHTML = '<div class="empty">' + (kw ? '没有匹配的会话' : '暂无会话') + '</div>'; return; }
   list.forEach(c => {
     const name = c.peer_nickname || c.peer_unique || ('uid ' + c.peer_uid);
+    // badge = server unread minus what was on screen when the user opened this
+    // conversation. We never send read receipts, so the server count alone would
+    // keep showing 41 forever; the baseline is the local "already seen" marker.
+    const u = Math.max(0, (c.unread || 0) - (SEEN_BASE[c.conv_id] || 0));
     const el = document.createElement('div');
     el.className = 'conv' + (CUR && CUR.conv_id === c.conv_id ? ' active' : '');
     el.innerHTML =
@@ -368,7 +372,7 @@ function renderConvs(){
          <div class="ctop"><span class="cname">${esc(name)}</span>
            <span class="ctime">${fmtTime(c.last_ms || c.updated_ms)}</span></div>
          <div class="clast">${c.last_from_me ? '我：' : ''}${esc(c.last_text || '(无消息)')}
-           ${UNREAD[c.conv_id] ? `<span class="unread">${UNREAD[c.conv_id]}</span>` : ''}</div>
+           ${u ? `<span class="unread">${u}</span>` : ''}</div>
        </div>`;
     el.onclick = () => openConv(c);
     box.appendChild(el);
@@ -378,7 +382,8 @@ function renderConvs(){
 // ------------------------------------------------------------------ messages
 async function openConv(c){
   if (!c) return;
-  CUR = c; SEEN = new Set(); LAST_REQUESTED_US = null; delete UNREAD[c.conv_id];
+  CUR = c; SEEN = new Set(); LAST_REQUESTED_US = null;
+  SEEN_BASE[c.conv_id] = c.unread || 0;   // opening = seen, locally
   $('#chatTitle').textContent = c.peer_nickname || c.peer_unique || ('uid ' + c.peer_uid);
   $('#chatSub').textContent = `uid ${c.peer_uid} · short_id ${c.short_id}`;
   $('#text').disabled = $('#sendBtn').disabled = false;
@@ -463,7 +468,8 @@ function appendMsg(container, m){
   el.dataset.day = dayLabel(m.ms);
   el.dataset.us = m.us;
   el.dataset.ms = m.ms;
-  el.innerHTML = `<div class="bubble">${esc(m.text || '(空)')}</div>
+  const body = m.text || (m.awe_type ? `[不支持的消息类型 ${m.awe_type}]` : '(空)');
+  el.innerHTML = `<div class="bubble">${esc(body)}</div>
                   <div class="meta">${fmtTime(m.ms)}</div>`;
   container.appendChild(el);
 }
@@ -488,7 +494,10 @@ function onIncoming(e){
     box.appendChild(frag);
     if (atBottom) box.scrollTop = box.scrollHeight;
   } else {
-    UNREAD[e.conv_id] = (UNREAD[e.conv_id] || 0) + (e.messages || []).length;
+    // optimistic badge bump; the next conversation-list sync will overwrite it
+    // with the authoritative server value
+    const hit = CONVS.find(x => x.conv_id === e.conv_id);
+    if (hit) { hit.unread = (hit.unread || 0) + (e.messages || []).length; }
   }
   loadConvs(true);
 }
