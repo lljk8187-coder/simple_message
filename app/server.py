@@ -15,6 +15,63 @@ from . import harvest
 WEB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'web')
 
 
+def _guard_present(fields):
+    """True when `guard` holds real headers. It may be a dict or JSON text — and
+    the DB stores accounts with no headers as '{}' (a truthy string), so parse
+    before trusting it."""
+    g = fields.get('guard')
+    if isinstance(g, str):
+        try:
+            g = json.loads(g) if g else {}
+        except Exception:
+            g = {}
+    return bool(g)
+
+
+def pool_fill(store, fields):
+    """Borrow signing materials from the shared pool for a cookie-only account.
+
+    Measured 2026-09-28: the server binds message identity to the cookie, not to
+    the ticket. An account that imported only a cookie sent successfully through
+    another account's ticket/headers — guard_result=1003 (degraded trust, the
+    pair is simply not the requester's own), message delivered, sender
+    attribution correct. Borrowing therefore makes "paste a cookie and go"
+    fully functional; per-account harvesting stays the path to result=0.
+
+    `fields` is a dict with optional guard / ticket / private_key entries (guard
+    may be a dict or canonical JSON text, matching both call sites). Missing
+    fields are filled individually, so a half-equipped account only borrows what
+    it lacks. Returns (fields, source) — source is non-empty only when something
+    was borrowed.
+    """
+    if all((fields.get('ticket'), fields.get('private_key'), _guard_present(fields))):
+        return fields, None            # complete own set — nothing to borrow
+    pool = store.pool_get()
+    if not pool or not (pool.get('ticket') or pool.get('private_key') or pool.get('guard')):
+        return fields, None
+    d = dict(fields)
+    borrowed = []
+    if not d.get('ticket'):
+        d['ticket'] = pool.get('ticket') or ''
+        borrowed.append('ticket')
+    if not d.get('private_key'):
+        d['private_key'] = pool.get('private_key') or ''
+        borrowed.append('private_key')
+    if not _guard_present(d):
+        d['guard'] = pool.get('guard') or ''
+        borrowed.append('guard')
+    return d, ('%s from %s' % ('+'.join(borrowed), pool.get('source') or 'pool')
+               if borrowed else None)
+
+
+def pool_refresh(store, ticket, private_key, guard, source=''):
+    """Remember a complete set of signing materials as the shared pool, so the
+    next cookie-only import can send without running the harvest wizard itself."""
+    if not (ticket or private_key or guard):
+        return
+    store.pool_put(ticket, private_key, guard, source)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = 'tk-message-demo/1.0'
     protocol_version = 'HTTP/1.1'
@@ -86,6 +143,7 @@ class Handler(BaseHTTPRequestHandler):
         ('DELETE', r'^/api/harvest$', 'harvest_clear'),
         ('GET', r'^/api/harvest/script$', 'harvest_script'),
         ('POST', r'^/api/harvest/apply$', 'harvest_apply'),
+        ('GET', r'^/api/pool$', 'pool'),
         ('GET', r'^/api/health$', 'health'),
     ]
 
@@ -195,13 +253,36 @@ class Handler(BaseHTTPRequestHandler):
         info = api.verify_cookie(self.client, cookie)
         if not name:
             name = info['username'] or info['uid']
+
+        # Keep the shared pool fresh with whatever materials came with this
+        # import, and borrow from it when the import carries none.
+        guard_in = body.get('guard')
+        if isinstance(guard_in, str):
+            try:
+                guard_in = json.loads(guard_in) if guard_in else {}
+            except Exception:
+                guard_in = {}
+        pool_refresh(self.store, body.get('ticket') or '', key_text,
+                     guard_in or {}, source=name or (info.get('username') or ''))
+
+        fields, borrowed = pool_fill(self.store, {
+            'guard': guard_in or {}, 'ticket': body.get('ticket') or '',
+            'private_key': private_key, 'ts_sign': body.get('ts_sign') or '',
+        })
+        borrowed_guard = fields['guard']
+        if isinstance(borrowed_guard, str):
+            try:
+                borrowed_guard = json.loads(borrowed_guard) if borrowed_guard else {}
+            except Exception:
+                borrowed_guard = {}
+
         sess = api.Session(
             cookie=cookie,
             device_id=(body.get('device_id') or self.config['default_device_id']),
             uid=info['uid'], username=info['username'], nickname=info['nickname'],
             region=info['region'],
-            guard=body.get('guard') or {}, ticket=(body.get('ticket') or ''),
-            private_key=private_key, ts_sign=(body.get('ts_sign') or ''),
+            guard=borrowed_guard, ticket=(fields['ticket'] or ''),
+            private_key=fields['private_key'], ts_sign=(fields['ts_sign'] or ''),
         )
         self.store.save_account(name, sess, info)
         self.hub.attach(name, sess)
@@ -211,7 +292,8 @@ class Handler(BaseHTTPRequestHandler):
             self.hub._set_status(name, 'warn', 'initial sync failed: %s' % e)
         _, tier = api.ticket_guard_headers(sess, '/v1/message/send') if sess else (None, None)
         self._json({'name': name, 'uid': info['uid'], 'username': info['username'],
-                    'write_tier': tier, 'writable': tier is not None})
+                    'write_tier': tier, 'writable': tier is not None,
+                    'borrowed_from': borrowed})
 
     def h_account_detail(self, q, name):
         row = self.store.get_account(name)
@@ -378,6 +460,11 @@ class Handler(BaseHTTPRequestHandler):
         )
         self.store.save_account(name, sess, info)
         self.hub.attach(name, sess)
+        # A successful harvest produces a complete, fresh set of signing
+        # materials — remember them as the shared pool for cookie-only imports.
+        pool_refresh(self.store, sess.ticket,
+                     ('%064x' % sess.private_key) if sess.private_key else '',
+                     sess.guard or {}, source=name)
         try:
             self.hub.sync_conversations(name)
         except Exception as e:
@@ -390,6 +477,16 @@ class Handler(BaseHTTPRequestHandler):
     def _require(self, name):
         if name not in self.hub.sessions:
             raise api.ApiError('account %r is not loaded' % name)
+
+    def h_pool(self, q):
+        """Status of the shared signing-material pool."""
+        pool = self.store.pool_get() or {}
+        has = bool(pool.get('ticket') or pool.get('private_key') or pool.get('guard'))
+        self._json({'has_materials': has, 'source': pool.get('source') or '',
+                    'updated_at': pool.get('updated_at'),
+                    'note': 'cookie-only imports borrow these materials; sends '
+                            'made with borrowed materials score guard_result=1003 '
+                            '(degraded trust, still delivered)'})
 
     # ------------------------------------------------------------------ SSE
 
