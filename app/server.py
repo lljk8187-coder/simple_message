@@ -498,6 +498,7 @@ class Handler(BaseHTTPRequestHandler):
         self.store.save_x_account(name, info['uid'], info['username'],
                                   info['name'], cookie_store)
         self.x_sessions[name] = sess
+        start_x_sync(self.hub, name, sess)
         self._json({'ok': True, 'name': name, 'uid': info['uid'],
                     'username': info['username'], 'platform': 'x'})
 
@@ -596,6 +597,49 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
 
+def start_x_sync(hub, name, sess, interval=10):
+    """Background poller for one X account: conversations() every `interval`
+    seconds; on change publish the same hub events the TikTok sync emits, so
+    the frontend refreshes identically. First pass only seeds the baseline
+    (no event flood on startup). Incoming messages are materialized through
+    history() and pushed as {'type':'message','account','conv_id','messages'}.
+    """
+    def loop():
+        last = {}          # conv_id -> last seen ms
+        seeded = False
+        while True:
+            try:
+                convs = sess.conversations()
+                incoming = []
+                changed = False
+                for c in convs:
+                    cid = c['conv_id']
+                    ms = c.get('last_ms') or 0
+                    prev = last.get(cid)
+                    if prev is not None and ms > prev and not c.get('last_from_me'):
+                        incoming.append((cid, prev))
+                    if prev is None or ms != prev:
+                        changed = True
+                    last[cid] = ms
+                if seeded and changed:
+                    hub.bus.publish({'type': 'conversations', 'account': name})
+                for cid, prev_ms in incoming:
+                    try:
+                        rows, _cursor = sess.history(cid)
+                        fresh = [m for m in rows if m['ms'] > prev_ms]
+                        if fresh:
+                            hub.bus.publish({'type': 'message', 'account': name,
+                                             'conv_id': cid, 'messages': fresh})
+                    except Exception:
+                        pass
+                seeded = True
+            except Exception:
+                pass
+            time.sleep(interval)
+
+    threading.Thread(target=loop, name='x-sync-%s' % name, daemon=True).start()
+
+
 def create_server(host, port, hub, store, client, config):
     Handler.hub = hub
     Handler.store = store
@@ -613,8 +657,10 @@ def create_server(host, port, hub, store, client, config):
                 continue
             full = store.get_account(row['name']) or {}
             try:
-                Handler.x_sessions[row['name']] = xconnect.XSession(
-                    full.get('cookie') or '', proxy=client.proxy).start()
+                xsess = xconnect.XSession(full.get('cookie') or '',
+                                          proxy=client.proxy).start()
+                Handler.x_sessions[row['name']] = xsess
+                start_x_sync(hub, row['name'], xsess)
             except Exception as e:
                 print('x session %s failed: %s' % (row['name'], e))
     except ImportError:
