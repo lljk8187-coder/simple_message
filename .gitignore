@@ -1,7 +1,7 @@
 # runtime state — never commit
 data/
-# 空库测试实例：内含真实登录凭据与浏览器 profile
-data-test/
+# 空库测试实例及其备份：内含真实登录凭据与浏览器 profile
+data-test*/
 config.json
 
 # python
