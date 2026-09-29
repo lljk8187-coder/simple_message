@@ -97,6 +97,7 @@ class Handler(BaseHTTPRequestHandler):
         ('GET', r'^/api/ig/accounts/(?P<name>[^/]+)/messages$', 'ig_messages'),
         ('POST', r'^/api/ig/accounts/(?P<name>[^/]+)/send$', 'ig_send'),
         ('POST', r'^/api/ig/accounts/(?P<name>[^/]+)/read$', 'ig_read'),
+        ('POST', r'^/api/batch/send$', 'batch_send'),
         ('POST', r'^/api/accounts/(?P<name>[^/]+)/focus$', 'focus'),
         ('GET', r'^/api/events$', 'events'),
         ('GET', r'^/api/harvest$', 'harvest_get'),
@@ -605,6 +606,73 @@ class Handler(BaseHTTPRequestHandler):
         if not peer:
             return self._json({'error': 'conv_id is required'}, 400)
         self._json(self._ig_sess(name).mark_seen(peer))
+
+    # ---------------------------------------------------- batch sending
+
+    def _send_one(self, account, conv_id, text):
+        """One message through the platform-dispatched path — the primitive
+        behind both the single-send endpoint and the batch sender. Returns a
+        result dict; never raises for expected failures."""
+        plat = self._platform(account)
+        if plat == 'x':
+            return self._x_sess(account).send(conv_id, text)
+        if plat == 'instagram':
+            return self._ig_sess(account).send(conv_id, text)
+        self._require(account)
+        sess = self.hub.sessions[account]
+        conv = next((c for c in self.store.list_conversations(account)
+                     if c['conv_id'] == conv_id), None)
+        if not conv or not conv['short_id']:
+            return {'ok': False, 'error': 'unknown conversation (no short_id)'}
+        result = api.send_message(self.client, sess, conv_id, conv['short_id'], text)
+        if result.get('ok'):
+            self.hub.nudge(account, conv_id)
+        return result
+
+    def h_batch_send(self, q):
+        """Send one text to many conversations, sequentially with a delay.
+
+        Deliberately rate-limited: identical content to many recipients is
+        the exact traffic shape every platform's risk control hunts for, so
+        the loop is serial, delays between sends, hard target cap, and
+        per-target results instead of fire-and-forget."""
+        body = self._body()
+        text = (body.get('text') or '').strip()
+        targets = body.get('targets') or []
+        if not text:
+            return self._json({'error': 'text is required'}, 400)
+        if not isinstance(targets, list) or not targets:
+            return self._json({'error': 'targets are required'}, 400)
+        if len(targets) > 50:
+            return self._json({'error': 'too many targets (max 50)'}, 400)
+        try:
+            delay = max(0, min(int(body.get('delay_ms') or 2000), 10000))
+        except (TypeError, ValueError):
+            delay = 2000
+        results = []
+        for i, t in enumerate(targets):
+            if not isinstance(t, dict):
+                continue
+            account = (t.get('account') or '').strip()
+            conv_id = (t.get('conv_id') or '').strip()
+            entry = {'account': account, 'conv_id': conv_id,
+                     'label': t.get('label') or ''}
+            if i and delay:
+                time.sleep(delay / 1000.0)
+            try:
+                entry.update(self._send_one(account, conv_id, text))
+            except api.ApiError as e:
+                entry.update({'ok': False, 'error': str(e)})
+            except Exception as e:
+                entry.update({'ok': False,
+                              'error': '%s: %s' % (type(e).__name__, e)})
+            if 'ok' not in entry:
+                entry['ok'] = False
+            results.append(entry)
+        sent = sum(1 for r in results if r.get('ok'))
+        self._json({'ok': sent == len(results) and bool(results),
+                    'sent': sent, 'failed': len(results) - sent,
+                    'results': results})
 
     def h_x_add(self, q):
         """Add an X (Twitter) account from pasted x.com cookies."""

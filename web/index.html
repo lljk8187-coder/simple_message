@@ -71,6 +71,10 @@
   input#text:focus{border-color:var(--accent)}
   #modal{position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;place-items:center;z-index:50}
   #modal.show{display:grid}
+  #batchModal{position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;place-items:center;z-index:50}
+  #batchModal.show{display:grid}
+  #batchList label{font-size:13px;color:var(--fg)}
+  #batchList .bgroup{font-weight:600;font-size:12.5px;margin:8px 0 2px;color:var(--fg2)}
   .card{width:min(620px,92vw);max-height:88vh;overflow:auto;background:var(--panel);
         border-radius:16px;padding:22px 24px;border:1px solid var(--line)}
   .card h3{margin:0 0 4px;font-size:16px;font-weight:600}
@@ -112,6 +116,7 @@
   <span style="font-size:12px;color:var(--fg3)" id="who"></span>
   <button class="btn" id="btnBrowserLogin" title="弹出浏览器窗口登录一次，材料自动收割入库">浏览器登录</button>
   <button class="btn" id="btnHarvest" title="从已登录的浏览器里取写入凭据">收割凭据</button>
+  <button class="btn" id="btnBatch" title="一条消息发送给多个会话（可跨平台）">批量发送</button>
   <button class="btn primary" id="btnAdd">添加账号</button>
 </header>
 
@@ -206,6 +211,25 @@
     <div class="row">
       <button class="btn" id="btnCancel">取消</button>
       <button class="btn primary" id="btnSave">验证并保存</button>
+    </div>
+  </div>
+</div>
+<div id="batchModal">
+  <div class="card">
+    <h3>批量发送</h3>
+    <p class="hint">
+      勾选要发送的会话（可跨账号、跨平台），写一份内容，逐条按间隔发送。
+      内容相同注意平台风控：建议只发给已知联系人，勿用于群发营销。
+    </p>
+    <div id="batchList" style="max-height:260px;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin-bottom:12px"></div>
+    <div class="field">
+      <label>内容</label>
+      <textarea id="batchText" rows="3" placeholder="要发送给所有勾选会话的同一条消息"></textarea>
+    </div>
+    <div id="batchOut" class="hint" style="margin-top:8px"></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px">
+      <button class="btn" id="btnBatchCancel">取消</button>
+      <button class="btn primary" id="btnBatchGo">发送</button>
     </div>
   </div>
 </div>
@@ -582,6 +606,66 @@ $('#btnSync').onclick = async () => {
   catch (e) { toast('同步失败：' + e.message, true); }
 };
 $('#btnAdd').onclick = () => $('#modal').classList.add('show');
+// ------------------------------------------------------------- batch send
+$('#btnBatch').onclick = async () => {
+  $('#batchModal').classList.add('show');
+  $('#batchOut').textContent = '';
+  const box = $('#batchList');
+  box.innerHTML = '<div class="hint">加载会话…</div>';
+  box.innerHTML = '';
+  let any = false;
+  for (const a of ACCOUNTS) {
+    let convs = [];
+    try {
+      convs = (await jget(`/api/accounts/${encodeURIComponent(a.name)}/conversations`)).conversations || [];
+    } catch (e) { /* account down — show as empty */ }
+    const tag = a.platform === 'x' ? 'X' : a.platform === 'instagram' ? 'IG' : 'TikTok';
+    const group = document.createElement('div');
+    group.className = 'bgroup';
+    group.textContent = `${a.name} · ${tag}${a.writable ? '' : '（不可发）'}`;
+    box.appendChild(group);
+    if (!convs.length) {
+      group.insertAdjacentHTML('beforeend', '<div class="hint" style="margin:0 0 4px 12px">无会话</div>');
+      continue;
+    }
+    convs.forEach(c => {
+      any = true;
+      const row = document.createElement('label');
+      row.style.cssText = 'display:flex;gap:7px;align-items:center;padding:3px 0 3px 12px;cursor:' + (a.writable ? 'pointer' : 'not-allowed');
+      row.innerHTML =
+        `<input type="checkbox" data-account="${esc(a.name)}" data-conv="${esc(c.conv_id)}"` +
+        ` data-label="${esc(c.peer_nickname || c.peer_unique || ('uid ' + c.peer_uid))}" ${a.writable ? '' : 'disabled'}>` +
+        `<span>${esc(c.peer_nickname || c.peer_unique || ('uid ' + c.peer_uid))}` +
+        ` <span class="hint">${esc((c.last_text || '').slice(0, 28))}</span></span>`;
+      box.appendChild(row);
+    });
+  }
+  if (!any) box.insertAdjacentHTML('beforeend', '<div class="hint">所有账号都没有可发送的会话</div>');
+};
+$('#btnBatchCancel').onclick = () => $('#batchModal').classList.remove('show');
+$('#btnBatchGo').onclick = async () => {
+  const targets = [...$('#batchList').querySelectorAll('input:checked')]
+    .map(i => ({ account: i.dataset.account, conv_id: i.dataset.conv, label: i.dataset.label }));
+  const text = $('#batchText').value.trim();
+  if (!targets.length) { toast('先勾选要发送的会话', true); return; }
+  if (!text) { toast('先输入要发送的内容', true); return; }
+  if (!confirm(`将向 ${targets.length} 个会话逐条发送相同内容，继续？`)) return;
+  const btn = $('#btnBatchGo'); btn.disabled = true;
+  $('#batchOut').textContent = `发送中（${targets.length} 条，逐条间隔限速）…`;
+  try {
+    const r = await jpost('/api/batch/send', { targets, text });
+    const lines = r.results.map(x =>
+      `${x.ok ? '✓' : '✗'} ${x.account} → ${x.label || x.conv_id}` +
+      (x.ok ? '' : `（${x.error || x.biz_msg || '失败'}）`));
+    $('#batchOut').innerHTML =
+      `完成：成功 ${r.sent} / 失败 ${r.failed}<br>` + lines.map(esc).join('<br>');
+    toast(`批量发送：成功 ${r.sent}，失败 ${r.failed}`, r.failed > 0);
+    $('#batchText').value = '';
+    if (ACCT) loadConvs(true);
+  } catch (e) {
+    $('#batchOut').textContent = '发送失败：' + e.message;
+  } finally { btn.disabled = false; }
+};
 $('#fPlat').onchange = () => {
   const v = $('#fPlat').value;
   const isX = v === 'x', isIG = v === 'instagram';
