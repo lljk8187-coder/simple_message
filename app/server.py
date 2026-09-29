@@ -27,6 +27,8 @@ class Handler(BaseHTTPRequestHandler):
     _pending = None     # harvest.Pending
     login_flow = None   # login_browser.BrowserLogin
     x_sessions = {}     # name -> xconnect.XSession (platform 'x')
+    ig_sessions = {}    # name -> igconnect.IGSession (platform 'instagram')
+    ig_logins = {}      # username -> igconnect.IGLogin (interactive login in flight)
 
     # ------------------------------------------------------------- helpers
 
@@ -88,6 +90,13 @@ class Handler(BaseHTTPRequestHandler):
         ('GET', r'^/api/x/accounts/(?P<name>[^/]+)/conversations$', 'x_conversations'),
         ('GET', r'^/api/x/accounts/(?P<name>[^/]+)/messages$', 'x_messages'),
         ('POST', r'^/api/x/accounts/(?P<name>[^/]+)/send$', 'x_send'),
+        ('POST', r'^/api/ig/add$', 'ig_add'),
+        ('POST', r'^/api/ig/code$', 'ig_code'),
+        ('GET', r'^/api/ig/state$', 'ig_state'),
+        ('GET', r'^/api/ig/accounts/(?P<name>[^/]+)/conversations$', 'ig_conversations'),
+        ('GET', r'^/api/ig/accounts/(?P<name>[^/]+)/messages$', 'ig_messages'),
+        ('POST', r'^/api/ig/accounts/(?P<name>[^/]+)/send$', 'ig_send'),
+        ('POST', r'^/api/ig/accounts/(?P<name>[^/]+)/read$', 'ig_read'),
         ('POST', r'^/api/accounts/(?P<name>[^/]+)/focus$', 'focus'),
         ('GET', r'^/api/events$', 'events'),
         ('GET', r'^/api/harvest$', 'harvest_get'),
@@ -185,6 +194,13 @@ class Handler(BaseHTTPRequestHandler):
                 a['write_tier'] = 'X'
                 out.append(a)
                 continue
+            if a['platform'] == 'instagram':
+                a['status'] = 'ok' if a['name'] in self.ig_sessions else 'down'
+                a['stats'] = {'conversations': 0, 'messages': 0}
+                a['writable'] = a['name'] in self.ig_sessions
+                a['write_tier'] = 'IG'
+                out.append(a)
+                continue
             st = self.hub.status.get(a['name'], {})
             a['status'] = st.get('state', 'idle')
             a['status_detail'] = st.get('detail', '')
@@ -262,14 +278,20 @@ class Handler(BaseHTTPRequestHandler):
         self._json({'ok': True, 'conversations': len(convs), 'meta': meta.get('meta')})
 
     def h_conversations(self, q, name):
-        if self._platform(name) == 'x':
+        plat = self._platform(name)
+        if plat == 'x':
             return self.h_x_conversations(q, name)
+        if plat == 'instagram':
+            return self.h_ig_conversations(q, name)
         self._require(name)
         self._json({'conversations': self.store.list_conversations(name)})
 
     def h_messages(self, q, name):
-        if self._platform(name) == 'x':
+        plat = self._platform(name)
+        if plat == 'x':
             return self.h_x_messages(q, name)
+        if plat == 'instagram':
+            return self.h_ig_messages(q, name)
         self._require(name)
         conv_id = (q.get('conv_id') or [''])[0]
         if not conv_id:
@@ -305,8 +327,11 @@ class Handler(BaseHTTPRequestHandler):
                     'conversation': conv})
 
     def h_send(self, q, name):
-        if self._platform(name) == 'x':
+        plat = self._platform(name)
+        if plat == 'x':
             return self.h_x_send(q, name)
+        if plat == 'instagram':
+            return self.h_ig_send(q, name)
         self._require(name)
         sess = self.hub.sessions[name]
         guard, tier = api.ticket_guard_headers(sess, '/v1/message/send')
@@ -336,9 +361,12 @@ class Handler(BaseHTTPRequestHandler):
         the effect lands on the peer's side as the "seen" mark — the local
         unread counters this hub displays stay frontend-owned.
         """
-        if self._platform(name) == 'x':
+        plat = self._platform(name)
+        if plat == 'x':
             return self._json({'ok': False,
                                'skipped': 'X read receipts not supported yet'})
+        if plat == 'instagram':
+            return self.h_ig_read(q, name)
         self._require(name)
         sess = self.hub.sessions[name]
         body = self._body()
@@ -463,6 +491,120 @@ class Handler(BaseHTTPRequestHandler):
     def _platform(self, name):
         row = self.store.get_account(name) or {}
         return row.get('platform') or 'tiktok'
+
+    # ----------------------------------------------- platform: IG dispatch
+
+    def _ig_sess(self, name):
+        sess = self.ig_sessions.get(name)
+        if not sess:
+            raise api.ApiError('Instagram session %r is not loaded' % name)
+        return sess
+
+    def h_ig_add(self, q):
+        """Two-phase Instagram login: this starts the background attempt;
+        when Instagram draws a challenge the hub waits for /api/ig/code."""
+        body = self._body()
+        username = (body.get('username') or '').strip()
+        password = (body.get('password') or '').strip()
+        if not username or not password:
+            return self._json({'error': 'username and password are required'}, 400)
+        name = (body.get('name') or '').strip() or username
+        prev = self.store.get_account(name)
+        if prev and (prev.get('platform') or 'tiktok') != 'instagram':
+            return self._json({'error': 'name %r is taken by a %s account'
+                               % (name, prev.get('platform') or 'tiktok')}, 409)
+        pending = self.ig_logins.get(username)
+        if pending and pending.phase in ('starting', 'challenge', 'twofa', 'verifying'):
+            return self._json({'started': True, 'state': pending.state()})
+        try:
+            from . import igconnect
+            login = igconnect.IGLogin(username, password, proxy=self.client.proxy)
+        except ImportError:
+            return self._json({'error': 'igconnect unavailable'}, 500)
+        login.hub_name = name
+        self.ig_logins[username] = login
+        threading.Thread(target=self._ig_login_thread, args=(login, name),
+                         daemon=True).start()
+        return self._json({'started': True, 'username': username})
+
+    def _ig_login_thread(self, login, name):
+        try:
+            cl = login.run()
+        except Exception:
+            return                              # phase='error' already set
+        try:
+            settings = cl.get_settings()
+            info = {'uid': str(cl.user_id or ''), 'username': cl.username or '',
+                    'name': ''}
+            try:
+                me = cl.account_info()
+                info['uid'] = str(me.pk)
+                info['name'] = me.full_name or ''
+                info['username'] = me.username or info['username']
+            except Exception:
+                pass
+            cookie_store = json.dumps({'settings': settings,
+                                       'password': login.password,
+                                       'username': info['username']})
+            self.store.save_ig_account(name, info['uid'], info['username'],
+                                       info['name'], cookie_store)
+            from . import igconnect
+            sess = igconnect.IGSession(settings, info['username'],
+                                       login.password, proxy=self.client.proxy)
+            self.ig_sessions[name] = sess
+            start_x_sync(self.hub, name, sess, interval=20)
+        except Exception as e:
+            with login._lock:
+                login.phase = 'error'
+                login.detail = 'post-login setup failed: %s' % e
+
+    def h_ig_state(self, q):
+        username = (q.get('username') or [''])[0]
+        login = self.ig_logins.get(username)
+        if not login:
+            return self._json({'error': 'no login in progress for %r' % username}, 404)
+        st = login.state()
+        st['name'] = getattr(login, 'hub_name', username)
+        return self._json(st)
+
+    def h_ig_code(self, q):
+        body = self._body()
+        username = (body.get('username') or '').strip()
+        code = (body.get('code') or '').strip()
+        login = self.ig_logins.get(username)
+        if not login:
+            return self._json({'error': 'no login in progress for %r' % username}, 404)
+        if login.phase not in ('challenge', 'twofa'):
+            return self._json({'error': 'not waiting for a code (phase=%s)'
+                               % login.phase}, 400)
+        login.submit_code(code)
+        return self._json({'ok': True, 'state': login.state()})
+
+    def h_ig_conversations(self, q, name):
+        convs = self._ig_sess(name).conversations()
+        self._json({'conversations': convs})
+
+    def h_ig_messages(self, q, name):
+        peer = (q.get('conv_id') or [''])[0]
+        if not peer:
+            return self._json({'error': 'conv_id is required'}, 400)
+        limit = int((q.get('limit') or ['30'])[0])
+        self._json({'messages': self._ig_sess(name).history(peer, amount=limit)})
+
+    def h_ig_send(self, q, name):
+        body = self._body()
+        peer = (body.get('conv_id') or '').strip()
+        text = (body.get('text') or '').strip()
+        if not peer or not text:
+            return self._json({'error': 'conv_id and text are required'}, 400)
+        self._json(self._ig_sess(name).send(peer, text))
+
+    def h_ig_read(self, q, name):
+        body = self._body()
+        peer = (body.get('conv_id') or '').strip()
+        if not peer:
+            return self._json({'error': 'conv_id is required'}, 400)
+        self._json(self._ig_sess(name).mark_seen(peer))
 
     def h_x_add(self, q):
         """Add an X (Twitter) account from pasted x.com cookies."""
@@ -647,6 +789,8 @@ def create_server(host, port, hub, store, client, config):
     Handler.config = config
     Handler._pending = harvest.Pending()
     Handler.x_sessions = {}
+    Handler.ig_sessions = {}
+    Handler.ig_logins = {}
     # Rehydrate X accounts: one background-loop session each. Kept separate
     # from the TikTok rehydration in run.py — an X session is independent of
     # the TikTok hub and must not break startup when twikit is missing.
@@ -663,6 +807,37 @@ def create_server(host, port, hub, store, client, config):
                 start_x_sync(hub, row['name'], xsess)
             except Exception as e:
                 print('x session %s failed: %s' % (row['name'], e))
+    except ImportError:
+        pass
+    # Rehydrate Instagram accounts: ensure_login is a network call (and can
+    # draw a challenge), so it runs in background threads and the account
+    # simply shows "down" until it lands.
+    try:
+        from . import igconnect
+        for row in store.list_accounts():
+            if (row.get('platform') or 'tiktok') != 'instagram':
+                continue
+            full = store.get_account(row['name']) or {}
+            try:
+                saved = json.loads(full.get('cookie') or '{}')
+            except Exception:
+                saved = {}
+
+            def _ig_rehydrate(name=row['name'], saved=saved):
+                try:
+                    sess = igconnect.IGSession(
+                        saved.get('settings') or {},
+                        saved.get('username') or name,
+                        saved.get('password') or '',
+                        proxy=client.proxy)
+                    sess.ensure_login()
+                    Handler.ig_sessions[name] = sess
+                    start_x_sync(hub, name, sess, interval=20)
+                    print('ig session %s restored' % name)
+                except Exception as e:
+                    print('ig session %s failed: %s' % (name, e))
+
+            threading.Thread(target=_ig_rehydrate, daemon=True).start()
     except ImportError:
         pass
     Handler.login_flow = login_browser.BrowserLogin(

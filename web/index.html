@@ -147,7 +147,13 @@
       <select id="fPlat" style="width:100%;background:var(--bg2);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:8px">
         <option value="tiktok">TikTok（贴 cookie 即收发）</option>
         <option value="x">X / Twitter（贴 cookie，发送信任分较低但可用）</option>
+        <option value="instagram">Instagram（账号密码登录，首次或要验证码）</option>
       </select>
+    </div>
+    <div class="field" id="fIgFields" style="display:none">
+      <label>Instagram 用户名 / 密码</label>
+      <input id="fIgUser" placeholder="username" autocomplete="off" style="width:100%;margin-bottom:6px">
+      <input id="fIgPass" type="password" placeholder="password" style="width:100%">
     </div>
     <p class="hint" id="platHintTikTok">
       需要一个已登录的 <b>tiktok.com</b> 会话 cookie。在浏览器里打开 devtools →
@@ -577,9 +583,12 @@ $('#btnSync').onclick = async () => {
 };
 $('#btnAdd').onclick = () => $('#modal').classList.add('show');
 $('#fPlat').onchange = () => {
-  const isX = $('#fPlat').value === 'x';
-  $('#platHintTikTok').style.display = isX ? 'none' : '';
+  const v = $('#fPlat').value;
+  const isX = v === 'x', isIG = v === 'instagram';
+  $('#platHintTikTok').style.display = isX || isIG ? 'none' : '';
   $('#platHintX').style.display = isX ? '' : 'none';
+  $('#fIgFields').style.display = isIG ? '' : 'none';
+  $('#fCookie').parentElement.style.display = isIG ? 'none' : '';
   $('#fCookie').placeholder = isX
     ? 'auth_token=…; ct0=…; twid=…'
     : 'tt_chain_token=…; sessionid=…; uid_tt=…';
@@ -606,6 +615,36 @@ $('#btnCancel').onclick = () => $('#modal').classList.remove('show');
 $('#btnSave').onclick = async () => {
   const btn = $('#btnSave'); btn.disabled = true;
   try {
+    if ($('#fPlat').value === 'instagram') {
+      const user = $('#fIgUser').value.trim(), pass = $('#fIgPass').value;
+      if (!user || !pass) { toast('需要 Instagram 用户名和密码', true); return; }
+      const r0 = await jpost('/api/ig/add', { username: user, password: pass });
+      if (!r0.started) { toast('启动登录失败：' + (r0.error || '未知'), true); return; }
+      // poll the two-phase login (challenge/2FA may interject)
+      let state = null;
+      for (let i = 0; i < 150; i++) {
+        await new Promise(res => setTimeout(res, 2000));
+        state = await jget('/api/ig/state?username=' + encodeURIComponent(user));
+        if (state.phase === 'challenge' || state.phase === 'twofa') {
+          const code = prompt(state.phase === 'twofa'
+            ? 'Instagram 两步验证：请输入验证码'
+            : 'Instagram 身份验证：请输入发送到邮箱/手机的 6 位验证码');
+          if (!code) { toast('已取消（未输入验证码）', true); return; }
+          await jpost('/api/ig/code', { username: user, code: code.trim() });
+        }
+        if (state.phase === 'success' || state.phase === 'error') break;
+      }
+      if (!state || state.phase !== 'success') {
+        toast('登录未完成：' + ((state && (state.detail || state.phase)) || '超时'), true);
+        return;
+      }
+      toast('已添加 Instagram 账号 ' + state.name);
+      $('#modal').classList.remove('show');
+      ['fIgUser','fIgPass','fName'].forEach(id => $('#'+id).value = '');
+      ACCT = null;
+      await loadAccounts(state.name);
+      return;
+    }
     if ($('#fPlat').value === 'x') {
       const r = await jpost('/api/x/add', {
         cookies: $('#fCookie').value.trim(),

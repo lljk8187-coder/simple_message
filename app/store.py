@@ -137,6 +137,23 @@ class Store:
                 (name, uid, username, nickname, cookie_json, 'x', now, now))
             self._db.commit()
 
+    def save_ig_account(self, name, uid, username='', nickname='', cookie_json=''):
+        """Store an Instagram account: cookie column holds JSON with the
+        instagrapi settings dict + password (re-login needs it). Caller
+        guards against name collisions with other platforms."""
+        now = int(time.time() * 1000)
+        with self._lock:
+            self._db.execute(
+                """INSERT INTO accounts (name, uid, username, nickname, cookie,
+                                         platform, created_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?)
+                   ON CONFLICT(name) DO UPDATE SET
+                     uid=excluded.uid, username=excluded.username,
+                     nickname=excluded.nickname, cookie=excluded.cookie,
+                     platform='instagram', updated_at=excluded.updated_at""",
+                (name, uid, username, nickname, cookie_json, 'instagram', now, now))
+            self._db.commit()
+
     def get_account(self, name):
         with self._lock:
             row = self._db.execute('SELECT * FROM accounts WHERE name=?', (name,)).fetchone()
