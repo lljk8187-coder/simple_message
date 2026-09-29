@@ -63,12 +63,32 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._json({'error': type(e).__name__, 'detail': str(e)}, code)
 
+    def _read_body_once(self):
+        """把请求体一次性读干净（结果缓存在 _raw_body，供 _body() 解析）。
+
+        必须"统一读干净"，而不是"谁需要谁读"：handler 未必消费 body
+        （例如 POST /api/accounts/<name>/sync 根本不看 body），残留字节会在
+        keep-alive 连接上被当成**下一个请求的请求行** —— 现象是请求行变成
+        `{}GET /api/...`，http.server 认不出方法名，回 501 HTML 错误页，
+        前端 JSON.parse 失败并显示 "bad json"。已实测复现。
+        """
+        self._raw_body = None
+        try:
+            n = int(self.headers.get('Content-Length') or 0)
+        except Exception:
+            n = 0
+        if n > 0:
+            try:
+                self._raw_body = self.rfile.read(n)
+            except Exception:
+                self._raw_body = None
+
     def _body(self):
-        n = int(self.headers.get('Content-Length') or 0)
-        if not n:
+        raw = getattr(self, '_raw_body', None)
+        if not raw:
             return {}
         try:
-            return json.loads(self.rfile.read(n).decode('utf-8'))
+            return json.loads(raw.decode('utf-8'))
         except Exception:
             return {}
 
@@ -105,6 +125,7 @@ class Handler(BaseHTTPRequestHandler):
     ]
 
     def _dispatch(self, method):
+        self._read_body_once()     # 见方法注释：不读干净会污染 keep-alive 连接
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
