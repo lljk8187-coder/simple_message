@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from app import client as api          # noqa: E402
 from app import server as web          # noqa: E402
 from app.store import Store            # noqa: E402
-from app.sync import Hub               # noqa: E402
+from app.hub import Hub                # noqa: E402
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 
@@ -80,11 +80,8 @@ def main():
         client = api.HttpClient(proxy=cfg.get('proxy'))
     hub = Hub(store, client, cfg)
 
-    # Rehydrate every stored account so a restart resumes without re-importing.
-    for row in store.list_accounts():
-        full = store.get_account(row['name'])
-        sess = api.Session.from_dict(full)
-        hub.attach(row['name'], sess)
+    # 恢复所有已存账号（全平台）：TikTok 同步 + X/IG/FB 会话与各自的实时循环。
+    hub.rehydrate_all()
     hub.start()
 
     httpd = web.create_server(cfg['host'], cfg['port'], hub, store, client, cfg)

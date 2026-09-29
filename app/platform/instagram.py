@@ -114,7 +114,6 @@ class InstagramAdapter(PlatformAdapter):
         return [Conversation(platform='instagram', account='', **{
                     k: c[k] for k in Conversation.__dataclass_fields__ if k in c})
                 for c in sess.conversations()]
-
     def messages(self, sess, conv_id, before_ms=None, limit=30):
         self._ensure(sess)
         rows = sess.history(conv_id, amount=max(limit, 30))

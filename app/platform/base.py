@@ -80,15 +80,18 @@ class Conversation:
     """通道账号 × 对端 的会话。conv_id 的格式由适配器自定（跨平台不比较）。
 
     account 字段由 hub 盖章（适配器可以留空——hub 知道自己用哪个账号调的）。
+    last_from_me 与 peer_avatar 是前端渲染依赖：能取到就填，取不到留默认。
     """
     platform: str
-    account: str                     # 所属 hub 账号名
+    account: str                     # 所属 hub 账号名（hub 盖章）
     conv_id: str
     peer_uid: str = ''               # 对端平台 id
     peer_nickname: str = ''          # 对端昵称
     peer_unique: str = ''            # 对端 handle/unique id
+    peer_avatar: str = ''            # 对端头像 URL（可空）
     last_text: str = ''              # 最新一条消息预览
     last_ms: int = 0                 # 最新活动时间（毫秒）
+    last_from_me: int = 0            # 最新一条是否本方发出
     unread: int = 0                  # 未读提示数（前端本地基线管理）
 
     def to_dict(self):

@@ -1,4 +1,9 @@
-"""HTTP API + static front end + SSE event stream."""
+"""HTTP API + static front end + SSE event stream.
+
+重构后的路由面只有一套：/api/accounts/... 对所有平台通用。平台差异全部
+住在 app/hub.py（编排）与 app/platform/*（适配器）里——本文件只做路由、
+鉴权、SSE 管道与静态页。
+"""
 import json
 import os
 import queue
@@ -17,19 +22,15 @@ WEB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = 'tk-message-demo/1.0'
+    server_version = 'tk-message-demo/2.0'
     protocol_version = 'HTTP/1.1'
 
-    hub = None          # injected by create_server
+    hub = None          # app.hub.Hub — injected by create_server
     store = None
     client = None
     config = None
     _pending = None     # harvest.Pending
-    login_flow = None   # login_browser.BrowserLogin
-    x_sessions = {}     # name -> xconnect.XSession (platform 'x')
-    ig_sessions = {}    # name -> igconnect.IGSession (platform 'instagram')
-    fb_sessions = {}    # name -> fbconnect.FBSession (platform 'facebook')
-    ig_logins = {}      # username -> igconnect.IGLogin (interactive login in flight)
+    login_flow = None   # login_browser.BrowserLogin（TikTok 弹窗官方登录）
 
     # ------------------------------------------------------------- helpers
 
@@ -79,6 +80,8 @@ class Handler(BaseHTTPRequestHandler):
         ('GET', r'^/api/config$', 'get_config'),
         ('GET', r'^/api/accounts$', 'list_accounts'),
         ('POST', r'^/api/accounts$', 'add_account'),
+        ('POST', r'^/api/accounts/code$', 'account_code'),
+        ('GET', r'^/api/accounts/pending/(?P<pid>[^/]+)$', 'account_pending'),
         ('GET', r'^/api/accounts/(?P<name>[^/]+)$', 'account_detail'),
         ('DELETE', r'^/api/accounts/(?P<name>[^/]+)$', 'drop_account'),
         ('POST', r'^/api/accounts/(?P<name>[^/]+)/sync$', 'force_sync'),
@@ -86,25 +89,9 @@ class Handler(BaseHTTPRequestHandler):
         ('GET', r'^/api/accounts/(?P<name>[^/]+)/messages$', 'messages'),
         ('POST', r'^/api/accounts/(?P<name>[^/]+)/send$', 'send'),
         ('POST', r'^/api/accounts/(?P<name>[^/]+)/read$', 'mark_read'),
-        ('POST', r'^/api/x/probe$', 'x_probe'),
-        ('POST', r'^/api/x/add$', 'x_add'),
-        ('GET', r'^/api/x/accounts/(?P<name>[^/]+)/conversations$', 'x_conversations'),
-        ('GET', r'^/api/x/accounts/(?P<name>[^/]+)/messages$', 'x_messages'),
-        ('POST', r'^/api/x/accounts/(?P<name>[^/]+)/send$', 'x_send'),
-        ('POST', r'^/api/ig/add$', 'ig_add'),
-        ('POST', r'^/api/ig/code$', 'ig_code'),
-        ('GET', r'^/api/ig/state$', 'ig_state'),
-        ('GET', r'^/api/ig/accounts/(?P<name>[^/]+)/conversations$', 'ig_conversations'),
-        ('GET', r'^/api/ig/accounts/(?P<name>[^/]+)/messages$', 'ig_messages'),
-        ('POST', r'^/api/ig/accounts/(?P<name>[^/]+)/send$', 'ig_send'),
-        ('POST', r'^/api/ig/accounts/(?P<name>[^/]+)/read$', 'ig_read'),
-        ('POST', r'^/api/fb/add$', 'fb_add'),
-        ('GET', r'^/api/fb/accounts/(?P<name>[^/]+)/conversations$', 'fb_conversations'),
-        ('GET', r'^/api/fb/accounts/(?P<name>[^/]+)/messages$', 'fb_messages'),
-        ('POST', r'^/api/fb/accounts/(?P<name>[^/]+)/send$', 'fb_send'),
-        ('POST', r'^/api/fb/accounts/(?P<name>[^/]+)/read$', 'fb_read'),
-        ('POST', r'^/api/batch/send$', 'batch_send'),
         ('POST', r'^/api/accounts/(?P<name>[^/]+)/focus$', 'focus'),
+        ('POST', r'^/api/x/probe$', 'x_probe'),
+        ('POST', r'^/api/batch/send$', 'batch_send'),
         ('GET', r'^/api/events$', 'events'),
         ('GET', r'^/api/harvest$', 'harvest_get'),
         ('POST', r'^/api/harvest$', 'harvest_post'),
@@ -150,6 +137,10 @@ class Handler(BaseHTTPRequestHandler):
                     return fn(query, **match.groupdict())
                 except api.ApiError as e:
                     return self._err(e, 502)
+                except KeyError as e:
+                    return self._json({'error': str(e)}, 404)
+                except ValueError as e:
+                    return self._json({'error': str(e)}, 400)
                 except Exception as e:
                     traceback.print_exc()
                     return self._err(e)
@@ -183,7 +174,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def h_health(self, q):
         self._json({'ok': True, 'ts': int(time.time() * 1000),
-                    'proxy': self.client.proxy, 'accounts': len(self.hub.sessions)})
+                    'proxy': self.client.proxy, 'accounts': len(self.store.list_accounts())})
 
     def h_get_config(self, q):
         cfg = dict(self.config)
@@ -194,223 +185,161 @@ class Handler(BaseHTTPRequestHandler):
         out = []
         for a in self.store.list_accounts():
             a['platform'] = a.get('platform') or 'tiktok'
-            if a['platform'] == 'x':
-                a['status'] = 'ok' if a['name'] in self.x_sessions else 'down'
+            name = a['name']
+            loaded = self.hub.loaded(name)
+            a['status'] = 'ok' if loaded else 'down'
+            a['writable'] = loaded
+            a['write_tier'] = self.hub.write_tier(name) if loaded else None
+            if a['platform'] == 'tiktok':
+                st = self.hub.status.get(name, {})
+                a['status_detail'] = st.get('detail', '')
+                a['stats'] = self.store.stats(name)
+            else:
                 a['stats'] = {'conversations': 0, 'messages': 0}
-                a['writable'] = a['name'] in self.x_sessions
-                a['write_tier'] = 'X'
-                out.append(a)
-                continue
-            if a['platform'] == 'instagram':
-                a['status'] = 'ok' if a['name'] in self.ig_sessions else 'down'
-                a['stats'] = {'conversations': 0, 'messages': 0}
-                a['writable'] = a['name'] in self.ig_sessions
-                a['write_tier'] = 'IG'
-                out.append(a)
-                continue
-            if a['platform'] == 'facebook':
-                a['status'] = 'ok' if a['name'] in self.fb_sessions else 'down'
-                a['stats'] = {'conversations': 0, 'messages': 0}
-                a['writable'] = a['name'] in self.fb_sessions
-                a['write_tier'] = 'FB'
-                out.append(a)
-                continue
-            st = self.hub.status.get(a['name'], {})
-            a['status'] = st.get('state', 'idle')
-            a['status_detail'] = st.get('detail', '')
-            a['stats'] = self.store.stats(a['name'])
-            sess = self.hub.sessions.get(a['name'])
-            guard, tier = api.ticket_guard_headers(sess, '/v1/message/send') if sess else (None, None)
-            a['write_tier'] = tier
-            a['writable'] = guard is not None
             out.append(a)
         self._json({'accounts': out})
 
     def h_add_account(self, q):
+        """统一添加入口：{platform: 'tiktok'|'x'|'instagram'|'facebook', ...}。
+
+        IG 需要验证码时返回 {need_code: true, pending_id}，
+        凭 pending_id 走 POST /api/accounts/code。
+        """
         body = self._body()
-        cookie = (body.get('cookie') or '').strip()
-        if not cookie:
-            return self._json({'error': 'cookie is required'}, 400)
-        cookie = ' '.join(cookie.split())
-        name = (body.get('name') or '').strip()
+        platform = (body.get('platform') or 'tiktok').strip()
+        self._json(self.hub.add_account(platform, body))
 
-        private_key = None
-        key_text = (body.get('private_key') or '').strip()
-        if key_text:
-            try:
-                private_key = api.signing.parse_private_key(key_text)
-            except Exception as e:
-                return self._json({'error': 'private key not understood: %s' % e}, 400)
+    def h_account_code(self, q):
+        """两段式登录第二段：{pending_id, code}。"""
+        body = self._body()
+        self._json(self.hub.submit_code((body.get('pending_id') or '').strip(),
+                                        (body.get('code') or '').strip()))
 
-        info = api.verify_cookie(self.client, cookie)
-        if not name:
-            name = info['username'] or info['uid']
-
-        guard_in = body.get('guard')
-        if isinstance(guard_in, str):
-            try:
-                guard_in = json.loads(guard_in) if guard_in else {}
-            except Exception:
-                guard_in = {}
-
-        sess = api.Session(
-            cookie=cookie,
-            device_id=(body.get('device_id') or self.config['default_device_id']),
-            uid=info['uid'], username=info['username'], nickname=info['nickname'],
-            region=info['region'],
-            guard=guard_in or {}, ticket=(body.get('ticket') or ''),
-            private_key=private_key, ts_sign=(body.get('ts_sign') or ''),
-        )
-        self.store.save_account(name, sess, info)
-        self.hub.attach(name, sess)
-        try:
-            self.hub.sync_conversations(name)
-        except Exception as e:
-            self.hub._set_status(name, 'warn', 'initial sync failed: %s' % e)
-        _, tier = api.ticket_guard_headers(sess, '/v1/message/send') if sess else (None, None)
-        self._json({'name': name, 'uid': info['uid'], 'username': info['username'],
-                    'write_tier': tier, 'writable': tier is not None})
+    def h_account_pending(self, q, pid):
+        self._json({'state': self.hub.pending_state(pid)})
 
     def h_account_detail(self, q, name):
         row = self.store.get_account(name)
         if not row:
             return self._json({'error': 'no such account'}, 404)
         row.pop('cookie', None)
-        row['status'] = self.hub.status.get(name, {}).get('state', 'idle')
+        row['platform'] = row.get('platform') or 'tiktok'
+        row['status'] = 'ok' if self.hub.loaded(name) else 'down'
         row['stats'] = self.store.stats(name)
         self._json(row)
 
     def h_drop_account(self, q, name):
-        self.hub.detach(name)
-        self.store.delete_account(name)
+        self.hub.drop(name)
         self._json({'ok': True})
 
     def h_force_sync(self, q, name):
-        if name not in self.hub.sessions:
-            return self._json({'error': 'account not loaded'}, 404)
-        convs, meta = self.hub.sync_conversations(name)
-        self._json({'ok': True, 'conversations': len(convs), 'meta': meta.get('meta')})
+        convs = self.hub.conversations(name)
+        self._json({'ok': True, 'conversations': len(convs)})
 
     def h_conversations(self, q, name):
-        plat = self._platform(name)
-        if plat == 'x':
-            return self.h_x_conversations(q, name)
-        if plat == 'instagram':
-            return self.h_ig_conversations(q, name)
-        if plat == 'facebook':
-            return self.h_fb_conversations(q, name)
-        self._require(name)
-        self._json({'conversations': self.store.list_conversations(name)})
+        self._json({'conversations': self.hub.conversations(name)})
 
     def h_messages(self, q, name):
-        plat = self._platform(name)
-        if plat == 'x':
-            return self.h_x_messages(q, name)
-        if plat == 'instagram':
-            return self.h_ig_messages(q, name)
-        if plat == 'facebook':
-            return self.h_fb_messages(q, name)
-        self._require(name)
         conv_id = (q.get('conv_id') or [''])[0]
         if not conv_id:
             return self._json({'error': 'conv_id is required'}, 400)
         limit = int((q.get('limit') or ['30'])[0])
         before = (q.get('before_us') or [''])[0]
         before_us = int(before) if before.isdigit() else None
-
-        conv = next((c for c in self.store.list_conversations(name)
-                     if c['conv_id'] == conv_id), None)
-        if not conv:
-            return self._json({'error': 'unknown conversation'}, 404)
-
-        if before_us is None:
-            self.hub.ensure_history(name, conv['conv_id'], conv['short_id'])
-
-        stored = self.store.list_messages(name, conv_id, limit=limit, before_us=before_us)
-        cursor = None
-        if len(stored) < limit:
-            # ran out of local rows — ask the server for the next page
-            oldest = min((m['us'] for m in stored), default=before_us or None)
-            try:
-                fetched, cursor = self.hub.fetch_more(name, conv['conv_id'],
-                                                      conv['short_id'],
-                                                      before_us=oldest, limit=limit)
-                self.store.save_messages(name, fetched)
-                stored = self.store.list_messages(name, conv_id, limit=limit, before_us=before_us)
-            except api.ApiError as e:
-                cursor = None
-                if not stored:
-                    raise e
-        self._json({'messages': stored, 'next_cursor': cursor,
+        messages, cursor, conv = self.hub.messages(name, conv_id,
+                                                   before_us=before_us, limit=limit)
+        self._json({'messages': messages, 'next_cursor': cursor,
                     'conversation': conv})
 
     def h_send(self, q, name):
-        plat = self._platform(name)
-        if plat == 'x':
-            return self.h_x_send(q, name)
-        if plat == 'instagram':
-            return self.h_ig_send(q, name)
-        if plat == 'facebook':
-            return self.h_fb_send(q, name)
-        self._require(name)
-        sess = self.hub.sessions[name]
-        guard, tier = api.ticket_guard_headers(sess, '/v1/message/send')
-        if guard is None:
-            return self._json({'error': 'no write credentials for this account '
-                                        '(needs guard headers, or ticket + ts_sign + private key)'}, 400)
         body = self._body()
         conv_id = (body.get('conv_id') or '').strip()
         text = (body.get('text') or '').strip()
         if not conv_id or not text:
             return self._json({'error': 'conv_id and text are required'}, 400)
-        conv = next((c for c in self.store.list_conversations(name)
-                     if c['conv_id'] == conv_id), None)
-        if not conv or not conv['short_id']:
-            return self._json({'error': 'unknown conversation (no short_id)'}, 404)
-        result = api.send_message(self.client, sess, conv_id, conv['short_id'], text)
-        if result.get('ok'):
-            # read-back is not instantaneous on this API, so poll this conversation
-            # hard for the next few seconds rather than waiting out a whole interval
-            self.hub.nudge(name, conv_id)
-        self._json(result)
+        self._json(self.hub.send(name, conv_id, text))
 
     def h_mark_read(self, q, name):
-        """Send the read receipt for a conversation (cmd 2002).
-
-        read_index comes from the newest stored message (epoch-microseconds);
-        the effect lands on the peer's side as the "seen" mark — the local
-        unread counters this hub displays stay frontend-owned.
-        """
-        plat = self._platform(name)
-        if plat == 'x':
-            return self._json({'ok': False,
-                               'skipped': 'X read receipts not supported yet'})
-        if plat == 'instagram':
-            return self.h_ig_read(q, name)
-        if plat == 'facebook':
-            return self.h_fb_read(q, name)
-        self._require(name)
-        sess = self.hub.sessions[name]
+        """已读回执。效果在对方视角的"已读"标记——本地未读徽章仍由前端基线管理。"""
         body = self._body()
         conv_id = (body.get('conv_id') or '').strip()
         if not conv_id:
             return self._json({'error': 'conv_id is required'}, 400)
-        conv = next((c for c in self.store.list_conversations(name)
-                     if c['conv_id'] == conv_id), None)
-        if not conv or not conv['short_id']:
-            return self._json({'error': 'unknown conversation (no short_id)'}, 404)
-        latest = self.store.latest_message(name, conv_id)
-        if not latest:
-            return self._json({'ok': False, 'skipped': 'no messages to mark'})
-        result = api.mark_read(self.client, sess, conv_id, conv['short_id'],
-                               latest['us'])
-        self._json(result)
+        self._json(self.hub.mark_read(name, conv_id))
 
     def h_focus(self, q, name):
-        if name in self.hub.sessions:
+        if self.hub.loaded(name):
             conv_id = (self._body().get('conv_id') or '')
             self.hub.nudge(name, conv_id)       # pull it now, don't wait for the tick
         self._json({'ok': True})
+
+    def h_x_probe(self, q):
+        """Stateless X cookie validation — verify/inbox/history per stage."""
+        body = self._body()
+        cookies = body.get('cookies')
+        if isinstance(cookies, str):
+            cookies = cookies.strip()
+        if not cookies:
+            return self._json({'error': 'cookies are required'}, 400)
+        try:
+            from . import xconnect
+        except ImportError:
+            return self._json({'error': 'xconnect module unavailable'}, 500)
+        try:
+            report = xconnect.probe(
+                cookies, proxy=self.client.proxy,
+                with_history_uid=(body.get('history_uid') or None))
+            self._json({'ok': 'error' not in (report.get('verify') or {}),
+                        'report': report})
+        except Exception as e:
+            self._json({'ok': False, 'error': '%s: %s' % (type(e).__name__, e)})
+
+    # ---------------------------------------------------- batch sending
+
+    def h_batch_send(self, q):
+        """Send one text to many conversations, sequentially with a delay.
+
+        Deliberately rate-limited: identical content to many recipients is
+        the exact traffic shape every platform's risk control hunts for, so
+        the loop is serial, delays between sends, hard target cap, and
+        per-target results instead of fire-and-forget."""
+        body = self._body()
+        text = (body.get('text') or '').strip()
+        targets = body.get('targets') or []
+        if not text:
+            return self._json({'error': 'text is required'}, 400)
+        if not isinstance(targets, list) or not targets:
+            return self._json({'error': 'targets are required'}, 400)
+        if len(targets) > 50:
+            return self._json({'error': 'too many targets (max 50)'}, 400)
+        try:
+            delay = max(0, min(int(body.get('delay_ms') or 2000), 10000))
+        except (TypeError, ValueError):
+            delay = 2000
+        results = []
+        for i, t in enumerate(targets):
+            if not isinstance(t, dict):
+                continue
+            account = (t.get('account') or '').strip()
+            conv_id = (t.get('conv_id') or '').strip()
+            entry = {'account': account, 'conv_id': conv_id,
+                     'label': t.get('label') or ''}
+            if i and delay:
+                time.sleep(delay / 1000.0)
+            try:
+                entry.update(self.hub.send(account, conv_id, text))
+            except api.ApiError as e:
+                entry.update({'ok': False, 'error': str(e)})
+            except Exception as e:
+                entry.update({'ok': False,
+                              'error': '%s: %s' % (type(e).__name__, e)})
+            if 'ok' not in entry:
+                entry['ok'] = False
+            results.append(entry)
+        sent = sum(1 for r in results if r.get('ok'))
+        self._json({'ok': sent == len(results) and bool(results),
+                    'sent': sent, 'failed': len(results) - sent,
+                    'results': results})
 
     # ------------------------------------------------------- harvest (credentials)
 
@@ -478,8 +407,7 @@ class Handler(BaseHTTPRequestHandler):
 
         sess = api.Session(
             cookie=cookie,
-            device_id=(body.get('device_id') or (prev.device_id if prev else '')
-                       or self.config['default_device_id']),
+            device_id=(body.get('device_id') or (prev.device_id if prev else '')),
             uid=info['uid'], username=info['username'], nickname=info['nickname'],
             region=info['region'],
             guard=(prev.guard if prev else {}),
@@ -498,367 +426,7 @@ class Handler(BaseHTTPRequestHandler):
         self._json({'ok': True, 'name': name, 'uid': info['uid'],
                     'username': info['username'], 'write_tier': tier})
 
-    def _require(self, name):
-        if name not in self.hub.sessions:
-            raise api.ApiError('account %r is not loaded' % name)
-
-    # ------------------------------------------------- platform: X dispatch
-
-    def _x_sess(self, name):
-        sess = self.x_sessions.get(name)
-        if not sess:
-            raise api.ApiError('X session %r is not loaded' % name)
-        return sess
-
-    def _platform(self, name):
-        row = self.store.get_account(name) or {}
-        return row.get('platform') or 'tiktok'
-
-    # ----------------------------------------------- platform: IG dispatch
-
-    def _ig_sess(self, name):
-        sess = self.ig_sessions.get(name)
-        if not sess:
-            raise api.ApiError('Instagram session %r is not loaded' % name)
-        return sess
-
-    def h_ig_add(self, q):
-        """Two-phase Instagram login: this starts the background attempt;
-        when Instagram draws a challenge the hub waits for /api/ig/code."""
-        body = self._body()
-        username = (body.get('username') or '').strip()
-        password = (body.get('password') or '').strip()
-        if not username or not password:
-            return self._json({'error': 'username and password are required'}, 400)
-        name = (body.get('name') or '').strip() or username
-        prev = self.store.get_account(name)
-        if prev and (prev.get('platform') or 'tiktok') != 'instagram':
-            return self._json({'error': 'name %r is taken by a %s account'
-                               % (name, prev.get('platform') or 'tiktok')}, 409)
-        pending = self.ig_logins.get(username)
-        if pending and pending.phase in ('starting', 'challenge', 'twofa', 'verifying'):
-            return self._json({'started': True, 'state': pending.state()})
-        try:
-            from . import igconnect
-            login = igconnect.IGLogin(username, password, proxy=self.client.proxy)
-        except ImportError:
-            return self._json({'error': 'igconnect unavailable'}, 500)
-        login.hub_name = name
-        self.ig_logins[username] = login
-        threading.Thread(target=self._ig_login_thread, args=(login, name),
-                         daemon=True).start()
-        return self._json({'started': True, 'username': username})
-
-    def _ig_login_thread(self, login, name):
-        try:
-            cl = login.run()
-        except Exception:
-            return                              # phase='error' already set
-        try:
-            settings = cl.get_settings()
-            info = {'uid': str(cl.user_id or ''), 'username': cl.username or '',
-                    'name': ''}
-            try:
-                me = cl.account_info()
-                info['uid'] = str(me.pk)
-                info['name'] = me.full_name or ''
-                info['username'] = me.username or info['username']
-            except Exception:
-                pass
-            cookie_store = json.dumps({'settings': settings,
-                                       'password': login.password,
-                                       'username': info['username']})
-            self.store.save_ig_account(name, info['uid'], info['username'],
-                                       info['name'], cookie_store)
-            from . import igconnect
-            sess = igconnect.IGSession(settings, info['username'],
-                                       login.password, proxy=self.client.proxy)
-            self.ig_sessions[name] = sess
-            start_x_sync(self.hub, name, sess, interval=20)
-        except Exception as e:
-            with login._lock:
-                login.phase = 'error'
-                login.detail = 'post-login setup failed: %s' % e
-
-    def h_ig_state(self, q):
-        username = (q.get('username') or [''])[0]
-        login = self.ig_logins.get(username)
-        if not login:
-            return self._json({'error': 'no login in progress for %r' % username}, 404)
-        st = login.state()
-        st['name'] = getattr(login, 'hub_name', username)
-        return self._json(st)
-
-    def h_ig_code(self, q):
-        body = self._body()
-        username = (body.get('username') or '').strip()
-        code = (body.get('code') or '').strip()
-        login = self.ig_logins.get(username)
-        if not login:
-            return self._json({'error': 'no login in progress for %r' % username}, 404)
-        if login.phase not in ('challenge', 'twofa'):
-            return self._json({'error': 'not waiting for a code (phase=%s)'
-                               % login.phase}, 400)
-        login.submit_code(code)
-        return self._json({'ok': True, 'state': login.state()})
-
-    def h_ig_conversations(self, q, name):
-        convs = self._ig_sess(name).conversations()
-        self._json({'conversations': convs})
-
-    def h_ig_messages(self, q, name):
-        peer = (q.get('conv_id') or [''])[0]
-        if not peer:
-            return self._json({'error': 'conv_id is required'}, 400)
-        limit = int((q.get('limit') or ['30'])[0])
-        self._json({'messages': self._ig_sess(name).history(peer, amount=limit)})
-
-    def h_ig_send(self, q, name):
-        body = self._body()
-        peer = (body.get('conv_id') or '').strip()
-        text = (body.get('text') or '').strip()
-        if not peer or not text:
-            return self._json({'error': 'conv_id and text are required'}, 400)
-        self._json(self._ig_sess(name).send(peer, text))
-
-    def h_ig_read(self, q, name):
-        body = self._body()
-        peer = (body.get('conv_id') or '').strip()
-        if not peer:
-            return self._json({'error': 'conv_id is required'}, 400)
-        self._json(self._ig_sess(name).mark_seen(peer))
-
-    # ---------------------------------------------- platform: FB dispatch
-
-    def _fb_sess(self, name):
-        sess = self.fb_sessions.get(name)
-        if not sess:
-            raise api.ApiError('Facebook session %r is not loaded' % name)
-        return sess
-
-    def h_fb_add(self, q):
-        """Add a Facebook account from pasted facebook.com cookies
-        (needs c_user + xs). The E2EE bridge starts in the background."""
-        body = self._body()
-        cookies = body.get('cookies')
-        if isinstance(cookies, str):
-            cookies = cookies.strip()
-        if not cookies:
-            return self._json({'error': 'cookies are required'}, 400)
-        try:
-            from . import fbconnect
-            sess = fbconnect.FBSession(cookies, proxy=self.client.proxy).start()
-        except ValueError as e:
-            return self._json({'error': str(e)}, 400)
-        except Exception as e:
-            return self._json({'error': 'facebook session failed: %s: %s'
-                               % (type(e).__name__, e)}, 400)
-        name = (body.get('name') or '').strip() or ('fb' + sess.me_id[-6:])
-        prev = self.store.get_account(name)
-        if prev and (prev.get('platform') or 'tiktok') != 'facebook':
-            sess.close()
-            return self._json({'error': 'name %r is taken by a %s account'
-                               % (name, prev.get('platform') or 'tiktok')}, 409)
-        cookie_store = json.dumps(cookies) if isinstance(cookies, dict) else cookies
-        self.store.save_platform_account(name, sess.me_id, '', '', cookie_store,
-                                         'facebook')
-        self.fb_sessions[name] = sess
-        start_fb_sync(self.hub, name, sess)
-
-        def _bridge():
-            try:
-                out = sess.start_e2ee()
-                print('fb e2ee %s: %s' % (name, out))
-            except Exception as e:
-                print('fb e2ee %s failed: %s' % (name, e))
-
-        threading.Thread(target=_bridge, daemon=True).start()
-        self._json({'ok': True, 'name': name, 'uid': sess.me_id,
-                    'platform': 'facebook',
-                    'note': 'E2EE bridge starting in background; 1:1 send/'
-                            'receive live once it connects'})
-
-    def h_fb_conversations(self, q, name):
-        convs = self._fb_sess(name).conversations()
-        self._json({'conversations': convs})
-
-    def h_fb_messages(self, q, name):
-        peer = (q.get('conv_id') or [''])[0]
-        if not peer:
-            return self._json({'error': 'conv_id is required'}, 400)
-        rows, _ = self._fb_sess(name).history(peer)
-        limit = int((q.get('limit') or ['30'])[0])
-        self._json({'messages': rows[-limit:]})
-
-    def h_fb_send(self, q, name):
-        body = self._body()
-        peer = (body.get('conv_id') or '').strip()
-        text = (body.get('text') or '').strip()
-        if not peer or not text:
-            return self._json({'error': 'conv_id and text are required'}, 400)
-        self._json(self._fb_sess(name).send(peer, text))
-
-    def h_fb_read(self, q, name):
-        body = self._body()
-        peer = (body.get('conv_id') or '').strip()
-        self._json(self._fb_sess(name).mark_seen(peer))
-
-    # ---------------------------------------------------- batch sending
-
-    def _send_one(self, account, conv_id, text):
-        """One message through the platform-dispatched path — the primitive
-        behind both the single-send endpoint and the batch sender. Returns a
-        result dict; never raises for expected failures."""
-        plat = self._platform(account)
-        if plat == 'x':
-            return self._x_sess(account).send(conv_id, text)
-        if plat == 'instagram':
-            return self._ig_sess(account).send(conv_id, text)
-        if plat == 'facebook':
-            return self._fb_sess(account).send(conv_id, text)
-        self._require(account)
-        sess = self.hub.sessions[account]
-        conv = next((c for c in self.store.list_conversations(account)
-                     if c['conv_id'] == conv_id), None)
-        if not conv or not conv['short_id']:
-            return {'ok': False, 'error': 'unknown conversation (no short_id)'}
-        result = api.send_message(self.client, sess, conv_id, conv['short_id'], text)
-        if result.get('ok'):
-            self.hub.nudge(account, conv_id)
-        return result
-
-    def h_batch_send(self, q):
-        """Send one text to many conversations, sequentially with a delay.
-
-        Deliberately rate-limited: identical content to many recipients is
-        the exact traffic shape every platform's risk control hunts for, so
-        the loop is serial, delays between sends, hard target cap, and
-        per-target results instead of fire-and-forget."""
-        body = self._body()
-        text = (body.get('text') or '').strip()
-        targets = body.get('targets') or []
-        if not text:
-            return self._json({'error': 'text is required'}, 400)
-        if not isinstance(targets, list) or not targets:
-            return self._json({'error': 'targets are required'}, 400)
-        if len(targets) > 50:
-            return self._json({'error': 'too many targets (max 50)'}, 400)
-        try:
-            delay = max(0, min(int(body.get('delay_ms') or 2000), 10000))
-        except (TypeError, ValueError):
-            delay = 2000
-        results = []
-        for i, t in enumerate(targets):
-            if not isinstance(t, dict):
-                continue
-            account = (t.get('account') or '').strip()
-            conv_id = (t.get('conv_id') or '').strip()
-            entry = {'account': account, 'conv_id': conv_id,
-                     'label': t.get('label') or ''}
-            if i and delay:
-                time.sleep(delay / 1000.0)
-            try:
-                entry.update(self._send_one(account, conv_id, text))
-            except api.ApiError as e:
-                entry.update({'ok': False, 'error': str(e)})
-            except Exception as e:
-                entry.update({'ok': False,
-                              'error': '%s: %s' % (type(e).__name__, e)})
-            if 'ok' not in entry:
-                entry['ok'] = False
-            results.append(entry)
-        sent = sum(1 for r in results if r.get('ok'))
-        self._json({'ok': sent == len(results) and bool(results),
-                    'sent': sent, 'failed': len(results) - sent,
-                    'results': results})
-
-    def h_x_add(self, q):
-        """Add an X (Twitter) account from pasted x.com cookies."""
-        body = self._body()
-        cookies = body.get('cookies')
-        if isinstance(cookies, str):
-            cookies = cookies.strip()
-        if not cookies:
-            return self._json({'error': 'cookies are required'}, 400)
-        try:
-            from . import xconnect
-            sess = xconnect.XSession(cookies, proxy=self.client.proxy).start()
-        except ValueError as e:
-            return self._json({'error': str(e)}, 400)
-        except RuntimeError as e:
-            return self._json({'error': str(e)}, 500)
-        try:
-            info = sess.verify()
-        except Exception as e:
-            sess.close()
-            return self._json({'error': 'cookie check failed: %s: %s'
-                               % (type(e).__name__, e)}, 400)
-        name = (body.get('name') or '').strip() or info['username']
-        if not name:
-            sess.close()
-            return self._json({'error': 'could not determine an account name'}, 400)
-        prev = self.store.get_account(name)
-        if prev and (prev.get('platform') or 'tiktok') != 'x':
-            sess.close()
-            return self._json({'error': 'name %r is taken by a %s account'
-                               % (name, prev.get('platform') or 'tiktok')}, 409)
-        cookie_store = json.dumps(cookies) if isinstance(cookies, dict) else cookies
-        self.store.save_x_account(name, info['uid'], info['username'],
-                                  info['name'], cookie_store)
-        self.x_sessions[name] = sess
-        start_x_sync(self.hub, name, sess)
-        self._json({'ok': True, 'name': name, 'uid': info['uid'],
-                    'username': info['username'], 'platform': 'x'})
-
-    def h_x_conversations(self, q, name):
-        convs = self._x_sess(name).conversations()
-        for c in convs:
-            c['last_from_me'] = bool(c.pop('outgoing', False))
-            c['peer_avatar'] = c.get('peer_avatar') or ''
-        self._json({'conversations': convs})
-
-    def h_x_messages(self, q, name):
-        peer = (q.get('conv_id') or [''])[0]
-        if not peer:
-            return self._json({'error': 'conv_id is required'}, 400)
-        msgs, _cursor = self._x_sess(name).history(peer)
-        limit = int((q.get('limit') or ['30'])[0])
-        self._json({'messages': msgs[-limit:]})
-
-    def h_x_send(self, q, name):
-        body = self._body()
-        peer = (body.get('conv_id') or '').strip()
-        text = (body.get('text') or '').strip()
-        if not peer or not text:
-            return self._json({'error': 'conv_id and text are required'}, 400)
-        self._json(self._x_sess(name).send(peer, text))
-
-    def h_x_probe(self, q):
-        """Stateless X (Twitter) cookie validation — verify/inbox/history.
-
-        Accepts {cookies: "<Cookie header string or JSON dict>",
-        history_uid (optional, exercise get_dm_history for one peer).
-        Stores nothing; every stage reports its own error so a single paste
-        of cookies answers whether the X connector works for this account.
-        """
-        body = self._body()
-        cookies = body.get('cookies')
-        if isinstance(cookies, str):
-            cookies = cookies.strip()
-        if not cookies:
-            return self._json({'error': 'cookies are required'}, 400)
-        try:
-            from . import xconnect
-        except ImportError:
-            return self._json({'error': 'xconnect module unavailable'}, 500)
-        try:
-            report = xconnect.probe(
-                cookies, proxy=self.client.proxy,
-                with_history_uid=(body.get('history_uid') or None))
-            self._json({'ok': 'error' not in (report.get('verify') or {}),
-                        'report': report})
-        except Exception as e:
-            self._json({'ok': False, 'error': '%s: %s' % (type(e).__name__, e)})
+    # ------------------------------------------------------- TikTok 弹窗登录
 
     def h_login_start(self, q):
         started, state = self.login_flow.start()
@@ -905,185 +473,12 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
 
-def start_x_sync(hub, name, sess, interval=10):
-    """Background poller for one X account: conversations() every `interval`
-    seconds; on change publish the same hub events the TikTok sync emits, so
-    the frontend refreshes identically. First pass only seeds the baseline
-    (no event flood on startup). Incoming messages are materialized through
-    history() and pushed as {'type':'message','account','conv_id','messages'}.
-    """
-    def loop():
-        last = {}          # conv_id -> last seen ms
-        seeded = False
-        while True:
-            try:
-                convs = sess.conversations()
-                incoming = []
-                changed = False
-                for c in convs:
-                    cid = c['conv_id']
-                    ms = c.get('last_ms') or 0
-                    prev = last.get(cid)
-                    if prev is not None and ms > prev and not c.get('last_from_me'):
-                        incoming.append((cid, prev))
-                    if prev is None or ms != prev:
-                        changed = True
-                    last[cid] = ms
-                if seeded and changed:
-                    hub.bus.publish({'type': 'conversations', 'account': name})
-                for cid, prev_ms in incoming:
-                    try:
-                        rows, _cursor = sess.history(cid)
-                        fresh = [m for m in rows if m['ms'] > prev_ms]
-                        if fresh:
-                            hub.bus.publish({'type': 'message', 'account': name,
-                                             'conv_id': cid, 'messages': fresh})
-                    except Exception:
-                        pass
-                seeded = True
-            except Exception:
-                pass
-            time.sleep(interval)
-
-    threading.Thread(target=loop, name='x-sync-%s' % name, daemon=True).start()
-
-
-def start_fb_sync(hub, name, sess, interval=12):
-    """FB sync: conversation-list deltas AND the E2EE bridge event pump.
-
-    Bridge events (1:1 incoming) are the authoritative realtime path —
-    each event is remembered on the session (live history) and pushed as
-    a {'type':'message'} hub event when it comes from the peer."""
-    import time as _time
-
-    def loop():
-        last = {}
-        seeded = False
-        while True:
-            try:
-                convs = sess.conversations()
-                changed = False
-                for c in convs:
-                    ms = c.get('last_ms') or 0
-                    prev = last.get(c['conv_id'])
-                    if prev is None or ms != prev:
-                        changed = True
-                    last[c['conv_id']] = ms
-                if seeded and changed:
-                    hub.bus.publish({'type': 'conversations', 'account': name})
-                seeded = True
-            except Exception:
-                pass
-            try:
-                for ev in sess.drain_events():
-                    data = ev.get('data') or {}
-                    tid = str(data.get('threadId') or '')
-                    if not tid:
-                        continue
-                    ms = int(data.get('timestampMs') or 0)
-                    sender = str(data.get('senderId') or '')
-                    row = {
-                        'platform': 'facebook', 'msg_id': str(data.get('id') or ''),
-                        'conv_id': tid, 'sender': sender,
-                        'outgoing': 1 if sender == sess.me_id else 0,
-                        'text': data.get('text') or '', 'ms': ms, 'us': ms * 1000,
-                    }
-                    sess._remember(row)
-                    if row['outgoing']:
-                        continue
-                    hub.bus.publish({'type': 'message', 'account': name,
-                                     'conv_id': tid, 'messages': [row]})
-            except Exception:
-                pass
-            _time.sleep(interval)
-
-    threading.Thread(target=loop, name='fb-sync-%s' % name, daemon=True).start()
-
-
 def create_server(host, port, hub, store, client, config):
     Handler.hub = hub
     Handler.store = store
     Handler.client = client
     Handler.config = config
     Handler._pending = harvest.Pending()
-    Handler.x_sessions = {}
-    Handler.ig_sessions = {}
-    Handler.ig_logins = {}
-    # Rehydrate X accounts: one background-loop session each. Kept separate
-    # from the TikTok rehydration in run.py — an X session is independent of
-    # the TikTok hub and must not break startup when twikit is missing.
-    try:
-        from . import xconnect
-        for row in store.list_accounts():
-            if (row.get('platform') or 'tiktok') != 'x':
-                continue
-            full = store.get_account(row['name']) or {}
-            try:
-                xsess = xconnect.XSession(full.get('cookie') or '',
-                                          proxy=client.proxy).start()
-                Handler.x_sessions[row['name']] = xsess
-                start_x_sync(hub, row['name'], xsess)
-            except Exception as e:
-                print('x session %s failed: %s' % (row['name'], e))
-    except ImportError:
-        pass
-    # Rehydrate Instagram accounts: ensure_login is a network call (and can
-    # draw a challenge), so it runs in background threads and the account
-    # simply shows "down" until it lands.
-    try:
-        from . import igconnect
-        for row in store.list_accounts():
-            if (row.get('platform') or 'tiktok') != 'instagram':
-                continue
-            full = store.get_account(row['name']) or {}
-            try:
-                saved = json.loads(full.get('cookie') or '{}')
-            except Exception:
-                saved = {}
-
-            def _ig_rehydrate(name=row['name'], saved=saved):
-                try:
-                    sess = igconnect.IGSession(
-                        saved.get('settings') or {},
-                        saved.get('username') or name,
-                        saved.get('password') or '',
-                        proxy=client.proxy)
-                    sess.ensure_login()
-                    Handler.ig_sessions[name] = sess
-                    start_x_sync(hub, name, sess, interval=20)
-                    print('ig session %s restored' % name)
-                except Exception as e:
-                    print('ig session %s failed: %s' % (name, e))
-
-            threading.Thread(target=_ig_rehydrate, daemon=True).start()
-    except ImportError:
-        pass
-    # Rehydrate Facebook accounts: session boot is quick, but the E2EE
-    # bridge handshake takes up to ~90s — background it.
-    try:
-        from . import fbconnect
-        for row in store.list_accounts():
-            if (row.get('platform') or 'tiktok') != 'facebook':
-                continue
-            full = store.get_account(row['name']) or {}
-            try:
-                fsess = fbconnect.FBSession(full.get('cookie') or '',
-                                            proxy=client.proxy).start()
-                Handler.fb_sessions[row['name']] = fsess
-                start_fb_sync(hub, row['name'], fsess)
-
-                def _fb_bridge(name=row['name'], fsess=fsess):
-                    try:
-                        out = fsess.start_e2ee()
-                        print('fb e2ee %s: %s' % (name, out))
-                    except Exception as e:
-                        print('fb e2ee %s failed: %s' % (name, e))
-
-                threading.Thread(target=_fb_bridge, daemon=True).start()
-            except Exception as e:
-                print('fb session %s failed: %s' % (row['name'], e))
-    except ImportError:
-        pass
     Handler.login_flow = login_browser.BrowserLogin(
         store, hub, client,
         profile_dir=os.path.abspath(os.path.join(

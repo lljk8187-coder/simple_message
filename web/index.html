@@ -361,6 +361,10 @@ async function loadAccounts(select) {
     o.value = a.name;
     if (a.platform === 'x') {
       o.textContent = (a.nickname || a.username || a.name) + ' · X' + (a.writable ? ' · 可发' : ' · 未连');
+    } else if (a.platform === 'instagram') {
+      o.textContent = (a.nickname || a.username || a.name) + ' · IG' + (a.writable ? ' · 可发' : ' · 未连');
+    } else if (a.platform === 'facebook') {
+      o.textContent = (a.nickname || a.username || a.name) + ' · FB' + (a.writable ? ' · 可发' : ' · 未连');
     } else {
       const mode = a.write_tier ? ' · 档位' + a.write_tier : ' · 只读';
       o.textContent = (a.nickname || a.username || a.name) + ' · ' + a.uid.slice(-6) + mode;
@@ -620,7 +624,8 @@ $('#btnBatch').onclick = async () => {
     try {
       convs = (await jget(`/api/accounts/${encodeURIComponent(a.name)}/conversations`)).conversations || [];
     } catch (e) { /* account down — show as empty */ }
-    const tag = a.platform === 'x' ? 'X' : a.platform === 'instagram' ? 'IG' : 'TikTok';
+    const tag = a.platform === 'x' ? 'X' : a.platform === 'instagram' ? 'IG'
+      : a.platform === 'facebook' ? 'FB' : 'TikTok';
     const group = document.createElement('div');
     group.className = 'bgroup';
     group.textContent = `${a.name} · ${tag}${a.writable ? '' : '（不可发）'}`;
@@ -702,68 +707,48 @@ $('#btnCancel').onclick = () => $('#modal').classList.remove('show');
 $('#btnSave').onclick = async () => {
   const btn = $('#btnSave'); btn.disabled = true;
   try {
-    if ($('#fPlat').value === 'instagram') {
-      const user = $('#fIgUser').value.trim(), pass = $('#fIgPass').value;
-      if (!user || !pass) { toast('需要 Instagram 用户名和密码', true); return; }
-      const r0 = await jpost('/api/ig/add', { username: user, password: pass });
-      if (!r0.started) { toast('启动登录失败：' + (r0.error || '未知'), true); return; }
-      // poll the two-phase login (challenge/2FA may interject)
-      let state = null;
-      for (let i = 0; i < 150; i++) {
-        await new Promise(res => setTimeout(res, 2000));
-        state = await jget('/api/ig/state?username=' + encodeURIComponent(user));
-        if (state.phase === 'challenge' || state.phase === 'twofa') {
-          const code = prompt(state.phase === 'twofa'
-            ? 'Instagram 两步验证：请输入验证码'
-            : 'Instagram 身份验证：请输入发送到邮箱/手机的 6 位验证码');
-          if (!code) { toast('已取消（未输入验证码）', true); return; }
-          await jpost('/api/ig/code', { username: user, code: code.trim() });
+    const plat = $('#fPlat').value;
+    const payload = { platform: plat, name: $('#fName').value.trim() };
+    if (plat === 'instagram') {
+      payload.username = $('#fIgUser').value.trim();
+      payload.password = $('#fIgPass').value;
+      if (!payload.username || !payload.password) { toast('需要 Instagram 用户名和密码', true); return; }
+    } else {
+      payload.cookie = $('#fCookie').value.trim();
+      if (!payload.cookie) { toast('需要粘贴 cookie', true); return; }
+      if (plat === 'tiktok') {
+        payload.device_id = $('#fDevice').value.trim();
+        payload.ticket = $('#fTicket').value.trim();
+        payload.private_key = $('#fKey').value.trim();
+        const guard = {};
+        if ($('#fPk').value.trim()) guard['tt-ticket-guard-public-key'] = $('#fPk').value.trim();
+        if ($('#fCd').value.trim()) guard['tt-ticket-guard-client-data'] = $('#fCd').value.trim();
+        if (guard['tt-ticket-guard-public-key']) {
+          guard['tt-ticket-guard-version'] = '2';
+          guard['tt-ticket-guard-iteration-version'] = '0';
+          guard['tt-ticket-guard-web-version'] = '1';
         }
-        if (state.phase === 'success' || state.phase === 'error') break;
+        payload.guard = guard;
       }
-      if (!state || state.phase !== 'success') {
-        toast('登录未完成：' + ((state && (state.detail || state.phase)) || '超时'), true);
-        return;
-      }
-      toast('已添加 Instagram 账号 ' + state.name);
+    }
+    // 统一入口。Instagram 两段式：服务端返回 need_code 时补一次验证码提交。
+    const r = await jpost('/api/accounts', payload);
+    if (r.need_code) {
+      const code = prompt('Instagram 身份验证：请输入发送到邮箱/手机的 6 位验证码');
+      if (!code) { toast('已取消（未输入验证码）', true); return; }
+      const r2 = await jpost('/api/accounts/code', { pending_id: r.pending_id, code: code.trim() });
+      toast('已添加 Instagram 账号 ' + (r2.username || r2.name));
       $('#modal').classList.remove('show');
       ['fIgUser','fIgPass','fName'].forEach(id => $('#'+id).value = '');
       ACCT = null;
-      await loadAccounts(state.name);
+      await loadAccounts(r2.name);
       return;
     }
-    if ($('#fPlat').value === 'x') {
-      const r = await jpost('/api/x/add', {
-        cookies: $('#fCookie').value.trim(),
-        name: $('#fName').value.trim(),
-      });
-      toast('已添加 X 账号 ' + r.username + '（发送已就绪）');
-      $('#modal').classList.remove('show');
-      ['fCookie','fName'].forEach(id => $('#'+id).value = '');
-      ACCT = null;
-      await loadAccounts(r.name);
-      return;
-    }
-    const guard = {};
-    if ($('#fPk').value.trim()) guard['tt-ticket-guard-public-key'] = $('#fPk').value.trim();
-    if ($('#fCd').value.trim()) guard['tt-ticket-guard-client-data'] = $('#fCd').value.trim();
-    if (guard['tt-ticket-guard-public-key']) {
-      guard['tt-ticket-guard-version'] = '2';
-      guard['tt-ticket-guard-iteration-version'] = '0';
-      guard['tt-ticket-guard-web-version'] = '1';
-    }
-    const r = await jpost('/api/accounts', {
-      cookie: $('#fCookie').value.trim(),
-      name: $('#fName').value.trim(),
-      device_id: $('#fDevice').value.trim(),
-      ticket: $('#fTicket').value.trim(),
-      private_key: $('#fKey').value.trim(),
-      guard,
-    });
-    const tier = r.write_tier ? ('档位 ' + r.write_tier) : '仅只读';
-    toast('已添加 ' + r.username + '（' + tier + '）');
+    const tag = plat === 'x' ? 'X' : plat === 'facebook' ? 'FB'
+      : (r.write_tier ? '档位 ' + r.write_tier : 'TikTok');
+    toast('已添加 ' + (r.username || r.name) + '（' + tag + '）');
     $('#modal').classList.remove('show');
-    ['fCookie','fName','fTicket','fPk','fCd','fDevice','fKey'].forEach(id => $('#'+id).value = '');
+    ['fCookie','fName','fTicket','fPk','fCd','fDevice','fKey','fIgUser','fIgPass'].forEach(id => $('#'+id).value = '');
     ACCT = null;
     await loadAccounts(r.name);
   } catch (e) { toast('添加失败：' + e.message, true); }

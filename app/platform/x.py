@@ -58,9 +58,12 @@ class XAdapter(PlatformAdapter):
     # -------------------------------------------------------------- 读
 
     def conversations(self, sess):
-        return [Conversation(platform='x', account='', **{k: v for k, v in c.items()
-                                                          if k in Conversation.__dataclass_fields__})
-                for c in sess.conversations()]
+        out = []
+        for c in sess.conversations():
+            c['last_from_me'] = 1 if c.pop('outgoing', False) else 0
+            out.append(Conversation(platform='x', account='', **{
+                k: c[k] for k in Conversation.__dataclass_fields__ if k in c}))
+        return out
 
     def messages(self, sess, conv_id, before_ms=None, limit=30):
         rows, _cursor = sess.history(conv_id)
