@@ -59,21 +59,42 @@ python run.py
 
 ## 目录结构
 
-```
-run.py                 入口：读配置、装配、启动
+````
+run.py                 入口：读配置、装配、全平台账号恢复、启动
 config.example.json    配置模板（复制成 config.json 后生效）
 app/
-  proto.py             protobuf 线格式编解码（varint / length-delimited）
+  hub.py               统一编排：账号生命周期、四平台会话登记、启动恢复、
+                       逐平台同步循环、统一读写分发（conversations/messages/
+                       send/mark_read 都从这里出）
+  server.py            HTTP 路由（全平台一套 /api/accounts/...）、静态页、SSE
+  platform/
+    base.py            统一消息模型（Account/Conversation/Message/Contact）
+                       + PlatformAdapter 通道契约（登录方式/能力/限速申报）
+    registry.py        通道名 → 适配器登记表（缺失的可选平台自动跳过）
+    tiktok.py          TikTok 适配器（包装 client.py）
+    x.py               X 适配器（包装 xconnect）
+    instagram.py       Instagram 适配器（包装 igconnect，两段式登录）
+    facebook.py        FB 适配器（包装 fbconnect，E2EE 桥）
+  client.py            TikTok 协议客户端：信封构造、各接口、双档签名
   signing.py           手写 P-256 ECDSA（标准库实现，含 PKCS#8 解析）
-  client.py            协议客户端：信封构造、四个接口、批量用户资料、双档签名
-  harvest.py           凭据收割：发给浏览器的控制台脚本 + 回传端点
-  store.py             SQLite：账号 / 会话 / 消息 / 资料
-  sync.py              后台同步循环 + 进程内事件总线
-  server.py            HTTP 路由、静态页、SSE
+  proto.py             protobuf 线格式编解码（varint / length-delimited）
+  xconnect.py          X 私有接口连接器（twikit 封装 + 收件箱自实现）
+  igconnect.py         Instagram 连接器（instagrapi 封装，两段式登录）
+  fbconnect.py         FB 连接器（fbchat-v2 E2EE 桥封装）
+  sync.py              TikTok 轮询机制 + 进程内事件总线（hub.py 的基类）
+  harvest.py           TikTok 凭据收割：控制台脚本 + 回传端点
+  login_browser.py     弹窗官方登录：真实浏览器登录一次，自动收割凭据
+  server.py            见上
 web/
   index.html           单文件前端（含样式与脚本）
+tests/
+  smoke.py             只读冒烟验收（不发消息）
+docs/
+  credentials-acquisition-options.md   TikTok 凭据首次获取的方案对比
 data/                  运行时生成，不要提交
-```
+````
+
+架构总览见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
 ---
 
