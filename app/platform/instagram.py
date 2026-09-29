@@ -1,8 +1,15 @@
 """Instagram 适配器 —— 包装 app/igconnect.py。
 
-登录：'password_2fa'（hub 页面里输用户名密码 → IG 发验证码 → 页面填码；
-session 持久化后不再需要验证码）。与 cookie 类平台不同：IG 的私有接口
-不认浏览器 web session，所以没有弹窗登录形态，也别试图用浏览器 cookie 导入。
+登录：两条通道并存。
+- 'password_2fa'（兜底）：页面输用户名密码 → IG 发验证码 → 填码；
+  session 持久化后不再需要验证码。
+- 'popup'（浏览器登录）：从已登录的 instagram.com 抓 sessionid，交给
+  instagrapi 的 login_by_sessionid —— web 与私有 API 共用同一个
+  sessionid（形如 <uid>%3A...），所以这条路走得通。
+  **更正**：本文件早先写着"IG 私有接口不认浏览器 web session、别试图用
+  cookie 导入"，该断言未经实测且不成立（instagrapi 3.0.14 有
+  login_by_sessionid，且它正是吃 web 的 sessionid），2026-09-29 推翻。
+  IG 网页登录常撞 challenge，账密通道因此保留为兜底。
 
 阶段 2 附带的修复：igconnect 现在把代理显式装到全部传输上——此前 requests
 系的会话回落到进程环境变量里的死代理，登录必报 502。
@@ -15,6 +22,15 @@ from .base import (PlatformAdapter, Account, Conversation, Message,
                    NeedCode, CAP_SEND, CAP_MARK_READ)
 
 
+def _pick_cookie(text, key):
+    """从 Cookie 头样式的字符串里取一个值（浏览器登录给来的是整串）。"""
+    for part in (text or '').split(';'):
+        k, _, v = part.strip().partition('=')
+        if k == key:
+            return v.strip()
+    return ''
+
+
 @registry.register
 class InstagramAdapter(PlatformAdapter):
     platform = 'instagram'
@@ -25,11 +41,39 @@ class InstagramAdapter(PlatformAdapter):
 
     # ------------------------------------------------------------ 认证
 
+    def popup_login_spec(self):
+        return {
+            'login_url': 'https://www.instagram.com/accounts/login/',
+            'required_cookies': ('sessionid', 'ds_user_id'),
+            'cookie_domains': ('instagram.com',),
+            'hint': '在窗口里登录 Instagram（可能要过验证码/挑战）。'
+                    '登录后自动抓 sessionid 导入，比输密码更少触发风控。',
+        }
+
     def auth_fields(self):
         return [{'key': 'username', 'label': 'Instagram 用户名', 'secret': False},
                 {'key': 'password', 'label': '密码', 'secret': True}]
 
     def add_account(self, fields):
+        # 通道一：浏览器登录给来的 sessionid（或整串 cookie）直接建会话
+        sid = (fields.get('sessionid') or '').strip()
+        if not sid and fields.get('cookie'):
+            sid = _pick_cookie(fields['cookie'], 'sessionid')
+        if sid:
+            try:
+                sess = igconnect.IGSession.from_sessionid(sid,
+                                                          proxy=self._proxy)
+            except Exception as e:
+                raise RuntimeError('sessionid 无效或已过期（%s）' % e)
+            info = sess.verify()
+            acct = Account(platform='instagram',
+                           name=(fields.get('name') or info['username']
+                                 or info['uid']),
+                           uid=info['uid'], username=info['username'],
+                           nickname=info['name'])
+            return sess, acct
+
+        # 通道二：账密 + 验证码（原路径，作为兜底保留）
         username = (fields.get('username') or '').strip()
         password = (fields.get('password') or '').strip()
         if not username or not password:

@@ -180,7 +180,7 @@ class PlatformAdapter:
         返回 (sess, Account)；需要验证码时抛 NeedCode 异常（见下），
         hub 引导用户走 submit_code。失败抛异常，hub 记审计并返回错误。
         """
-        raise NotImplementedError
+        raise NotImplementedError('%s 未实现 add_account' % (self.platform or '?'))
 
     def submit_code(self, sess, code):
         """password_2fa 第二段：提交验证码，成功返回 (sess, Account)。"""
@@ -198,15 +198,31 @@ class PlatformAdapter:
         raise NotImplementedError('%s does not support popup login'
                                   % (self.platform or '?'))
 
+    def popup_login_spec(self):
+        """弹窗登录的**平台差异声明**；返回 None 表示该平台不支持。
+
+        同一个 login_browser 驱动按这份声明跑，因此各平台不再需要各自的
+        登录实现。键：
+          login_url         str   登录页地址
+          required_cookies  tuple 判据：这些 cookie 同时出现即视为登录完成
+          cookie_domains    tuple 只保留域里含任一子串的 cookie
+          hint              str   给用户的一句话提示（弹窗里显示）
+          collect_materials callable(page, ctx, cookie_str) -> dict | None
+                           平台专属的额外材料收割（如 TikTok 的 ticket /
+                           私钥 / ts_sign）；返回的 dict 并进 add_account 的
+                           fields。抓到 cookie 后调用，可选。
+        """
+        return None
+
     # ------------------------------------------------------ 会话持久化
 
     def session_dump(self, sess):
         """把会话转成可持久化 dict（hub 存库；重启后 session_load 恢复）。"""
-        raise NotImplementedError
+        raise NotImplementedError('%s 未实现 session_dump' % (self.platform or '?'))
 
     def session_load(self, d):
         """从 session_dump 的 dict 恢复会话。"""
-        raise NotImplementedError
+        raise NotImplementedError('%s 未实现 session_load' % (self.platform or '?'))
 
     def session_status(self, sess):
         """会话健康度：'ok' | 'error'（hub 的账号列表展示用）。"""
@@ -216,11 +232,11 @@ class PlatformAdapter:
 
     def conversations(self, sess):
         """会话列表，按 last_ms 降序。"""
-        raise NotImplementedError
+        raise NotImplementedError('%s 未实现 conversations' % (self.platform or '?'))
 
     def messages(self, sess, conv_id, before_ms=None, limit=30):
         """某会话的消息，旧→新排序；before_ms 用于向上翻页。"""
-        raise NotImplementedError
+        raise NotImplementedError('%s 未实现 messages' % (self.platform or '?'))
 
     def poll(self, sess, state):
         """实时增量收取（CAP_REALTIME 平台）。
@@ -229,14 +245,14 @@ class PlatformAdapter:
         返回 (events, new_state)；events = [{'type': 'message'|'conversation',
         ...统一模型字段}]。
         """
-        raise NotImplementedError
+        raise NotImplementedError('%s 未实现 poll' % (self.platform or '?'))
 
     # -------------------------------------------------------------- 写
 
     def send(self, sess, conv_id, text):
         """发一条文本消息。返回 {'ok': bool, ...平台细节（信任分等）}。"""
-        raise NotImplementedError
+        raise NotImplementedError('%s 未实现 send' % (self.platform or '?'))
 
     def mark_read(self, sess, conv_id, read_index):
         """上报已读（CAP_MARK_READ 平台）。read_index 语义由适配器定义。"""
-        raise NotImplementedError
+        raise NotImplementedError('%s 未实现 mark_read' % (self.platform or '?'))

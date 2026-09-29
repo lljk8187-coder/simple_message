@@ -197,8 +197,31 @@ class IGSession:
     def ensure_login(self):
         """Validate the stored session; re-login with the stored password
         when Instagram rejects it (may raise ChallengeRequired — the user
-        re-adds the account interactively in that case)."""
+        re-adds the account interactively in that case).
+
+        sessionid 导入的会话没有密码：鉴权已在 settings 里，直接放行。
+        """
+        if not self.password:
+            return True
         return self._cl.login(self.username, self.password)
+
+    @classmethod
+    def from_sessionid(cls, sessionid, proxy=None):
+        """用浏览器 web session 的 sessionid 建会话（无需账号密码）。
+
+        IG 的 web 与私有 API 共用同一个 sessionid（形如 ``<uid>%3A...``），
+        instagrapi 的 login_by_sessionid 从中推导 ds_user_id 并装好
+        Authorization 头；sessionid 无效会抛 PrivateError/ValidationError。
+        """
+        from instagrapi import Client
+        cl = Client(proxy=proxy)
+        cl.delay_range = [1, 3]
+        _install_proxy(cl, proxy)
+        cl.login_by_sessionid(sessionid.strip())
+        sess = cls(cl.get_settings(), cl.username or '', '', proxy=proxy,
+                   client=cl)
+        sess._ensured = True             # 刚建好，无需再 ensure
+        return sess
 
     def settings(self):
         return self._cl.get_settings()

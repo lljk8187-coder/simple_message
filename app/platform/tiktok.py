@@ -11,11 +11,51 @@ popup_login 挂载点。
   信任分越低（Z 档 1104）越不该贴近上限。
 """
 import threading
+import time
 
 from . import registry
 from .. import client as cl
 from .base import (PlatformAdapter, Account, Conversation, Message,
                    CAP_SEND, CAP_MARK_READ, CAP_REALTIME)
+
+# ------------------------------------------------------- 弹窗登录：材料收割
+# 开浏览器的**唯一理由**是取这两样东西：wid（即 device_id）与签名材料。
+# 材料在 localStorage 里是密文，解密必须在该站点的 JS 上下文里做，所以这段
+# 必须跑在页面内（而不是把密文抓回本地再解）。
+WID_JS = """
+() => {
+  try {
+    const el = document.querySelector('#__UNIVERSAL_DATA_FOR_REHYDRATION__');
+    if (!el) return null;
+    const data = JSON.parse(el.textContent).__DEFAULT_SCOPE__['webapp.app-context'];
+    return data.wid || null;
+  } catch (e) { return null; }
+}
+"""
+
+MATERIALS_JS = """
+async () => {
+  const signRaw = localStorage.getItem('security-sdk/s_sdk_sign_data_key/tt_fetch');
+  const cryptRaw = localStorage.getItem('security-sdk/s_sdk_crypt_sdk');
+  if (!signRaw || !cryptRaw) return {error: 'materials not in localStorage yet'};
+  const s = JSON.parse(JSON.parse(signRaw).data);
+  if (!s.encrypt_ticket || !s.ts_sign) return {error: 'sign data incomplete'};
+  const b = Uint8Array.from(atob(s.encrypt_ticket), c => c.charCodeAt(0));
+  const k = await crypto.subtle.importKey('raw',
+      new TextEncoder().encode('tt-ticket-guard-iv'), 'PBKDF2', false, ['deriveKey']);
+  const kk = await crypto.subtle.deriveKey(
+      {name: 'PBKDF2', salt: new TextEncoder().encode('secure-salt'),
+       iterations: 1000, hash: 'SHA-256'}, k,
+      {name: 'AES-GCM', length: 128}, false, ['decrypt']);
+  const ticket = new TextDecoder().decode(
+      await crypto.subtle.decrypt({name: 'AES-GCM', iv: b.slice(0, 12)}, kk, b.slice(12)));
+  const crypt = JSON.parse(JSON.parse(cryptRaw).data);
+  const private_key = (crypt.ec_privateKey || '')
+      .replace(/-----[A-Z ]+-----/g, '').replace(/\\s+/g, '');
+  if (!ticket || !private_key) return {error: 'materials incomplete'};
+  return {ticket, private_key, ts_sign: s.ts_sign};
+}
+"""
 
 
 @registry.register
@@ -31,6 +71,52 @@ class TikTokAdapter(PlatformAdapter):
         self._http = None
         self._lock = threading.Lock()
         self._short = {}                 # (uid, conv_id) -> short_id
+
+    # ---------------------------------------------------------- 弹窗登录
+
+    def popup_login_spec(self):
+        return {
+            'login_url': 'https://www.tiktok.com/login',
+            'required_cookies': ('sessionid', 'sessionid_ss'),
+            'cookie_domains': ('tiktok',),
+            'hint': '在窗口里登录 TikTok（密码 / 扫码 / 验证码都行）。'
+                    '登录完成后会自动收割签名材料（ticket + 私钥），'
+                    '这一步是最高信任档的输入。',
+            'collect_materials': self._collect_materials,
+        }
+
+    def _collect_materials(self, page, ctx, cookie_str):
+        """页面内收割 wid（device_id）与 ticket / 私钥 / ts_sign。
+
+        必须在登录后的页面上下文里跑：材料在 localStorage 是密文，
+        密钥派生与解密只有该站点的 JS 能做。
+        """
+        time.sleep(4)                    # 等安全 SDK 初始化完再读
+        wid = None
+        for _ in range(10):
+            try:
+                wid = page.evaluate(WID_JS)
+            except Exception:
+                wid = None
+            if wid:
+                break
+            time.sleep(2)
+        mats = None
+        for _ in range(20):
+            try:
+                mats = page.evaluate(MATERIALS_JS)
+            except Exception:
+                mats = None
+            if mats and not mats.get('error'):
+                break
+            time.sleep(3)
+        if not mats or mats.get('error'):
+            raise RuntimeError('materials not readable: %s'
+                               % (mats or {}).get('error', 'timeout'))
+        return {'ticket': mats['ticket'],
+                'private_key': mats['private_key'],
+                'ts_sign': mats['ts_sign'],
+                'device_id': wid or ''}
 
     # ------------------------------------------------------------ 内部工具
 

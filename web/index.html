@@ -114,7 +114,6 @@
   <button class="btn" id="btnSync">同步</button>
   <span class="spacer"></span>
   <span style="font-size:12px;color:var(--fg3)" id="who"></span>
-  <button class="btn" id="btnBrowserLogin" title="弹出浏览器窗口登录一次，材料自动收割入库">浏览器登录</button>
   <button class="btn" id="btnHarvest" title="从已登录的浏览器里取写入凭据">收割凭据</button>
   <button class="btn" id="btnBatch" title="一条消息发送给多个会话（可跨平台）">批量发送</button>
   <button class="btn primary" id="btnAdd">添加账号</button>
@@ -150,12 +149,24 @@
     <div class="field">
       <label>平台</label>
       <select id="fPlat" style="width:100%;background:var(--bg2);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:8px">
-        <option value="tiktok">TikTok（贴 cookie 即收发）</option>
-        <option value="x">X / Twitter（贴 cookie，发送信任分较低但可用）</option>
-        <option value="instagram">Instagram（账号密码登录，首次或要验证码）</option>
-        <option value="facebook">Facebook（贴 cookie；1:1 走 E2EE 桥）</option>
+        <option value="tiktok">TikTok（浏览器登录，可拿最高信任分）</option>
+        <option value="x">X / Twitter（浏览器登录或贴 cookie）</option>
+        <option value="instagram">Instagram（浏览器登录或账号密码）</option>
+        <option value="facebook">Facebook（仅手工导入 cookie）</option>
       </select>
     </div>
+
+    <div class="field" id="fPopRow">
+      <button class="btn primary" id="btnPopupLogin" style="width:100%">浏览器登录（推荐）</button>
+      <p class="hint" id="popHint" style="margin:8px 0 0"></p>
+      <p class="hint" id="popState" style="margin:6px 0 0;display:none"></p>
+    </div>
+
+    <details id="manualBox">
+      <summary>手工导入（高级）</summary>
+      <p class="hint" style="margin:6px 0 12px">
+        不想开浏览器窗口时用这里：粘 cookie（IG 也可改用账号密码登录）。
+      </p>
     <div class="field" id="fIgFields" style="display:none">
       <label>Instagram 用户名 / 密码</label>
       <input id="fIgUser" placeholder="username" autocomplete="off" style="width:100%;margin-bottom:6px">
@@ -172,10 +183,11 @@
       <code>Cookie</code> 请求头）。必须包含 <code>auth_token</code> 和 <code>ct0</code>。
       收发全自动；已读回执暂不支持。
     </p>
-    <div class="field">
-      <label>Cookie</label>
-      <textarea id="fCookie" rows="5" placeholder="tt_chain_token=…; sessionid=…; uid_tt=…"></textarea>
-    </div>
+      <div class="field">
+        <label>Cookie</label>
+        <textarea id="fCookie" rows="5" placeholder="tt_chain_token=…; sessionid=…; uid_tt=…"></textarea>
+      </div>
+    </details>
     <div class="field">
       <label>账号名（留空则用用户名）</label>
       <input type="text" id="fName" placeholder="jakson">
@@ -610,7 +622,13 @@ $('#btnSync').onclick = async () => {
   try { const d = await jpost(`/api/accounts/${encodeURIComponent(ACCT)}/sync`); toast('已同步 ' + (d.conversations||0) + ' 个会话'); }
   catch (e) { toast('同步失败：' + e.message, true); }
 };
-$('#btnAdd').onclick = () => $('#modal').classList.add('show');
+$('#btnAdd').onclick = () => {
+  $('#modal').classList.add('show');
+  $('#btnPopupLogin').disabled = false;
+  $('#popState').style.display = 'none';
+  $('#popState').textContent = '';
+  syncPlatformFields();
+};
 // ------------------------------------------------------------- batch send
 $('#btnBatch').onclick = async () => {
   $('#batchModal').classList.add('show');
@@ -672,7 +690,16 @@ $('#btnBatchGo').onclick = async () => {
     $('#batchOut').textContent = '发送失败：' + e.message;
   } finally { btn.disabled = false; }
 };
-$('#fPlat').onchange = () => {
+// 浏览器登录：平台差异由后端的 popup_login_spec 决定，这里只放文案与开关
+const POPUP_HINT = {
+  tiktok: '弹出一个独立浏览器窗口登录 TikTok（密码 / 扫码 / 验证码都行）；'
+        + '登录后自动收割签名材料（ticket + 私钥）并导入。',
+  x: '弹出窗口登录 X（可能要过手机号 / 邮箱验证）；'
+   + '登录后自动抓 auth_token 与 ct0，不用手工复制。',
+  instagram: '弹出窗口登录 Instagram（可能要过验证码 / 挑战）；'
+           + '登录后抓 sessionid 导入，比输密码更少触发风控。'
+};
+const syncPlatformFields = () => {
   const v = $('#fPlat').value;
   const isX = v === 'x', isIG = v === 'instagram', isFB = v === 'facebook';
   $('#platHintTikTok').style.display = isX || isIG ? 'none' : '';
@@ -684,24 +711,51 @@ $('#fPlat').onchange = () => {
     : isFB
       ? 'c_user=…; xs=…; datr=…; fr=…'
       : 'tt_chain_token=…; sessionid=…; uid_tt=…';
+  const hasPopup = !!POPUP_HINT[v];
+  $('#fPopRow').style.display = hasPopup ? '' : 'none';
+  $('#popHint').textContent = hasPopup ? POPUP_HINT[v] : '';
+  if (!hasPopup) $('#manualBox').open = true;   // 没有弹窗登录，只能手工
 };
-$('#btnBrowserLogin').onclick = async () => {
+$('#fPlat').onchange = syncPlatformFields;
+
+let popTimer = null;
+$('#btnPopupLogin').onclick = async () => {
+  const plat = $('#fPlat').value;
+  const btn = $('#btnPopupLogin');
+  const show = (t, bad) => {
+    const el = $('#popState');
+    el.style.display = ''; el.textContent = t;
+    el.style.color = bad ? '#e05252' : '';
+  };
+  btn.disabled = true;
   try {
-    await jpost('/api/login/browser', {});
-    toast('浏览器已打开：请在窗口里登录 TikTok，完成后自动导入');
-    const timer = setInterval(async () => {
+    const r = await jpost('/api/login/browser', { platform: plat });
+    if (r.state && r.state.phase === 'error') {
+      btn.disabled = false; show(r.state.detail, true); return;
+    }
+    show('浏览器已打开：请在窗口里登录，完成后自动导入…');
+    clearInterval(popTimer);
+    popTimer = setInterval(async () => {
       try {
         const s = (await (await fetch('/api/login/state')).json()).state;
         if (s.phase === 'done') {
-          clearInterval(timer); toast(s.detail || '登录导入完成'); loadAccounts();
+          clearInterval(popTimer);
+          show(s.detail || '登录导入完成');
+          toast(s.detail || '登录导入完成');
+          $('#modal').classList.remove('show');
+          loadAccounts();
         } else if (s.phase === 'error' || s.phase === 'cancelled') {
-          clearInterval(timer); toast('浏览器登录：' + s.detail, true);
-        } else if (s.phase !== 'idle') {
-          toast('浏览器登录：' + s.detail || s.phase);
+          clearInterval(popTimer); btn.disabled = false;
+          show('浏览器登录：' + s.detail, true);
+        } else if (s.detail) {
+          show(s.detail);
         }
       } catch (e) { /* transient */ }
     }, 2000);
-  } catch (e) { toast('浏览器登录启动失败：' + e.message, true); }
+  } catch (e) {
+    btn.disabled = false;
+    show('浏览器登录启动失败：' + e.message, true);
+  }
 };
 $('#btnCancel').onclick = () => $('#modal').classList.remove('show');
 $('#btnSave').onclick = async () => {

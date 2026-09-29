@@ -20,6 +20,17 @@ class XAdapter(PlatformAdapter):
     capabilities = (CAP_SEND,)
     send_limits = {'min_interval_s': 15, 'daily_cap': 100}
 
+    # ---------------------------------------------------------- 弹窗登录
+
+    def popup_login_spec(self):
+        return {
+            'login_url': 'https://x.com/i/flow/login',
+            'required_cookies': ('auth_token', 'ct0'),
+            'cookie_domains': ('x.com', 'twitter.com'),
+            'hint': '在窗口里登录 X（可能要求手机号/邮箱验证）。'
+                    '登录后自动抓取 auth_token 与 ct0，无需手工复制。',
+        }
+
     # ------------------------------------------------------------ 认证
 
     def auth_fields(self):

@@ -429,7 +429,11 @@ class Handler(BaseHTTPRequestHandler):
     # ------------------------------------------------------- TikTok 弹窗登录
 
     def h_login_start(self, q):
-        started, state = self.login_flow.start()
+        """{platform} 缺省为 tiktok（兼容旧调用）。平台差异见适配器的
+        popup_login_spec()。"""
+        body = self._body()
+        platform = (body.get('platform') or 'tiktok').strip()
+        started, state = self.login_flow.start(platform)
         self._json({'started': started, 'state': state})
 
     def h_login_state(self, q):
@@ -479,9 +483,16 @@ def create_server(host, port, hub, store, client, config):
     Handler.client = client
     Handler.config = config
     Handler._pending = harvest.Pending()
+
+    # 弹窗登录的浏览器 profile 跟随 --data-dir：原先硬编码为 <项目>/data，
+    # 于是换库（例如 --data-dir data-test）测试时仍复用同一浏览器身份，
+    # 登录态会串味。现在 profile 落在 <data_dir>/login-profile/<平台>。
+    data_dir = config.get('data_dir') or 'data'
+    if not os.path.isabs(data_dir):
+        data_dir = os.path.abspath(os.path.join(
+            os.path.dirname(WEB_DIR), data_dir))
     Handler.login_flow = login_browser.BrowserLogin(
         store, hub, client,
-        profile_dir=os.path.abspath(os.path.join(
-            WEB_DIR, os.pardir, 'data', 'login-profile')),
+        profile_root=os.path.join(data_dir, 'login-profile'),
         proxy=client.proxy)
     return ThreadingHTTPServer((host, port), Handler)
