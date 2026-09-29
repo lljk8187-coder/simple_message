@@ -41,9 +41,9 @@ def load_adapters():
     import importlib
     for name in _MODULES:
         try:
-            importlib.import_module('.' + name, __name__)
+            importlib.import_module('.' + name, __package__)
         except ModuleNotFoundError as e:
             # 仅当缺失的是适配器模块本身时跳过；其内部依赖缺失照常抛出
-            if name in str(e):
+            if ('.' + name) in str(e) or name in str(e).split():
                 continue
             raise

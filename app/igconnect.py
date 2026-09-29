@@ -22,6 +22,26 @@ import threading
 LAZY_ERR = 'instagrapi is not installed — run: pip install instagrapi'
 
 
+def _install_proxy(cl, proxy):
+    """显式把代理装到 instagrapi 的**全部**传输上。
+
+    只给 Client(proxy=...) 并不够：3.x 的私有走 curl（会带上），但
+    requests 系的 public/graphql 会话不带显式代理时会回落到进程环境变量
+    ——而环境变量里常是一条死代理（502 Bad Gateway）。requests 的语义是
+    显式 session.proxies 优先于环境（setdefault），所以写死即根治。
+    """
+    if not proxy:
+        return
+    proxies = {'http': proxy, 'https': proxy}
+    for attr in ('public', 'private', 'graphql'):
+        s = getattr(cl, attr, None)
+        if s is not None and hasattr(s, 'proxies'):
+            try:
+                s.proxies = dict(proxies)
+            except Exception:
+                pass
+
+
 def _fix_nonascii_ca_bundle():
     """curl on Windows cannot open CA bundles under non-ASCII paths — curl
     error 77, "error adding trust anchors from locations: CAfile". The hub
@@ -127,6 +147,7 @@ class IGLogin:
             raise RuntimeError(LAZY_ERR)
         cl = Client(proxy=self.proxy)
         cl.delay_range = [1, 3]
+        _install_proxy(cl, self.proxy)
         cl.challenge_code_handler = self._challenge_handler
         self.client = cl
         try:
@@ -158,15 +179,17 @@ class IGLogin:
 class IGSession:
     """One logged-in Instagram account backed by persisted settings."""
 
-    def __init__(self, settings, username, password, proxy=None):
+    def __init__(self, settings, username, password, proxy=None, client=None):
         from instagrapi import Client
-        self._cl = Client(proxy=proxy)
+        self._cl = client or Client(proxy=proxy)
         self._cl.delay_range = [1, 3]
+        _install_proxy(self._cl, proxy)
         if settings:
             self._cl.set_settings(settings)
         self._cl.username = username
         self._cl.password = password
         self.username = username
+        self.password = password
         self._me_uid = None
 
     # ------------------------------------------------------------ lifecycle

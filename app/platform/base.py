@@ -56,7 +56,8 @@
 """
 from dataclasses import dataclass, asdict
 
-__all__ = ['Account', 'Conversation', 'Message', 'Contact', 'PlatformAdapter']
+__all__ = ['Account', 'Conversation', 'Message', 'Contact', 'PlatformAdapter',
+           'NeedCode', 'CAP_SEND', 'CAP_MARK_READ', 'CAP_REALTIME']
 
 
 # ------------------------------------------------------------ 统一消息模型
@@ -76,7 +77,10 @@ class Account:
 
 @dataclass
 class Conversation:
-    """通道账号 × 对端 的会话。conv_id 的格式由适配器自定（跨平台不比较）。"""
+    """通道账号 × 对端 的会话。conv_id 的格式由适配器自定（跨平台不比较）。
+
+    account 字段由 hub 盖章（适配器可以留空——hub 知道自己用哪个账号调的）。
+    """
     platform: str
     account: str                     # 所属 hub 账号名
     conv_id: str
@@ -131,6 +135,17 @@ CAP_MARK_READ = 'mark_read'
 CAP_REALTIME = 'realtime'
 
 
+class NeedCode(Exception):
+    """add_account 中途需要验证码。
+
+    state 携带登录句柄（适配器自定义），hub 引导用户提交后原样传回
+    adapter.submit_code(state, code)。
+    """
+    def __init__(self, state=None, message='verification code required'):
+        super().__init__(message)
+        self.state = state
+
+
 class PlatformAdapter:
     """所有平台适配器的基类。子类必须设置类属性并覆写对应方法。"""
 
@@ -140,6 +155,11 @@ class PlatformAdapter:
     capabilities = ()                # (CAP_SEND, CAP_MARK_READ, CAP_REALTIME) 子集
     send_limits = {'min_interval_s': 0, 'daily_cap': 0}
     #                                     0 = 未申报；代发队列对 0 采取保守默认值
+
+    def __init__(self, config=None):
+        # config：hub 注入的运行环境，至少含 'proxy'；各适配器按需取其他键。
+        self.config = config or {}
+        self._proxy = self.config.get('proxy')
 
     # ------------------------------------------------------------ 认证
 
