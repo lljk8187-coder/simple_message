@@ -67,6 +67,63 @@ CREATE TABLE IF NOT EXISTS profiles (
   fetched_ms INTEGER,
   PRIMARY KEY (account, uid)
 );
+
+-- ── 阶段 2 预备表（统一消息中心内核：联系人 / 代发 / 审计）──────────
+-- 本阶段只建结构不写入；写入方法随代发队列一起落地。
+
+CREATE TABLE IF NOT EXISTS contacts (
+  contact_id   TEXT PRIMARY KEY,          -- 内部 id（uuid）
+  display_name TEXT,
+  note         TEXT,
+  tags         TEXT,                       -- 逗号分隔
+  created_ms   INTEGER
+);
+
+-- 一个联系人（Contact）在各平台的身份挂靠
+CREATE TABLE IF NOT EXISTS channel_identities (
+  contact_id  TEXT NOT NULL,
+  platform    TEXT NOT NULL,
+  account     TEXT NOT NULL,               -- hub 账号名
+  peer_uid    TEXT NOT NULL,               -- 平台侧对端 id
+  created_ms  INTEGER,
+  PRIMARY KEY (platform, account, peer_uid)
+);
+
+-- 代发任务（一条文案 + 目标会话集），Brevo 语义：调度后配置冻结，可暂停/重排
+CREATE TABLE IF NOT EXISTS campaigns (
+  campaign_id TEXT PRIMARY KEY,
+  text        TEXT NOT NULL,
+  created_by  TEXT,
+  schedule_ms INTEGER,                     -- 首批发送时间
+  batch_size  INTEGER,                     -- 每批人数
+  interval_s  INTEGER,                     -- 批间隔秒
+  status      TEXT,                        -- draft|queued|running|paused|done|cancelled
+  created_ms  INTEGER
+);
+
+-- 队列项：逐目标的状态机 queued→sending→sent|failed（含平台信任分留痕）
+CREATE TABLE IF NOT EXISTS dispatch_items (
+  campaign_id  TEXT NOT NULL,
+  seq          INTEGER NOT NULL,
+  platform     TEXT,
+  account      TEXT,
+  conv_id      TEXT,
+  status       TEXT,
+  error        TEXT,
+  sent_ms      INTEGER,
+  guard_result TEXT,
+  PRIMARY KEY (campaign_id, seq)
+);
+
+-- 审计日志：append-only，谁/何时/对谁/什么动作/结果
+CREATE TABLE IF NOT EXISTS audit_log (
+  id     INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts_ms  INTEGER,
+  actor  TEXT,
+  action TEXT,
+  target TEXT,
+  detail TEXT                            -- JSON
+);
 """
 
 
@@ -74,12 +131,43 @@ class Store:
     def __init__(self, path):
         os.makedirs(os.path.dirname(os.path.abspath(path)) or '.', exist_ok=True)
         self._lock = threading.RLock()
+        needs_upgrade = self._needs_upgrade(path)
+        if needs_upgrade:
+            # 任何 schema 升级前先留一份快照；升级一次性、自动、无需人工。
+            stamp = time.strftime('%Y%m%d-%H%M%S')
+            backup = '%s.backup-%s' % (path, stamp)
+            try:
+                import shutil
+                shutil.copyfile(path, backup)
+                self.backup_path = backup
+            except OSError:
+                self.backup_path = None
+        else:
+            self.backup_path = None
         self._db = sqlite3.connect(path, check_same_thread=False)
         self._db.row_factory = sqlite3.Row
         with self._lock:
             self._db.executescript(SCHEMA)
             self._migrate()
             self._db.commit()
+
+    @staticmethod
+    def _needs_upgrade(path):
+        """True when an existing pre-versioned DB is about to be upgraded."""
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            return False
+        try:
+            con = sqlite3.connect(path)
+            try:
+                ver = con.execute('PRAGMA user_version').fetchone()[0]
+                has_accounts = con.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' "
+                    "AND name='accounts'").fetchone()
+                return ver < 1 and bool(has_accounts)
+            finally:
+                con.close()
+        except sqlite3.Error:
+            return False
 
     def _migrate(self):
         """Add columns introduced after the first release, so an old hub.db keeps working."""
@@ -95,11 +183,27 @@ class Store:
             # waiting on the server; 0 here would look authoritative until the next
             # list sync, so start them at NULL (rendered as "unknown") instead.
             self._db.execute('UPDATE conversations SET unread = NULL')
+        # 版本化：阶段 1 重构（统一模型 + 阶段 2 预备表）之后即为 version 1。
+        self._db.execute('PRAGMA user_version = 1')
 
     # ------------------------------------------------------------ accounts
 
+    def _ensure_platform_free(self, name, platform):
+        """账号名全平台唯一：同名已被其它平台占用时拒绝写入。
+
+        这是 (platform, name) 唯一性的落地形态——以全局唯一的 name 为键、
+        platform 为属性，避免重建四张表；跨平台撞名要求换一个标签名。
+        """
+        with self._lock:
+            row = self._db.execute('SELECT platform FROM accounts WHERE name=?',
+                                   (name,)).fetchone()
+        if row and (row['platform'] or 'tiktok') != platform:
+            raise ValueError('账号名 %r 已被 %s 平台占用，请换一个名字'
+                             % (name, row['platform'] or 'tiktok'))
+
     def save_account(self, name, sess, profile=None):
         p = profile or {}
+        self._ensure_platform_free(name, getattr(sess, 'platform', '') or 'tiktok')
         d = sess.to_dict()
         now = int(time.time() * 1000)
         with self._lock:
@@ -122,8 +226,8 @@ class Store:
 
     def save_x_account(self, name, uid, username='', nickname='', cookie_json=''):
         """Store an X (Twitter) account: cookie JSON in the cookie column,
-        no TikTok signing materials. Caller guards against name collisions
-        with existing TikTok accounts."""
+        no TikTok signing materials."""
+        self._ensure_platform_free(name, 'x')
         now = int(time.time() * 1000)
         with self._lock:
             self._db.execute(
@@ -139,8 +243,8 @@ class Store:
 
     def save_platform_account(self, name, uid, username='', nickname='',
                               cookie_json='', platform='x'):
-        """Generic non-TikTok account store (platform explicit). Caller
-        guards against name collisions with other platforms."""
+        """Generic non-TikTok account store (platform explicit)."""
+        self._ensure_platform_free(name, platform)
         now = int(time.time() * 1000)
         with self._lock:
             self._db.execute(
@@ -156,8 +260,8 @@ class Store:
 
     def save_ig_account(self, name, uid, username='', nickname='', cookie_json=''):
         """Store an Instagram account: cookie column holds JSON with the
-        instagrapi settings dict + password (re-login needs it). Caller
-        guards against name collisions with other platforms."""
+        instagrapi settings dict + password (re-login needs it)."""
+        self._ensure_platform_free(name, 'instagram')
         now = int(time.time() * 1000)
         with self._lock:
             self._db.execute(
