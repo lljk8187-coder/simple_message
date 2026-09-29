@@ -84,7 +84,8 @@ class Store:
     def _migrate(self):
         """Add columns introduced after the first release, so an old hub.db keeps working."""
         cols = {r['name'] for r in self._db.execute('PRAGMA table_info(accounts)')}
-        for name, ddl in (('private_key', 'TEXT'), ('ts_sign', 'TEXT')):
+        for name, ddl in (('private_key', 'TEXT'), ('ts_sign', 'TEXT'),
+                          ('platform', "TEXT NOT NULL DEFAULT 'tiktok'")):
             if name not in cols:
                 self._db.execute('ALTER TABLE accounts ADD COLUMN %s %s' % (name, ddl))
         ccols = {r['name'] for r in self._db.execute('PRAGMA table_info(conversations)')}
@@ -119,6 +120,23 @@ class Store:
                  d['private_key'], d['ts_sign'], now, now))
             self._db.commit()
 
+    def save_x_account(self, name, uid, username='', nickname='', cookie_json=''):
+        """Store an X (Twitter) account: cookie JSON in the cookie column,
+        no TikTok signing materials. Caller guards against name collisions
+        with existing TikTok accounts."""
+        now = int(time.time() * 1000)
+        with self._lock:
+            self._db.execute(
+                """INSERT INTO accounts (name, uid, username, nickname, cookie,
+                                         platform, created_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?)
+                   ON CONFLICT(name) DO UPDATE SET
+                     uid=excluded.uid, username=excluded.username,
+                     nickname=excluded.nickname, cookie=excluded.cookie,
+                     platform='x', updated_at=excluded.updated_at""",
+                (name, uid, username, nickname, cookie_json, 'x', now, now))
+            self._db.commit()
+
     def get_account(self, name):
         with self._lock:
             row = self._db.execute('SELECT * FROM accounts WHERE name=?', (name,)).fetchone()
@@ -127,8 +145,8 @@ class Store:
     def list_accounts(self):
         with self._lock:
             rows = self._db.execute(
-                'SELECT name, uid, username, nickname, avatar, region, updated_at '
-                'FROM accounts ORDER BY updated_at DESC').fetchall()
+                'SELECT name, uid, username, nickname, avatar, region, platform, '
+                'updated_at FROM accounts ORDER BY updated_at DESC').fetchall()
         return [dict(r) for r in rows]
 
     def delete_account(self, name):

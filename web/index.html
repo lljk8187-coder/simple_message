@@ -142,11 +142,23 @@
 <div id="modal">
   <div class="card">
     <h3>添加账号</h3>
-    <p class="hint">
+    <div class="field">
+      <label>平台</label>
+      <select id="fPlat" style="width:100%;background:var(--bg2);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:8px">
+        <option value="tiktok">TikTok（贴 cookie 即收发）</option>
+        <option value="x">X / Twitter（贴 cookie，发送信任分较低但可用）</option>
+      </select>
+    </div>
+    <p class="hint" id="platHintTikTok">
       需要一个已登录的 <b>tiktok.com</b> 会话 cookie。在浏览器里打开 devtools →
       Application/存储 → Cookies → <code>https://www.tiktok.com</code>，全选复制；
       或从任意一个发往 <code>tiktok.com</code> 的请求里复制 <code>Cookie</code> 请求头。
       必须包含 <code>sessionid</code>。
+    </p>
+    <p class="hint" id="platHintX" style="display:none">
+      需要一个已登录的 <b>x.com</b> 会话 cookie（F12 → Network → 任意请求的
+      <code>Cookie</code> 请求头）。必须包含 <code>auth_token</code> 和 <code>ct0</code>。
+      收发全自动；已读回执暂不支持。
     </p>
     <div class="field">
       <label>Cookie</label>
@@ -316,8 +328,12 @@ async function loadAccounts(select) {
   ACCOUNTS.forEach(a => {
     const o = document.createElement('option');
     o.value = a.name;
-    const mode = a.write_tier ? ' · 档位' + a.write_tier : ' · 只读';
-    o.textContent = (a.nickname || a.username || a.name) + ' · ' + a.uid.slice(-6) + mode;
+    if (a.platform === 'x') {
+      o.textContent = (a.nickname || a.username || a.name) + ' · X' + (a.writable ? ' · 可发' : ' · 未连');
+    } else {
+      const mode = a.write_tier ? ' · 档位' + a.write_tier : ' · 只读';
+      o.textContent = (a.nickname || a.username || a.name) + ' · ' + a.uid.slice(-6) + mode;
+    }
     sel.appendChild(o);
   });
   const want = select || ACCT || (ACCOUNTS[0] && ACCOUNTS[0].name);
@@ -406,7 +422,7 @@ async function openConv(c){
   CUR = c; SEEN = new Set(); LAST_REQUESTED_US = null;
   SEEN_BASE[c.conv_id] = c.unread || 0;   // opening = seen, locally
   $('#chatTitle').textContent = c.peer_nickname || c.peer_unique || ('uid ' + c.peer_uid);
-  $('#chatSub').textContent = `uid ${c.peer_uid} · short_id ${c.short_id}`;
+  $('#chatSub').textContent = `uid ${c.peer_uid}${c.short_id ? ' · short_id ' + c.short_id : ''}`;
   $('#text').disabled = $('#sendBtn').disabled = false;
   $('#msgs').innerHTML = '<div class="empty">加载消息…</div>';
   renderConvs();
@@ -560,6 +576,14 @@ $('#btnSync').onclick = async () => {
   catch (e) { toast('同步失败：' + e.message, true); }
 };
 $('#btnAdd').onclick = () => $('#modal').classList.add('show');
+$('#fPlat').onchange = () => {
+  const isX = $('#fPlat').value === 'x';
+  $('#platHintTikTok').style.display = isX ? 'none' : '';
+  $('#platHintX').style.display = isX ? '' : 'none';
+  $('#fCookie').placeholder = isX
+    ? 'auth_token=…; ct0=…; twid=…'
+    : 'tt_chain_token=…; sessionid=…; uid_tt=…';
+};
 $('#btnBrowserLogin').onclick = async () => {
   try {
     await jpost('/api/login/browser', {});
@@ -582,6 +606,18 @@ $('#btnCancel').onclick = () => $('#modal').classList.remove('show');
 $('#btnSave').onclick = async () => {
   const btn = $('#btnSave'); btn.disabled = true;
   try {
+    if ($('#fPlat').value === 'x') {
+      const r = await jpost('/api/x/add', {
+        cookies: $('#fCookie').value.trim(),
+        name: $('#fName').value.trim(),
+      });
+      toast('已添加 X 账号 ' + r.username + '（发送已就绪）');
+      $('#modal').classList.remove('show');
+      ['fCookie','fName'].forEach(id => $('#'+id).value = '');
+      ACCT = null;
+      await loadAccounts(r.name);
+      return;
+    }
     const guard = {};
     if ($('#fPk').value.trim()) guard['tt-ticket-guard-public-key'] = $('#fPk').value.trim();
     if ($('#fCd').value.trim()) guard['tt-ticket-guard-client-data'] = $('#fCd').value.trim();

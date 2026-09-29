@@ -155,8 +155,19 @@ class XSession:
         return out[0] if isinstance(out, tuple) else out
 
     def verify(self):
-        """Who am I — cheap round trip that also proves the cookies work."""
-        d = self._loop.call(self._verify_raw())
+        """Who am I — cheap round trip that also proves the cookies work.
+
+        One retry: X's edge intermittently serves a spurious 404 (code 34)
+        on this endpoint — a single retry clears it (observed live)."""
+        last = None
+        for attempt in range(2):
+            try:
+                d = self._loop.call(self._verify_raw())
+                break
+            except Exception as e:
+                last = e
+        else:
+            raise RuntimeError('%s: %s' % (type(last).__name__, last))
         if isinstance(d, dict) and d.get('errors'):
             raise RuntimeError(str(d['errors'][0]))
         return {'uid': str(d.get('id_str') or d.get('id') or ''),
@@ -226,6 +237,31 @@ class XSession:
         return out
 
     # ------------------------------------------------------------- history
+
+    def inbox_diag(self):
+        """Raw shape of the inbox answer — distinguishes 'account has no DMs'
+        from 'my parser missed the data'."""
+        try:
+            out = self._loop.call(self._inbox_diag_raw())
+        except Exception as e:
+            return {'error': '%s: %s' % (type(e).__name__, e)}
+        if not isinstance(out, dict):
+            return {'type': type(out).__name__}
+        state = out.get('inbox_initial_state') if isinstance(out.get('inbox_initial_state'), dict) else out
+        return {
+            'top_keys': sorted(str(k) for k in out.keys())[:12],
+            'conversations': len(state.get('conversations') or {}),
+            'entries': len(state.get('entries') or []),
+            'user_events': len(state.get('user_events') or {}),
+            'errors': out.get('errors') or None,
+        }
+
+    async def _inbox_diag_raw(self):
+        from twikit.client.v11 import Endpoint
+        out, _ = await self._client.request(
+            'GET', Endpoint.DM_INBOX,
+            params=_INBOX_PARAMS, headers=self._client._base_headers)
+        return out
 
     def history(self, peer_uid, max_id=None):
         """Messages with one peer, oldest first (hub message shape)."""
@@ -336,6 +372,10 @@ def probe(cookie_str, proxy=None, with_history_uid=None):
                                        'first': convs[0] if convs else None}
         except Exception as e:
             report['conversations'] = {'error': '%s: %s' % (type(e).__name__, e)}
+        try:
+            report['inbox_diag'] = sess.inbox_diag()
+        except Exception as e:
+            report['inbox_diag'] = {'error': '%s: %s' % (type(e).__name__, e)}
         if with_history_uid:
             try:
                 msgs, cursor = sess.history(with_history_uid)

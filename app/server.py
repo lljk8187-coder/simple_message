@@ -26,6 +26,7 @@ class Handler(BaseHTTPRequestHandler):
     config = None
     _pending = None     # harvest.Pending
     login_flow = None   # login_browser.BrowserLogin
+    x_sessions = {}     # name -> xconnect.XSession (platform 'x')
 
     # ------------------------------------------------------------- helpers
 
@@ -83,6 +84,10 @@ class Handler(BaseHTTPRequestHandler):
         ('POST', r'^/api/accounts/(?P<name>[^/]+)/send$', 'send'),
         ('POST', r'^/api/accounts/(?P<name>[^/]+)/read$', 'mark_read'),
         ('POST', r'^/api/x/probe$', 'x_probe'),
+        ('POST', r'^/api/x/add$', 'x_add'),
+        ('GET', r'^/api/x/accounts/(?P<name>[^/]+)/conversations$', 'x_conversations'),
+        ('GET', r'^/api/x/accounts/(?P<name>[^/]+)/messages$', 'x_messages'),
+        ('POST', r'^/api/x/accounts/(?P<name>[^/]+)/send$', 'x_send'),
         ('POST', r'^/api/accounts/(?P<name>[^/]+)/focus$', 'focus'),
         ('GET', r'^/api/events$', 'events'),
         ('GET', r'^/api/harvest$', 'harvest_get'),
@@ -172,6 +177,14 @@ class Handler(BaseHTTPRequestHandler):
     def h_list_accounts(self, q):
         out = []
         for a in self.store.list_accounts():
+            a['platform'] = a.get('platform') or 'tiktok'
+            if a['platform'] == 'x':
+                a['status'] = 'ok' if a['name'] in self.x_sessions else 'down'
+                a['stats'] = {'conversations': 0, 'messages': 0}
+                a['writable'] = a['name'] in self.x_sessions
+                a['write_tier'] = 'X'
+                out.append(a)
+                continue
             st = self.hub.status.get(a['name'], {})
             a['status'] = st.get('state', 'idle')
             a['status_detail'] = st.get('detail', '')
@@ -249,10 +262,14 @@ class Handler(BaseHTTPRequestHandler):
         self._json({'ok': True, 'conversations': len(convs), 'meta': meta.get('meta')})
 
     def h_conversations(self, q, name):
+        if self._platform(name) == 'x':
+            return self.h_x_conversations(q, name)
         self._require(name)
         self._json({'conversations': self.store.list_conversations(name)})
 
     def h_messages(self, q, name):
+        if self._platform(name) == 'x':
+            return self.h_x_messages(q, name)
         self._require(name)
         conv_id = (q.get('conv_id') or [''])[0]
         if not conv_id:
@@ -288,6 +305,8 @@ class Handler(BaseHTTPRequestHandler):
                     'conversation': conv})
 
     def h_send(self, q, name):
+        if self._platform(name) == 'x':
+            return self.h_x_send(q, name)
         self._require(name)
         sess = self.hub.sessions[name]
         guard, tier = api.ticket_guard_headers(sess, '/v1/message/send')
@@ -317,6 +336,9 @@ class Handler(BaseHTTPRequestHandler):
         the effect lands on the peer's side as the "seen" mark — the local
         unread counters this hub displays stay frontend-owned.
         """
+        if self._platform(name) == 'x':
+            return self._json({'ok': False,
+                               'skipped': 'X read receipts not supported yet'})
         self._require(name)
         sess = self.hub.sessions[name]
         body = self._body()
@@ -430,6 +452,78 @@ class Handler(BaseHTTPRequestHandler):
         if name not in self.hub.sessions:
             raise api.ApiError('account %r is not loaded' % name)
 
+    # ------------------------------------------------- platform: X dispatch
+
+    def _x_sess(self, name):
+        sess = self.x_sessions.get(name)
+        if not sess:
+            raise api.ApiError('X session %r is not loaded' % name)
+        return sess
+
+    def _platform(self, name):
+        row = self.store.get_account(name) or {}
+        return row.get('platform') or 'tiktok'
+
+    def h_x_add(self, q):
+        """Add an X (Twitter) account from pasted x.com cookies."""
+        body = self._body()
+        cookies = body.get('cookies')
+        if isinstance(cookies, str):
+            cookies = cookies.strip()
+        if not cookies:
+            return self._json({'error': 'cookies are required'}, 400)
+        try:
+            from . import xconnect
+            sess = xconnect.XSession(cookies, proxy=self.client.proxy).start()
+        except ValueError as e:
+            return self._json({'error': str(e)}, 400)
+        except RuntimeError as e:
+            return self._json({'error': str(e)}, 500)
+        try:
+            info = sess.verify()
+        except Exception as e:
+            sess.close()
+            return self._json({'error': 'cookie check failed: %s: %s'
+                               % (type(e).__name__, e)}, 400)
+        name = (body.get('name') or '').strip() or info['username']
+        if not name:
+            sess.close()
+            return self._json({'error': 'could not determine an account name'}, 400)
+        prev = self.store.get_account(name)
+        if prev and (prev.get('platform') or 'tiktok') != 'x':
+            sess.close()
+            return self._json({'error': 'name %r is taken by a %s account'
+                               % (name, prev.get('platform') or 'tiktok')}, 409)
+        cookie_store = json.dumps(cookies) if isinstance(cookies, dict) else cookies
+        self.store.save_x_account(name, info['uid'], info['username'],
+                                  info['name'], cookie_store)
+        self.x_sessions[name] = sess
+        self._json({'ok': True, 'name': name, 'uid': info['uid'],
+                    'username': info['username'], 'platform': 'x'})
+
+    def h_x_conversations(self, q, name):
+        convs = self._x_sess(name).conversations()
+        for c in convs:
+            c['last_from_me'] = bool(c.pop('outgoing', False))
+            c['peer_avatar'] = c.get('peer_avatar') or ''
+        self._json({'conversations': convs})
+
+    def h_x_messages(self, q, name):
+        peer = (q.get('conv_id') or [''])[0]
+        if not peer:
+            return self._json({'error': 'conv_id is required'}, 400)
+        msgs, _cursor = self._x_sess(name).history(peer)
+        limit = int((q.get('limit') or ['30'])[0])
+        self._json({'messages': msgs[-limit:]})
+
+    def h_x_send(self, q, name):
+        body = self._body()
+        peer = (body.get('conv_id') or '').strip()
+        text = (body.get('text') or '').strip()
+        if not peer or not text:
+            return self._json({'error': 'conv_id and text are required'}, 400)
+        self._json(self._x_sess(name).send(peer, text))
+
     def h_x_probe(self, q):
         """Stateless X (Twitter) cookie validation — verify/inbox/history.
 
@@ -508,6 +602,23 @@ def create_server(host, port, hub, store, client, config):
     Handler.client = client
     Handler.config = config
     Handler._pending = harvest.Pending()
+    Handler.x_sessions = {}
+    # Rehydrate X accounts: one background-loop session each. Kept separate
+    # from the TikTok rehydration in run.py — an X session is independent of
+    # the TikTok hub and must not break startup when twikit is missing.
+    try:
+        from . import xconnect
+        for row in store.list_accounts():
+            if (row.get('platform') or 'tiktok') != 'x':
+                continue
+            full = store.get_account(row['name']) or {}
+            try:
+                Handler.x_sessions[row['name']] = xconnect.XSession(
+                    full.get('cookie') or '', proxy=client.proxy).start()
+            except Exception as e:
+                print('x session %s failed: %s' % (row['name'], e))
+    except ImportError:
+        pass
     Handler.login_flow = login_browser.BrowserLogin(
         store, hub, client,
         profile_dir=os.path.abspath(os.path.join(
