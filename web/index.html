@@ -110,6 +110,7 @@
   <button class="btn" id="btnSync">同步</button>
   <span class="spacer"></span>
   <span style="font-size:12px;color:var(--fg3)" id="who"></span>
+  <button class="btn" id="btnBrowserLogin" title="弹出浏览器窗口登录一次，材料自动收割入库">浏览器登录</button>
   <button class="btn" id="btnHarvest" title="从已登录的浏览器里取写入凭据">收割凭据</button>
   <button class="btn primary" id="btnAdd">添加账号</button>
 </header>
@@ -557,6 +558,24 @@ $('#btnSync').onclick = async () => {
   catch (e) { toast('同步失败：' + e.message, true); }
 };
 $('#btnAdd').onclick = () => $('#modal').classList.add('show');
+$('#btnBrowserLogin').onclick = async () => {
+  try {
+    await jpost('/api/login/browser', {});
+    toast('浏览器已打开：请在窗口里登录 TikTok，完成后自动导入');
+    const timer = setInterval(async () => {
+      try {
+        const s = (await (await fetch('/api/login/state')).json()).state;
+        if (s.phase === 'done') {
+          clearInterval(timer); toast(s.detail || '登录导入完成'); loadAccounts();
+        } else if (s.phase === 'error' || s.phase === 'cancelled') {
+          clearInterval(timer); toast('浏览器登录：' + s.detail, true);
+        } else if (s.phase !== 'idle') {
+          toast('浏览器登录：' + s.detail || s.phase);
+        }
+      } catch (e) { /* transient */ }
+    }, 2000);
+  } catch (e) { toast('浏览器登录启动失败：' + e.message, true); }
+};
 $('#btnCancel').onclick = () => $('#modal').classList.remove('show');
 $('#btnSave').onclick = async () => {
   const btn = $('#btnSave'); btn.disabled = true;

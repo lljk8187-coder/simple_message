@@ -11,6 +11,7 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 from . import client as api
 from . import harvest
+from . import login_browser
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'web')
 
@@ -24,6 +25,7 @@ class Handler(BaseHTTPRequestHandler):
     client = None
     config = None
     _pending = None     # harvest.Pending
+    login_flow = None   # login_browser.BrowserLogin
 
     # ------------------------------------------------------------- helpers
 
@@ -86,6 +88,9 @@ class Handler(BaseHTTPRequestHandler):
         ('DELETE', r'^/api/harvest$', 'harvest_clear'),
         ('GET', r'^/api/harvest/script$', 'harvest_script'),
         ('POST', r'^/api/harvest/apply$', 'harvest_apply'),
+        ('POST', r'^/api/login/browser$', 'login_start'),
+        ('GET', r'^/api/login/state$', 'login_state'),
+        ('POST', r'^/api/login/cancel$', 'login_cancel'),
         ('GET', r'^/api/health$', 'health'),
     ]
 
@@ -399,6 +404,17 @@ class Handler(BaseHTTPRequestHandler):
         if name not in self.hub.sessions:
             raise api.ApiError('account %r is not loaded' % name)
 
+    def h_login_start(self, q):
+        started, state = self.login_flow.start()
+        self._json({'started': started, 'state': state})
+
+    def h_login_state(self, q):
+        self._json({'state': self.login_flow.get_state()})
+
+    def h_login_cancel(self, q):
+        self.login_flow.cancel()
+        self._json({'ok': True, 'state': self.login_flow.get_state()})
+
     # ------------------------------------------------------------------ SSE
 
     def h_events(self, q):
@@ -439,4 +455,9 @@ def create_server(host, port, hub, store, client, config):
     Handler.client = client
     Handler.config = config
     Handler._pending = harvest.Pending()
+    Handler.login_flow = login_browser.BrowserLogin(
+        store, hub, client,
+        profile_dir=os.path.abspath(os.path.join(
+            WEB_DIR, os.pardir, 'data', 'login-profile')),
+        proxy=client.proxy)
     return ThreadingHTTPServer((host, port), Handler)
