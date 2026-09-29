@@ -153,6 +153,7 @@
         <option value="tiktok">TikTok（贴 cookie 即收发）</option>
         <option value="x">X / Twitter（贴 cookie，发送信任分较低但可用）</option>
         <option value="instagram">Instagram（账号密码登录，首次或要验证码）</option>
+        <option value="facebook">Facebook（贴 cookie；1:1 走 E2EE 桥）</option>
       </select>
     </div>
     <div class="field" id="fIgFields" style="display:none">
@@ -668,14 +669,16 @@ $('#btnBatchGo').onclick = async () => {
 };
 $('#fPlat').onchange = () => {
   const v = $('#fPlat').value;
-  const isX = v === 'x', isIG = v === 'instagram';
+  const isX = v === 'x', isIG = v === 'instagram', isFB = v === 'facebook';
   $('#platHintTikTok').style.display = isX || isIG ? 'none' : '';
   $('#platHintX').style.display = isX ? '' : 'none';
   $('#fIgFields').style.display = isIG ? '' : 'none';
   $('#fCookie').parentElement.style.display = isIG ? 'none' : '';
   $('#fCookie').placeholder = isX
     ? 'auth_token=…; ct0=…; twid=…'
-    : 'tt_chain_token=…; sessionid=…; uid_tt=…';
+    : isFB
+      ? 'c_user=…; xs=…; datr=…; fr=…'
+      : 'tt_chain_token=…; sessionid=…; uid_tt=…';
 };
 $('#btnBrowserLogin').onclick = async () => {
   try {

@@ -28,6 +28,7 @@ class Handler(BaseHTTPRequestHandler):
     login_flow = None   # login_browser.BrowserLogin
     x_sessions = {}     # name -> xconnect.XSession (platform 'x')
     ig_sessions = {}    # name -> igconnect.IGSession (platform 'instagram')
+    fb_sessions = {}    # name -> fbconnect.FBSession (platform 'facebook')
     ig_logins = {}      # username -> igconnect.IGLogin (interactive login in flight)
 
     # ------------------------------------------------------------- helpers
@@ -97,6 +98,11 @@ class Handler(BaseHTTPRequestHandler):
         ('GET', r'^/api/ig/accounts/(?P<name>[^/]+)/messages$', 'ig_messages'),
         ('POST', r'^/api/ig/accounts/(?P<name>[^/]+)/send$', 'ig_send'),
         ('POST', r'^/api/ig/accounts/(?P<name>[^/]+)/read$', 'ig_read'),
+        ('POST', r'^/api/fb/add$', 'fb_add'),
+        ('GET', r'^/api/fb/accounts/(?P<name>[^/]+)/conversations$', 'fb_conversations'),
+        ('GET', r'^/api/fb/accounts/(?P<name>[^/]+)/messages$', 'fb_messages'),
+        ('POST', r'^/api/fb/accounts/(?P<name>[^/]+)/send$', 'fb_send'),
+        ('POST', r'^/api/fb/accounts/(?P<name>[^/]+)/read$', 'fb_read'),
         ('POST', r'^/api/batch/send$', 'batch_send'),
         ('POST', r'^/api/accounts/(?P<name>[^/]+)/focus$', 'focus'),
         ('GET', r'^/api/events$', 'events'),
@@ -202,6 +208,13 @@ class Handler(BaseHTTPRequestHandler):
                 a['write_tier'] = 'IG'
                 out.append(a)
                 continue
+            if a['platform'] == 'facebook':
+                a['status'] = 'ok' if a['name'] in self.fb_sessions else 'down'
+                a['stats'] = {'conversations': 0, 'messages': 0}
+                a['writable'] = a['name'] in self.fb_sessions
+                a['write_tier'] = 'FB'
+                out.append(a)
+                continue
             st = self.hub.status.get(a['name'], {})
             a['status'] = st.get('state', 'idle')
             a['status_detail'] = st.get('detail', '')
@@ -284,6 +297,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.h_x_conversations(q, name)
         if plat == 'instagram':
             return self.h_ig_conversations(q, name)
+        if plat == 'facebook':
+            return self.h_fb_conversations(q, name)
         self._require(name)
         self._json({'conversations': self.store.list_conversations(name)})
 
@@ -293,6 +308,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.h_x_messages(q, name)
         if plat == 'instagram':
             return self.h_ig_messages(q, name)
+        if plat == 'facebook':
+            return self.h_fb_messages(q, name)
         self._require(name)
         conv_id = (q.get('conv_id') or [''])[0]
         if not conv_id:
@@ -333,6 +350,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.h_x_send(q, name)
         if plat == 'instagram':
             return self.h_ig_send(q, name)
+        if plat == 'facebook':
+            return self.h_fb_send(q, name)
         self._require(name)
         sess = self.hub.sessions[name]
         guard, tier = api.ticket_guard_headers(sess, '/v1/message/send')
@@ -368,6 +387,8 @@ class Handler(BaseHTTPRequestHandler):
                                'skipped': 'X read receipts not supported yet'})
         if plat == 'instagram':
             return self.h_ig_read(q, name)
+        if plat == 'facebook':
+            return self.h_fb_read(q, name)
         self._require(name)
         sess = self.hub.sessions[name]
         body = self._body()
@@ -607,6 +628,81 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({'error': 'conv_id is required'}, 400)
         self._json(self._ig_sess(name).mark_seen(peer))
 
+    # ---------------------------------------------- platform: FB dispatch
+
+    def _fb_sess(self, name):
+        sess = self.fb_sessions.get(name)
+        if not sess:
+            raise api.ApiError('Facebook session %r is not loaded' % name)
+        return sess
+
+    def h_fb_add(self, q):
+        """Add a Facebook account from pasted facebook.com cookies
+        (needs c_user + xs). The E2EE bridge starts in the background."""
+        body = self._body()
+        cookies = body.get('cookies')
+        if isinstance(cookies, str):
+            cookies = cookies.strip()
+        if not cookies:
+            return self._json({'error': 'cookies are required'}, 400)
+        try:
+            from . import fbconnect
+            sess = fbconnect.FBSession(cookies, proxy=self.client.proxy).start()
+        except ValueError as e:
+            return self._json({'error': str(e)}, 400)
+        except Exception as e:
+            return self._json({'error': 'facebook session failed: %s: %s'
+                               % (type(e).__name__, e)}, 400)
+        name = (body.get('name') or '').strip() or ('fb' + sess.me_id[-6:])
+        prev = self.store.get_account(name)
+        if prev and (prev.get('platform') or 'tiktok') != 'facebook':
+            sess.close()
+            return self._json({'error': 'name %r is taken by a %s account'
+                               % (name, prev.get('platform') or 'tiktok')}, 409)
+        cookie_store = json.dumps(cookies) if isinstance(cookies, dict) else cookies
+        self.store.save_platform_account(name, sess.me_id, '', '', cookie_store,
+                                         'facebook')
+        self.fb_sessions[name] = sess
+        start_fb_sync(self.hub, name, sess)
+
+        def _bridge():
+            try:
+                out = sess.start_e2ee()
+                print('fb e2ee %s: %s' % (name, out))
+            except Exception as e:
+                print('fb e2ee %s failed: %s' % (name, e))
+
+        threading.Thread(target=_bridge, daemon=True).start()
+        self._json({'ok': True, 'name': name, 'uid': sess.me_id,
+                    'platform': 'facebook',
+                    'note': 'E2EE bridge starting in background; 1:1 send/'
+                            'receive live once it connects'})
+
+    def h_fb_conversations(self, q, name):
+        convs = self._fb_sess(name).conversations()
+        self._json({'conversations': convs})
+
+    def h_fb_messages(self, q, name):
+        peer = (q.get('conv_id') or [''])[0]
+        if not peer:
+            return self._json({'error': 'conv_id is required'}, 400)
+        rows, _ = self._fb_sess(name).history(peer)
+        limit = int((q.get('limit') or ['30'])[0])
+        self._json({'messages': rows[-limit:]})
+
+    def h_fb_send(self, q, name):
+        body = self._body()
+        peer = (body.get('conv_id') or '').strip()
+        text = (body.get('text') or '').strip()
+        if not peer or not text:
+            return self._json({'error': 'conv_id and text are required'}, 400)
+        self._json(self._fb_sess(name).send(peer, text))
+
+    def h_fb_read(self, q, name):
+        body = self._body()
+        peer = (body.get('conv_id') or '').strip()
+        self._json(self._fb_sess(name).mark_seen(peer))
+
     # ---------------------------------------------------- batch sending
 
     def _send_one(self, account, conv_id, text):
@@ -618,6 +714,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._x_sess(account).send(conv_id, text)
         if plat == 'instagram':
             return self._ig_sess(account).send(conv_id, text)
+        if plat == 'facebook':
+            return self._fb_sess(account).send(conv_id, text)
         self._require(account)
         sess = self.hub.sessions[account]
         conv = next((c for c in self.store.list_conversations(account)
@@ -850,6 +948,58 @@ def start_x_sync(hub, name, sess, interval=10):
     threading.Thread(target=loop, name='x-sync-%s' % name, daemon=True).start()
 
 
+def start_fb_sync(hub, name, sess, interval=12):
+    """FB sync: conversation-list deltas AND the E2EE bridge event pump.
+
+    Bridge events (1:1 incoming) are the authoritative realtime path —
+    each event is remembered on the session (live history) and pushed as
+    a {'type':'message'} hub event when it comes from the peer."""
+    import time as _time
+
+    def loop():
+        last = {}
+        seeded = False
+        while True:
+            try:
+                convs = sess.conversations()
+                changed = False
+                for c in convs:
+                    ms = c.get('last_ms') or 0
+                    prev = last.get(c['conv_id'])
+                    if prev is None or ms != prev:
+                        changed = True
+                    last[c['conv_id']] = ms
+                if seeded and changed:
+                    hub.bus.publish({'type': 'conversations', 'account': name})
+                seeded = True
+            except Exception:
+                pass
+            try:
+                for ev in sess.drain_events():
+                    data = ev.get('data') or {}
+                    tid = str(data.get('threadId') or '')
+                    if not tid:
+                        continue
+                    ms = int(data.get('timestampMs') or 0)
+                    sender = str(data.get('senderId') or '')
+                    row = {
+                        'platform': 'facebook', 'msg_id': str(data.get('id') or ''),
+                        'conv_id': tid, 'sender': sender,
+                        'outgoing': 1 if sender == sess.me_id else 0,
+                        'text': data.get('text') or '', 'ms': ms, 'us': ms * 1000,
+                    }
+                    sess._remember(row)
+                    if row['outgoing']:
+                        continue
+                    hub.bus.publish({'type': 'message', 'account': name,
+                                     'conv_id': tid, 'messages': [row]})
+            except Exception:
+                pass
+            _time.sleep(interval)
+
+    threading.Thread(target=loop, name='fb-sync-%s' % name, daemon=True).start()
+
+
 def create_server(host, port, hub, store, client, config):
     Handler.hub = hub
     Handler.store = store
@@ -906,6 +1056,32 @@ def create_server(host, port, hub, store, client, config):
                     print('ig session %s failed: %s' % (name, e))
 
             threading.Thread(target=_ig_rehydrate, daemon=True).start()
+    except ImportError:
+        pass
+    # Rehydrate Facebook accounts: session boot is quick, but the E2EE
+    # bridge handshake takes up to ~90s — background it.
+    try:
+        from . import fbconnect
+        for row in store.list_accounts():
+            if (row.get('platform') or 'tiktok') != 'facebook':
+                continue
+            full = store.get_account(row['name']) or {}
+            try:
+                fsess = fbconnect.FBSession(full.get('cookie') or '',
+                                            proxy=client.proxy).start()
+                Handler.fb_sessions[row['name']] = fsess
+                start_fb_sync(hub, row['name'], fsess)
+
+                def _fb_bridge(name=row['name'], fsess=fsess):
+                    try:
+                        out = fsess.start_e2ee()
+                        print('fb e2ee %s: %s' % (name, out))
+                    except Exception as e:
+                        print('fb e2ee %s failed: %s' % (name, e))
+
+                threading.Thread(target=_fb_bridge, daemon=True).start()
+            except Exception as e:
+                print('fb session %s failed: %s' % (row['name'], e))
     except ImportError:
         pass
     Handler.login_flow = login_browser.BrowserLogin(
