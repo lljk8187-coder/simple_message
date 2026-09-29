@@ -81,13 +81,9 @@ def main():
     hub = Hub(store, client, cfg)
 
     # Rehydrate every stored account so a restart resumes without re-importing.
-    # Cookie-only accounts borrow signing materials from the shared pool here —
-    # without this a restart would silently drop their write ability.
     for row in store.list_accounts():
         full = store.get_account(row['name'])
-        full, borrowed = web.pool_fill(store, full)
         sess = api.Session.from_dict(full)
-        sess.borrowed = borrowed or ''
         hub.attach(row['name'], sess)
     hub.start()
 

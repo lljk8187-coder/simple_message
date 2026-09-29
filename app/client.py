@@ -7,6 +7,7 @@ path needs none and the write path can reuse captured guard headers.
 import base64
 import json
 import os
+import secrets
 import time
 import urllib.error
 import urllib.parse
@@ -144,9 +145,6 @@ class Session:
         self.ticket = ticket
         self.private_key = private_key          # int scalar, or None
         self.ts_sign = ts_sign or ''
-        # Runtime note, set by server.pool_fill consumers: which account's
-        # materials this session borrowed when it owns none. Never persisted.
-        self.borrowed = ''
 
     @classmethod
     def from_dict(cls, d):
@@ -481,12 +479,35 @@ def signable(sess):
     return bool(sess.ticket and sess.private_key and (sess.ts_sign or ts_sign_from_guard(sess)))
 
 
+def _throwaway_guard_headers():
+    """Tier Z — a fresh throwaway key, no client-data, no ticket.
+
+    matrix-tiktok (production bridge, Aug 2026) sends exactly this way; measured
+    here as biz_code=0 with guard_result=1104. The guard pipeline scores the
+    request lower than a verified signature but still accepts it. This makes
+    sending possible with NOTHING but the cookie — no harvesting, no
+    cross-account material sharing, no browser, ever.
+    """
+    d = secrets.randbelow(signing.N - 1) + 1
+    return {
+        'tt-ticket-guard-public-key':
+            base64.b64encode(signing.public_key_raw(d)).decode('ascii'),
+        'tt-ticket-guard-version': '2',
+        'tt-ticket-guard-iteration-version': '0',
+        'tt-ticket-guard-web-version': '1',
+    }, 'Z'
+
+
 def ticket_guard_headers(sess, path, timestamp=None):
     """Build `tt-ticket-guard-*` headers for `path`.
 
-    Returns (headers, tier). Tier B signs the request locally; tier A replays the
-    captured set. Tier A is bound to the path it was captured for, so a mismatch
-    is a real risk there — tier B has no such constraint.
+    Returns (headers, tier). Preference order:
+      B — sign locally from `ticket` + `ts_sign` + `private_key`   (result 0)
+      A — replay the captured `guard` headers verbatim             (0 / 1003)
+      Z — throwaway key, no ticket, no client-data                 (1104)
+    Tier A is bound to the path it was captured for, so a mismatch is a real
+    risk there — tier B has no such constraint. Tier Z has neither constraint
+    nor harvested material: every account sends independently.
     """
     ts_sign = sess.ts_sign or ts_sign_from_guard(sess)
     if sess.private_key and sess.ticket and ts_sign:
@@ -510,11 +531,11 @@ def ticket_guard_headers(sess, path, timestamp=None):
         }, 'B'
     if sess.guard:
         return dict(sess.guard), 'A'
-    return None, None
+    return _throwaway_guard_headers()
 
 
 def send_message(client, sess, conv_id, short_id, text):
-    """cmd 100. Signs locally when possible, otherwise replays captured headers."""
+    """cmd 100. Tier B signs locally, A replays captured headers, Z sends bare."""
     cid = str(uuid.uuid4())
     ext = b''
     for k, v in (('s:client_message_id', cid), ('deprecated', cid),
@@ -523,7 +544,8 @@ def send_message(client, sess, conv_id, short_id, text):
     payload = (pb.s(1, conv_id) + pb.vint(2, 1) + pb.vint(3, int(short_id))
                + pb.s(4, json.dumps({'aweType': 0, 'text': text}, separators=(',', ':')))
                + pb.ld(5, ext) + pb.vint(6, 7)
-               + pb.s(7, sess.ticket) + pb.s(8, cid))
+               + (pb.s(7, sess.ticket) if sess.ticket else b'')   # tier Z omits the ticket
+               + pb.s(8, cid))
     body = envelope(100, payload, sess, with_sub=False, feature=True)
     headers = _proto_headers(sess)
     guard, tier = ticket_guard_headers(sess, '/v1/message/send')

@@ -67,15 +67,6 @@ CREATE TABLE IF NOT EXISTS profiles (
   fetched_ms INTEGER,
   PRIMARY KEY (account, uid)
 );
-
-CREATE TABLE IF NOT EXISTS signing_pool (
-  id INTEGER PRIMARY KEY CHECK (id = 1),
-  ticket      TEXT,
-  private_key TEXT,
-  guard       TEXT,
-  source      TEXT,
-  updated_at  INTEGER
-);
 """
 
 
@@ -147,31 +138,6 @@ class Store:
                         'DELETE FROM messages WHERE account=?',
                         'DELETE FROM profiles WHERE account=?'):
                 self._db.execute(sql, (name,))
-            self._db.commit()
-
-    # ------------------------------------------------------- signing pool
-
-    def pool_get(self):
-        """The shared signing-material pool (see server.pool_fill for the why)."""
-        with self._lock:
-            row = self._db.execute('SELECT * FROM signing_pool WHERE id=1').fetchone()
-        return dict(row) if row else None
-
-    def pool_put(self, ticket, private_key, guard, source=''):
-        """Store one set of signing materials; each upload replaces the previous one.
-
-        `guard` is stored as canonical JSON text, matching the accounts table.
-        """
-        with self._lock:
-            self._db.execute(
-                """INSERT INTO signing_pool (id, ticket, private_key, guard, source, updated_at)
-                   VALUES (1,?,?,?,?,?)
-                   ON CONFLICT(id) DO UPDATE SET
-                     ticket=excluded.ticket, private_key=excluded.private_key,
-                     guard=excluded.guard, source=excluded.source,
-                     updated_at=excluded.updated_at""",
-                (ticket or '', private_key or '', json.dumps(guard or {}), source,
-                 int(time.time() * 1000)))
             self._db.commit()
 
     # ---------------------------------------------------------- profiles

@@ -156,13 +156,12 @@
       <input type="text" id="fName" placeholder="jakson">
     </div>
     <details>
-      <summary>高级：发送凭据（通常不用填）</summary>
+      <summary>高级：发送凭据（可选，不填也能发）</summary>
       <p class="hint" style="margin:6px 0 12px">
-        <b>通常不填即可</b>：服务端会自动借用共享材料池来发送（发送者身份以 cookie 为准，
-        借用材料的请求服务端信任结果为 1003，仍正常送达）。只有想要
-        <code>result=0</code> 的自有材料时才需要填：<b>档位 B（推荐）</b>：
+        <b>不填也能发</b>：无材料时服务端用一次性密钥发送（信任分 1104，消息正常送达）。
+        想要最高信任分 <code>result=0</code> 时才需要填：<b>档位 B（推荐）</b>：
         <code>ticket</code> + <b>私钥</b>，服务端本地签名；<b>档位 A</b>：只填下面两个
-        guard 头，直接复用捕获值。<code>ts_sign</code> 会自动从 guard 头里提取。
+        guard 头，复用捕获值。<code>ts_sign</code> 会自动从 guard 头里提取。
       </p>
       <div class="field">
         <label>device_id（默认沿用本机观测值）</label>
@@ -316,7 +315,7 @@ async function loadAccounts(select) {
   ACCOUNTS.forEach(a => {
     const o = document.createElement('option');
     o.value = a.name;
-    const mode = a.writable ? (a.write_borrowed ? ' · 借用' : ' · 可发') : ' · 只读';
+    const mode = a.write_tier ? ' · 档位' + a.write_tier : ' · 只读';
     o.textContent = (a.nickname || a.username || a.name) + ' · ' + a.uid.slice(-6) + mode;
     sel.appendChild(o);
   });
@@ -327,7 +326,7 @@ async function loadAccounts(select) {
 function renderWelcome(){
   $('#convs').innerHTML = '';
   $('#msgs').innerHTML = '<div class="empty">还没有账号。<br>点右上角 <code>添加账号</code> 粘贴一个已登录的 cookie 即可开始。<br>' +
-    '<span style="font-size:12px;color:var(--fg3)">cookie 就能收发：发送材料由服务端自动从共享池借用（空库时先导入一份带材料的账号或跑一次收割）。</span></div>';
+    '<span style="font-size:12px;color:var(--fg3)">cookie 即可收发：不填发送材料也能发（信任分较低）；填自有材料可升到最高信任分。</span></div>';
   $('#chatTitle').textContent = '选择一个会话';
   $('#chatSub').textContent = '';
   $('#text').disabled = $('#sendBtn').disabled = true;
@@ -578,9 +577,7 @@ $('#btnSave').onclick = async () => {
       private_key: $('#fKey').value.trim(),
       guard,
     });
-    const tier = r.write_tier
-      ? ('档位 ' + r.write_tier + (r.borrowed_from ? '（借用 ' + r.borrowed_from + '）' : ''))
-      : '仅只读';
+    const tier = r.write_tier ? ('档位 ' + r.write_tier) : '仅只读';
     toast('已添加 ' + r.username + '（' + tier + '）');
     $('#modal').classList.remove('show');
     ['fCookie','fName','fTicket','fPk','fCd','fDevice','fKey'].forEach(id => $('#'+id).value = '');
@@ -671,7 +668,7 @@ $('#hApply').onclick = async () => {
       cookie: $('#hCookie').value.trim(),
     });
     if (!r.ok) { toast('保存失败：' + (r.error || '未知错误'), true); return; }
-    toast('已保存 ' + r.name + '（' + (r.write_tier ? '档位 ' + r.write_tier : '仅只读') + '）；共享材料池已更新，借用账号已同步');
+    toast('已保存 ' + r.name + '（' + (r.write_tier ? '档位 ' + r.write_tier : '仅只读') + '）');
     HPEND = null;
     $('#hStatus').textContent = '（tiktok.com 的 CSP 会拦掉页面往 localhost 的自动回传，所以这一步是手动的。）';
     $('#hWait').textContent = '· 等待中';
