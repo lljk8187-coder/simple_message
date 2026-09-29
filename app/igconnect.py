@@ -15,9 +15,40 @@ shapes: DirectThread{id, users, messages, last_activity_at},
 DirectMessage{id, user_id, thread_id, timestamp, item_type,
 is_sent_by_viewer, text}.
 """
+import os
+import shutil
 import threading
 
 LAZY_ERR = 'instagrapi is not installed — run: pip install instagrapi'
+
+
+def _fix_nonascii_ca_bundle():
+    """curl on Windows cannot open CA bundles under non-ASCII paths — curl
+    error 77, "error adding trust anchors from locations: CAfile". The hub
+    commonly runs under a user directory whose name is not ASCII (e.g.
+    C:\\Users\\刘海丽\\...), where certifi's bundle lives, so instagrapi's
+    private curl transport dies before any TLS happens. Copy the bundle to
+    an ASCII-only location once and point certifi.where() at it; curl_cffi
+    reads that at session creation, so patching the module attribute before
+    any session exists is sufficient."""
+    import certifi
+    src = certifi.where()
+    if src.isascii():
+        return src
+    base = os.environ.get('PROGRAMDATA') or r'C:\ProgramData'
+    if not base.isascii():
+        base = r'C:\ProgramData'
+    dst_dir = os.path.join(base, 'tk-message-demo')
+    os.makedirs(dst_dir, exist_ok=True)
+    dst = os.path.join(dst_dir, 'cacert.pem')
+    if (not os.path.exists(dst)
+            or os.path.getsize(dst) != os.path.getsize(src)):
+        shutil.copyfile(src, dst)
+    certifi.where = lambda: dst
+    return dst
+
+
+_fix_nonascii_ca_bundle()
 
 
 def _to_ms(dt):
