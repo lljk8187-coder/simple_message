@@ -439,7 +439,9 @@ class Handler(BaseHTTPRequestHandler):
         of cookies answers whether the X connector works for this account.
         """
         body = self._body()
-        cookies = (body.get('cookies') or '').strip()
+        cookies = body.get('cookies')
+        if isinstance(cookies, str):
+            cookies = cookies.strip()
         if not cookies:
             return self._json({'error': 'cookies are required'}, 400)
         try:

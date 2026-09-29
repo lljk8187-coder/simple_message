@@ -17,6 +17,7 @@ reports its own error if X's answer deviates from the shapes parsed here.
 import asyncio
 import json
 import threading
+import urllib.parse
 
 LAZY_ERR = ('twikit is not installed — run: pip install twikit '
             '(X connector optional dependency)')
@@ -25,22 +26,26 @@ LAZY_ERR = ('twikit is not installed — run: pip install twikit '
 # ------------------------------------------------------------------ cookies
 
 def parse_cookies(text):
-    """Accept the raw `Cookie:` header string from DevTools, or a JSON dict.
+    """Accept the raw `Cookie:` header string from DevTools, a JSON dict, or
+    an already-parsed dict.
 
     Returns a plain dict; raises ValueError when the mandatory pair is
     missing so callers can reject an import before any network call.
     """
-    if not text or not text.strip():
-        raise ValueError('cookies are empty')
-    text = text.strip()
-    if text.startswith('{'):
-        d = json.loads(text)
+    if isinstance(text, dict):
+        d = dict(text)
     else:
-        d = {}
-        for part in text.replace('\n', '; ').split(';'):
-            if '=' in part:
-                k, v = part.split('=', 1)
-                d[k.strip()] = v.strip().strip('"')
+        if not text or not text.strip():
+            raise ValueError('cookies are empty')
+        text = text.strip()
+        if text.startswith('{'):
+            d = json.loads(text)
+        else:
+            d = {}
+            for part in text.replace('\n', '; ').split(';'):
+                if '=' in part:
+                    k, v = part.split('=', 1)
+                    d[k.strip()] = v.strip().strip('"')
     if not isinstance(d, dict) or not d:
         raise ValueError('cookies did not parse into a dict')
     missing = [k for k in ('auth_token', 'ct0') if not d.get(k)]
@@ -118,6 +123,14 @@ class XSession:
         cookies = parse_cookies(self.cookie_str)
         self._client = Client('en-US', proxy=self.proxy)
         self._client.set_cookies(cookies, clear_cookies=True)   # plain dict storage
+        self._me_uid = None
+        twid = cookies.get('twid')                              # 'u%3D<uid>'
+        if twid:
+            try:
+                uid = urllib.parse.unquote(twid).split('=', 1)[-1]
+                self._me_uid = uid or None
+            except Exception:
+                self._me_uid = None
         self._loop = _Loop()
         return self
 
@@ -128,10 +141,37 @@ class XSession:
 
     # ------------------------------------------------------------- identity
 
+    async def _verify_raw(self):
+        """v1.1 verify_credentials — raw JSON, no User object.
+
+        twikit's User constructor hard-crashes (KeyError 'urls') on accounts
+        whose profile omits `entities.description.urls` — raw is robust.
+        """
+        out = await self._client.request(
+            'GET', 'https://x.com/i/api/1.1/account/verify_credentials.json',
+            params={'skip_status': 'true', 'include_entities': 'false',
+                    'include_email': 'false'},
+            headers=self._client._base_headers)
+        return out[0] if isinstance(out, tuple) else out
+
     def verify(self):
         """Who am I — cheap round trip that also proves the cookies work."""
-        u = self._loop.call(self._client.user())
-        return {'uid': str(u.id), 'username': u.screen_name, 'name': u.name}
+        d = self._loop.call(self._verify_raw())
+        if isinstance(d, dict) and d.get('errors'):
+            raise RuntimeError(str(d['errors'][0]))
+        return {'uid': str(d.get('id_str') or d.get('id') or ''),
+                'username': d.get('screen_name') or '',
+                'name': d.get('name') or ''}
+
+    async def _me(self):
+        """Own uid without touching twikit's User constructor (KeyError 'urls'
+        on profiles without description links): twid cookie first, raw
+        verify_credentials as fallback."""
+        if self._me_uid:
+            return self._me_uid
+        d = await self._verify_raw()
+        self._me_uid = str(d.get('id_str') or d.get('id') or '')
+        return self._me_uid
 
     # -------------------------------------------------------------- inbox
 
@@ -141,9 +181,15 @@ class XSession:
         Shape mirrors the TikTok hub rows: conv_id, peer_uid, peer name,
         last message text + ms, unread left to the frontend baseline.
         """
-        data, _ = self._loop.call(self._conversations_raw())
-        state = data.get('inbox_initial_state') or {}
-        me = str(self._loop.call(self._client.user_id()))
+        return self._loop.call(self._conversations())
+
+    async def _conversations(self):
+        from twikit.client.v11 import Endpoint
+        out, _ = await self._client.request(
+            'GET', Endpoint.DM_INBOX,
+            params=_INBOX_PARAMS, headers=self._client._base_headers)
+        state = (out.get('inbox_initial_state') or {}) if isinstance(out, dict) else {}
+        me = await self._me()
         convs = state.get('conversations') or {}
         users = state.get('user_events') or {}
         latest = {}
@@ -179,18 +225,15 @@ class XSession:
         out.sort(key=lambda c: c['last_ms'], reverse=True)
         return out
 
-    async def _conversations_raw(self):
-        from twikit.client.v11 import Endpoint
-        return await self._client.request(
-            'GET', Endpoint.DM_INBOX,
-            params=_INBOX_PARAMS, headers=self._client._base_headers)
-
     # ------------------------------------------------------------- history
 
     def history(self, peer_uid, max_id=None):
         """Messages with one peer, oldest first (hub message shape)."""
-        result = self._loop.call(self._client.get_dm_history(str(peer_uid), max_id))
-        me = str(self._loop.call(self._client.user_id()))
+        return self._loop.call(self._history(peer_uid, max_id))
+
+    async def _history(self, peer_uid, max_id=None):
+        result = await self._client.get_dm_history(str(peer_uid), max_id)
+        me = await self._me()
         out = []
         for m in result:
             out.append({
@@ -210,6 +253,63 @@ class XSession:
         m = self._loop.call(self._client.send_dm(str(peer_uid), text))
         return {'ok': True, 'msg_id': str(m.id),
                 'ms': ms_from_time(getattr(m, 'time', 0))}
+
+
+# --------------------------------------------------- transaction-id patch
+
+# X moved the ondemand.s chunk hash from the old `{name: hash}` page map into
+# a webpack runtime builder: `.u=e=>""+(({id:name,...})[e]+"."+({id:hash,...})
+# [e]+"a.js"` (verified live 2026-09-29; chunk id 59924 = ondemand.s). twikit
+# 2.3.3 still greps the old shape, so KEY_BYTE extraction always fails. This
+# patch parses the new builder and falls back to upstream's regex when the
+# new shape is absent.
+_NEW_U_RE = None
+
+
+def _install_transaction_patch():
+    global _NEW_U_RE
+    try:
+        from twikit.x_client_transaction import transaction as _tx
+    except ImportError:
+        return
+    if getattr(_tx.ClientTransaction.get_indices, '_xconnect_patch', False):
+        return
+    import re as _re
+    _NEW_U_RE = _re.compile(
+        r'\.u=e=>""\+\(\(\{(?P<names>.*?)\}\)\[e\](?:\|\|e)?\)\+"\."\s*\+\s*'
+        r'\(\{(?P<hashes>.*?)\}\)\[e\]\+"a\.js"', _re.S)
+    _PAIR_RE = _re.compile(r'(\d+):"([^"]*)"')
+    _ONDEMAND_URL = ('https://abs.twimg.com/responsive-web/client-web/'
+                     'ondemand.s.{hash}a.js')
+    _orig = _tx.ClientTransaction.get_indices
+
+    async def get_indices(self, home_page_response, session, headers):
+        html = str(home_page_response)
+        m = _NEW_U_RE.search(html)
+        indices = None
+        if m:
+            names = dict(_PAIR_RE.findall(m.group('names')))
+            hashes = dict(_PAIR_RE.findall(m.group('hashes')))
+            cid = next((k for k, v in names.items() if v == 'ondemand.s'), None)
+            hash_val = hashes.get(cid or '')
+            if hash_val:
+                resp = await session.request(
+                    method='GET', url=_ONDEMAND_URL.format(hash=hash_val),
+                    headers=headers)
+                indices = [int(item.group(2)) for item in
+                           _tx.INDICES_REGEX.finditer(resp.text)]
+        if indices is None:                    # new shape absent — upstream path
+            return await _orig(self, home_page_response, session, headers)
+        if not indices:
+            raise Exception("Couldn't get KEY_BYTE indices "
+                            '(new page format parsed empty)')
+        return indices[0], indices[1:]
+
+    get_indices._xconnect_patch = True
+    _tx.ClientTransaction.get_indices = get_indices
+
+
+_install_transaction_patch()
 
 
 # ------------------------------------------------------------------- probe
