@@ -281,6 +281,16 @@ class Store:
             rows = self._db.execute(sql, args).fetchall()
         return [dict(r) for r in reversed(rows)]
 
+    def latest_message(self, account, conv_id):
+        """Newest message of a conversation — read_index source for mark_read."""
+        with self._lock:
+            row = self._db.execute(
+                """SELECT msg_id, us FROM messages
+                   WHERE account=? AND conv_id=? AND us IS NOT NULL
+                   ORDER BY us DESC LIMIT 1""",
+                (account, conv_id)).fetchone()
+        return dict(row) if row else None
+
     def has_messages(self, account, conv_id):
         with self._lock:
             row = self._db.execute('SELECT COUNT(1) AS n FROM messages WHERE account=? AND conv_id=?',

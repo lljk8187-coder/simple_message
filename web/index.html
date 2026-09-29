@@ -412,6 +412,8 @@ async function openConv(c){
   renderConvs();
   jpost(`/api/accounts/${encodeURIComponent(ACCT)}/focus`, { conv_id: c.conv_id }).catch(()=>{});
   await loadMsgs();
+  // read receipt: opening the conversation marks it seen on the peer's side
+  jpost(`/api/accounts/${encodeURIComponent(ACCT)}/read`, { conv_id: c.conv_id }).catch(()=>{});
 }
 async function loadMsgs(beforeUs){
   if (!ACCT || !CUR || LOADING) return;

@@ -572,6 +572,46 @@ def send_message(client, sess, conv_id, short_id, text):
     }
 
 
+ALNUM = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+
+
+def mark_read(client, sess, conv_id, short_id, read_index, unread=0):
+    """cmd 2002 (mark read) -> inner field 604, sub=1.
+
+    Recipe diffed against matrix-tiktok and validated live (biz_code=0):
+    f4 is the read index in epoch-microseconds (the newest message's f4),
+    f5/f6 carry the local unread counters. Known quirk: the server-side
+    conversation counters (f11/f9 of cmd 203) do not move from this call —
+    the receipt lands on the peer's side, which is exactly the "seen" mark
+    the official clients show.
+    """
+    payload = (pb.s(1, conv_id) + pb.vint(2, int(short_id)) + pb.vint(3, 1)
+               + pb.vint(4, int(read_index))
+               + pb.vint(5, int(unread)) + pb.vint(6, int(unread)))
+    body = (pb.vint(1, 2002) + pb.vint(2, 1) + pb.s(3, ENVELOPE_VER)
+            + pb.vint(5, 3) + pb.vint(6, 0) + pb.s(7, ENVELOPE_BUILD)
+            + pb.sub(8, pb.sub(604, payload))
+            + pb.s(9, sess.device_id) + pb.s(11, 'web'))
+    headers = _proto_headers(sess)
+    guard, tier = ticket_guard_headers(sess, '/v3/conversation/mark_read')
+    if guard:
+        headers.update(guard)
+    bogus = ''.join(secrets.choice(ALNUM) for _ in range(24))   # X-Bogus: random, like the web client
+    query = ('?aid=1988&version_code=1.0.0&app_name=tiktok_web&device_platform=web_pc'
+             '&msToken=' + urllib.parse.quote(sess.ms_token or '', safe='')
+             + '&X-Bogus=' + bogus)
+    status, raw, rh = client.post(IM_API + '/v3/conversation/mark_read' + query,
+                                  headers=headers, body=body)
+    _, meta = unwrap(raw, 2002)
+    guard_result = None
+    for k, v in rh.items():
+        if k.lower() == 'tt-ticket-guard-result':
+            guard_result = v
+    return {'ok': meta.get('biz_code') == 0, 'http': status,
+            'biz_code': meta.get('biz_code'), 'biz_msg': meta.get('biz_msg'),
+            'guard_result': guard_result, 'tier': tier}
+
+
 # --------------------------------------------------------------------- login
 
 def verify_cookie(client, cookie):

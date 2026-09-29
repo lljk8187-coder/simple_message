@@ -180,7 +180,13 @@ f7 = "1132b10:master"    f8 = { f<命令号>: 载荷 }    f9 = device_id    f11 
 | 增量心跳 | 204 | 10040 | `/v1/message/get_by_user_combo` | `{f1:{f1:0, f2 游标, f3:50, f4:8}}` |
 | 陌生人列表 | 1001 | — | `/v1/stranger/get_conversation_list` | f8 内层 **f1000**：`{f1 cursor, f2 count, f3 show_total_unread}` |
 | 发送 | 100 | — | `/v1/message/send` | 见下 |
+| 已读回执 | 2002 | 1 | `/v3/conversation/mark_read` | f8 内层 **f604**：`{f1 会话id, f2 short_id, f3:1, f4 read_index(最新消息微秒), f5/f6 未读计数}` |
 | 用户资料 | — | — | `GET www.tiktok.com/tiktok/v1/im/user/profile/?aid=1988&user_ids=[...]` | 批量，JSON 返回 |
+
+**已读回执（2002，已接入 hub）**：打开会话时自动发送（`POST /api/accounts/<name>/read`）。
+read_index 取库里最新一条消息的微秒时间戳；f5/f6 传 0。实测两账号 `biz=0`。
+注意：服务端会话计数（f11/f9）不因此归零——回执效果在**对方视角**的"已读"标记上，
+本 hub 的未读徽章仍由前端本地基线管理。X-Bogus 用随机 24 位字母数字（web 客户端同款）。
 
 **陌生人列表（1001）**：响应 f6 的内层 tag 也是 **f1000**（不是 1001）——
 `{f1 next_cursor, f2 has_more, f3 total_unread（消息请求未读总数）, f4 StrangerConversation[]}`。

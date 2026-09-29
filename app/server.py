@@ -81,6 +81,7 @@ class Handler(BaseHTTPRequestHandler):
         ('GET', r'^/api/accounts/(?P<name>[^/]+)/conversations$', 'conversations'),
         ('GET', r'^/api/accounts/(?P<name>[^/]+)/messages$', 'messages'),
         ('POST', r'^/api/accounts/(?P<name>[^/]+)/send$', 'send'),
+        ('POST', r'^/api/accounts/(?P<name>[^/]+)/read$', 'mark_read'),
         ('POST', r'^/api/accounts/(?P<name>[^/]+)/focus$', 'focus'),
         ('GET', r'^/api/events$', 'events'),
         ('GET', r'^/api/harvest$', 'harvest_get'),
@@ -306,6 +307,30 @@ class Handler(BaseHTTPRequestHandler):
             # read-back is not instantaneous on this API, so poll this conversation
             # hard for the next few seconds rather than waiting out a whole interval
             self.hub.nudge(name, conv_id)
+        self._json(result)
+
+    def h_mark_read(self, q, name):
+        """Send the read receipt for a conversation (cmd 2002).
+
+        read_index comes from the newest stored message (epoch-microseconds);
+        the effect lands on the peer's side as the "seen" mark — the local
+        unread counters this hub displays stay frontend-owned.
+        """
+        self._require(name)
+        sess = self.hub.sessions[name]
+        body = self._body()
+        conv_id = (body.get('conv_id') or '').strip()
+        if not conv_id:
+            return self._json({'error': 'conv_id is required'}, 400)
+        conv = next((c for c in self.store.list_conversations(name)
+                     if c['conv_id'] == conv_id), None)
+        if not conv or not conv['short_id']:
+            return self._json({'error': 'unknown conversation (no short_id)'}, 404)
+        latest = self.store.latest_message(name, conv_id)
+        if not latest:
+            return self._json({'ok': False, 'skipped': 'no messages to mark'})
+        result = api.mark_read(self.client, sess, conv_id, conv['short_id'],
+                               latest['us'])
         self._json(result)
 
     def h_focus(self, q, name):
