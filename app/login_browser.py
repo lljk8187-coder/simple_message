@@ -160,7 +160,10 @@ class BrowserLogin:
         page.goto('https://www.tiktok.com/login', timeout=60000)
 
         # -- wait for the session cookie (login complete)
-        deadline = time.time() + 600
+        # 30 min: fresh-environment logins often draw TikTok email/captcha
+        # verification, and the mail-code endpoint rate-limits ("访问频繁")
+        # for minutes at a time — 10 was not enough to wait that out.
+        deadline = time.time() + 1800
         cookie_str = ''
         while time.time() < deadline:
             if self._cancel.is_set():
