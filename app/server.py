@@ -82,6 +82,7 @@ class Handler(BaseHTTPRequestHandler):
         ('GET', r'^/api/accounts/(?P<name>[^/]+)/messages$', 'messages'),
         ('POST', r'^/api/accounts/(?P<name>[^/]+)/send$', 'send'),
         ('POST', r'^/api/accounts/(?P<name>[^/]+)/read$', 'mark_read'),
+        ('POST', r'^/api/x/probe$', 'x_probe'),
         ('POST', r'^/api/accounts/(?P<name>[^/]+)/focus$', 'focus'),
         ('GET', r'^/api/events$', 'events'),
         ('GET', r'^/api/harvest$', 'harvest_get'),
@@ -428,6 +429,31 @@ class Handler(BaseHTTPRequestHandler):
     def _require(self, name):
         if name not in self.hub.sessions:
             raise api.ApiError('account %r is not loaded' % name)
+
+    def h_x_probe(self, q):
+        """Stateless X (Twitter) cookie validation — verify/inbox/history.
+
+        Accepts {cookies: "<Cookie header string or JSON dict>",
+        history_uid (optional, exercise get_dm_history for one peer).
+        Stores nothing; every stage reports its own error so a single paste
+        of cookies answers whether the X connector works for this account.
+        """
+        body = self._body()
+        cookies = (body.get('cookies') or '').strip()
+        if not cookies:
+            return self._json({'error': 'cookies are required'}, 400)
+        try:
+            from . import xconnect
+        except ImportError:
+            return self._json({'error': 'xconnect module unavailable'}, 500)
+        try:
+            report = xconnect.probe(
+                cookies, proxy=self.client.proxy,
+                with_history_uid=(body.get('history_uid') or None))
+            self._json({'ok': 'error' not in (report.get('verify') or {}),
+                        'report': report})
+        except Exception as e:
+            self._json({'ok': False, 'error': '%s: %s' % (type(e).__name__, e)})
 
     def h_login_start(self, q):
         started, state = self.login_flow.start()
