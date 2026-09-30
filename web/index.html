@@ -75,6 +75,25 @@
   #modal.show{display:grid}
   #batchModal{position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;place-items:center;z-index:50}
   #batchModal.show{display:grid}
+  #blockModal,#auditModal{position:fixed;inset:0;background:rgba(0,0,0,.45);
+                          display:none;place-items:center;z-index:50}
+  #blockModal.show,#auditModal.show{display:grid}
+  .panelrow{display:flex;align-items:center;gap:8px;padding:7px 0;border-bottom:1px solid var(--line)}
+  .panelrow:last-child{border-bottom:none}
+  .panelrow .grow{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;
+                  white-space:nowrap;font-size:12.5px}
+  .kv{color:var(--fg3);font-size:11.5px}
+  .detail{background:var(--panel2);border:1px solid var(--line);border-radius:9px;
+          padding:8px 11px;margin:2px 0 8px}
+  .detail table{width:100%;border-collapse:collapse;font-size:11.5px}
+  .detail td{padding:2px 0;vertical-align:top}
+  .detail td.dk{color:var(--fg3);white-space:nowrap;padding-right:10px}
+  .detail td.dv{color:var(--fg2);word-break:break-all}
+  .stat{padding:0 6px;border-radius:999px;border:1px solid var(--line);font-size:11px;white-space:nowrap}
+  .stat.sent{color:#3fb950;border-color:#2ea04355}
+  .stat.failed{color:#f85149;border-color:#f8514955}
+  .stat.skipped{color:#d29922;border-color:#d2992255}
+  .stat.unknown{color:var(--fg3);border-color:var(--line)}
   #batchList label{font-size:13px;color:var(--fg)}
   #batchList .bgroup{font-weight:600;font-size:12.5px;margin:8px 0 2px;color:var(--fg2)}
   .card{width:min(620px,92vw);max-height:88vh;overflow:auto;background:var(--panel);
@@ -118,6 +137,8 @@
   <span style="font-size:12px;color:var(--fg3)" id="who"></span>
   <button class="btn" id="btnHarvest" title="从已登录的浏览器里取写入凭据">收割凭据</button>
   <button class="btn" id="btnBatch" title="建立群发任务：同一条消息发给多个会话（可跨平台），可暂停/继续/取消">群发任务</button>
+  <button class="btn" id="btnAudit" title="审计：群发任务与手动发送的时间、对象与结果（只增不改，供追溯）">审计</button>
+  <button class="btn" id="btnBlock" title="黑名单：群发任务会自动跳过这些人">黑名单</button>
   <button class="btn primary" id="btnAdd">添加账号</button>
 </header>
 
@@ -136,6 +157,8 @@
       </div>
       <span class="spacer"></span>
       <span class="csub" id="histHint"></span>
+      <button class="btn" id="btnBlockPeer" style="display:none;padding:3px 10px;font-size:12px"
+              title="把该联系人加入黑名单：群发任务会跳过 TA（手动单发不受影响）">拉黑</button>
     </div>
     <div id="msgs"><div class="empty" id="welcome"></div></div>
     <form id="sendform">
@@ -266,6 +289,41 @@
     </div>
   </div>
 </div>
+
+<div id="blockModal">
+  <div class="card">
+    <h3>黑名单</h3>
+    <p class="hint">
+      列在这里的联系人，<b>群发任务会自动跳过</b>（记为「跳过 · blocked」），不会发出任何消息；
+      手动单发不受影响。列表里 <code>account</code> 空白表示<b>该平台下所有账号</b>都跳过此人。
+    </p>
+    <div id="blockList" style="max-height:360px;overflow:auto"></div>
+    <div class="row">
+      <button class="btn" id="btnBlockRefresh">刷新</button>
+      <button class="btn" id="btnBlockClose">关闭</button>
+    </div>
+  </div>
+</div>
+
+<div id="auditModal">
+  <div class="card">
+    <h3>审计</h3>
+    <p class="hint">
+      群发任务的每一步与手动发送都会留痕：动作、对象、结果（TikTok 含信任档）。
+      这张表<b>只增不改</b>，没有修改或删除入口。默认显示最近 100 条。
+    </p>
+    <div class="field">
+      <input type="text" id="auditFilter"
+             placeholder="过滤：动作 / 对象 / 内容，例如 dispatch.failed、obb815">
+    </div>
+    <div id="auditList" style="max-height:400px;overflow:auto"></div>
+    <div class="row">
+      <button class="btn" id="btnAuditRefresh">刷新</button>
+      <button class="btn" id="btnAuditClose">关闭</button>
+    </div>
+  </div>
+</div>
+
 <div id="hmodal">
   <div class="card">
     <h3>收割凭据</h3>
@@ -381,6 +439,10 @@ async function jpost(u,b){ const r=await fetch(u,{method:'POST',headers:Object.a
   if(r.status===401){ await needAuth(); return jpost(u,b); }
   const j=await r.json().catch(()=>({error:'bad json'}));
   if(j.error) throw new Error(j.error + (j.detail? ' · '+j.detail : '')); return j; }
+async function jdel(u){ const r=await fetch(u,{method:'DELETE',headers:authHeaders()});
+  if(r.status===401){ await needAuth(); return jdel(u); }
+  const j=await r.json().catch(()=>({error:'bad json'}));
+  if(j.error) throw new Error(j.error + (j.detail? ' · '+j.detail : '')); return j; }
 
 // ---------------------------------------------------------------- accounts
 async function loadAccounts(select) {
@@ -427,6 +489,7 @@ async function switchAccount(name){
   const meta = ACCOUNTS.find(a => a.name === name);
   $('#who').textContent = meta ? ((meta.nickname||meta.username||'') + ' · ' + meta.uid) : '';
   $('#msgs').innerHTML = '<div class="empty">加载中…</div>';
+  $('#btnBlockPeer').style.display = 'none';   // 会话未选定时不显示「拉黑」
   hookEvents();
   await loadConvs();
 }
@@ -491,6 +554,7 @@ async function openConv(c){
   $('#chatTitle').textContent = c.peer_nickname || c.peer_unique || ('uid ' + c.peer_uid);
   $('#chatSub').textContent = `uid ${c.peer_uid}${c.short_id ? ' · short_id ' + c.short_id : ''}`;
   $('#text').disabled = $('#sendBtn').disabled = false;
+  $('#btnBlockPeer').style.display = c.peer_uid ? '' : 'none';
   $('#msgs').innerHTML = '<div class="empty">加载消息…</div>';
   renderConvs();
   jpost(`/api/accounts/${encodeURIComponent(ACCT)}/focus`, { conv_id: c.conv_id }).catch(()=>{});
@@ -687,8 +751,11 @@ $('#btnAdd').onclick = () => {
 // ------------------------------------------------------------- batch send
 // ------------------------------------------------------- campaigns (queue)
 let CAMP_TIMER = null;
+let CAMP_OPEN = null;              // 展开明细的任务 id（同时只展开一个）
 const CAMP_ZH = {queued: '待开始', running: '进行中', paused: '已暂停',
                  done: '已完成', cancelled: '已取消'};
+const ITEM_ZH = {queued: '待发', sending: '发送中', sent: '已发送', failed: '失败',
+                 skipped: '跳过', unknown: '未知'};
 
 async function loadCampaigns(){
   const box = $('#campList');
@@ -698,22 +765,29 @@ async function loadCampaigns(){
     const list = d.campaigns || [];
     if (!list.length) { box.innerHTML = '<div class="hint">还没有任务</div>'; return; }
     box.innerHTML = '';
-    list.forEach(c => {
+    for (const c of list) {
       const p = c.progress || {};
       const parts = [`总数 ${p.total || 0}`, `已发 ${p.sent || 0}`];
       if (p.failed) parts.push(`失败 ${p.failed}`);
       if (p.skipped) parts.push(`跳过 ${p.skipped}`);
       if (p.unknown) parts.push(`未知 ${p.unknown}`);
       if (p.queued) parts.push(`待发 ${p.queued}`);
+      const open = CAMP_OPEN === c.campaign_id;
       const row = document.createElement('div');
       row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:6px 0;'
                         + 'border-bottom:1px solid var(--line)';
       const title = document.createElement('span');
       title.style.cssText = 'font-size:12px;flex:1;min-width:0;overflow:hidden;'
-                          + 'text-overflow:ellipsis;white-space:nowrap';
-      title.innerHTML = `<b>${esc(CAMP_ZH[c.status] || c.status)}</b> · `
+                          + 'text-overflow:ellipsis;white-space:nowrap;cursor:pointer';
+      title.title = '点击展开这一条的队列明细';
+      title.innerHTML = `<span class="kv">${open ? '▾' : '▸'}</span> `
+        + `<b>${esc(CAMP_ZH[c.status] || c.status)}</b> · `
         + `${esc((c.text || '').slice(0, 16))} `
         + `<span class="hint">${esc(parts.join(' · '))}</span>`;
+      title.onclick = () => {
+        CAMP_OPEN = open ? null : c.campaign_id;
+        loadCampaigns();
+      };
       row.appendChild(title);
       if (c.status === 'running' || c.status === 'queued') {
         row.appendChild(campBtn(c, '暂停', 'pause'));
@@ -723,7 +797,13 @@ async function loadCampaigns(){
         row.appendChild(campBtn(c, '取消', 'cancel'));
       }
       box.appendChild(row);
-    });
+      if (open) {
+        const host = document.createElement('div');
+        host.innerHTML = '<div class="hint">加载队列明细…</div>';
+        box.appendChild(host);
+        loadCampDetail(c.campaign_id, host);
+      }
+    }
   } catch (e) {
     box.innerHTML = '<div class="hint">任务列表加载失败：' + esc(e.message) + '</div>';
   }
@@ -742,6 +822,160 @@ function campBtn(c, label, action){
   };
   return b;
 }
+async function loadCampDetail(cid, host){
+  try {
+    const d = await jget(`/api/campaigns/${encodeURIComponent(cid)}`);
+    const items = d.items || [];
+    if (!items.length) {
+      host.innerHTML = '<div class="hint">该任务没有队列项</div>';
+      return;
+    }
+    const rows = items.map(i => {
+      const note = i.skip_reason ? '跳过原因 ' + i.skip_reason
+                 : (i.error ? String(i.error).slice(0, 90) : '');
+      const gr = (i.status === 'sent' && i.guard_result !== null
+                  && i.guard_result !== undefined && i.guard_result !== '')
+        ? '信任档 ' + i.guard_result : '';
+      const tail = [note, gr].filter(Boolean).join(' · ');
+      return `<tr><td class="dk">#${esc(String(i.seq))}</td><td class="dv">`
+        + `<span class="stat ${esc(i.status)}">${esc(ITEM_ZH[i.status] || i.status)}</span> `
+        + `<span class="kv">${esc(i.account || '')}`
+        + (i.peer_uid ? ' → ' + esc(String(i.peer_uid)) : '') + `</span>`
+        + (tail ? `<br><span class="kv">${esc(tail)}</span>` : '')
+        + `</td></tr>`;
+    }).join('');
+    host.innerHTML = '<div class="detail"><table>' + rows + '</table></div>';
+  } catch (e) {
+    host.innerHTML = '<div class="hint">明细加载失败：' + esc(e.message) + '</div>';
+  }
+}
+
+// ------------------------------------------------------------- blocklist
+async function loadBlocks(){
+  const box = $('#blockList');
+  box.innerHTML = '<div class="hint">加载中…</div>';
+  try {
+    const d = await jget('/api/blocks');
+    const list = d.blocks || [];
+    if (!list.length) {
+      box.innerHTML = '<div class="empty" style="padding:16px">黑名单为空</div>';
+      return;
+    }
+    box.innerHTML = '';
+    list.forEach(b => {
+      const row = document.createElement('div');
+      row.className = 'panelrow';
+      const g = document.createElement('div');
+      g.className = 'grow';
+      g.innerHTML = `<b>${esc(b.peer_uid || '')}</b> `
+        + `<span class="kv">${esc(b.platform || '')} / `
+        + `${b.account ? esc(b.account) : '全部账号'}`
+        + (b.reason ? ' · ' + esc(b.reason) : '') + `</span>`;
+      const rm = document.createElement('button');
+      rm.className = 'btn';
+      rm.style.cssText = 'padding:3px 9px;font-size:12px;flex:0 0 auto';
+      rm.textContent = '移除';
+      rm.onclick = async () => {
+        try {
+          await jdel('/api/blocks?' + new URLSearchParams({
+            platform: b.platform || '', account: b.account || '',
+            peer_uid: b.peer_uid || ''}));
+          toast('已从黑名单移除');
+          loadBlocks();
+        } catch (e) { toast('移除失败：' + e.message, true); }
+      };
+      row.appendChild(g);
+      row.appendChild(rm);
+      box.appendChild(row);
+    });
+  } catch (e) {
+    box.innerHTML = '<div class="hint">加载失败：' + esc(e.message) + '</div>';
+  }
+}
+$('#btnBlock').onclick = () => { $('#blockModal').classList.add('show'); loadBlocks(); };
+$('#btnBlockClose').onclick = () => $('#blockModal').classList.remove('show');
+$('#btnBlockRefresh').onclick = () => loadBlocks();
+$('#btnBlockPeer').onclick = async () => {
+  if (!ACCT || !CUR) return;
+  const acc = ACCOUNTS.find(a => a.name === ACCT) || {};
+  const who = CUR.peer_nickname || CUR.peer_unique || ('uid ' + CUR.peer_uid);
+  const reason = prompt('把「' + who + '」加入黑名单？\n\n'
+    + '效果：群发任务会自动跳过 TA，手动单发不受影响。\n'
+    + '可填写原因（留空也行；点「取消」则不操作）：', '');
+  if (reason === null) return;
+  try {
+    await jpost('/api/blocks', {platform: acc.platform || '', account: ACCT,
+                                peer_uid: CUR.peer_uid, reason: reason.trim()});
+    toast('已加入黑名单：' + who);
+  } catch (e) { toast('加入黑名单失败：' + e.message, true); }
+};
+
+// ------------------------------------------------------------------ audit
+const AUDIT_ZH = {
+  'campaign.create': '建立任务', 'campaign.start': '任务开始', 'campaign.done': '任务完成',
+  'campaign.pause': '暂停任务', 'campaign.resume': '继续任务', 'campaign.cancel': '取消任务',
+  'dispatch.sent': '已发送', 'dispatch.failed': '发送失败', 'dispatch.skipped': '已跳过',
+  'dispatch.orphan': '遗留（结局未知）', 'block.add': '加入黑名单',
+  'block.remove': '移出黑名单', 'message.send': '手动发送'
+};
+let AUDIT = [];
+function auditTone(action){
+  if (action.endsWith('.failed')) return 'failed';
+  if (action.endsWith('.sent')) return 'sent';
+  if (action.endsWith('.skipped') || action.endsWith('.orphan')) return 'skipped';
+  return '';
+}
+function renderAudit(){
+  const box = $('#auditList');
+  const kw = ($('#auditFilter').value || '').trim().toLowerCase();
+  const hits = AUDIT.filter(a => !kw ||
+    JSON.stringify([a.action, a.target, a.detail, a.actor]).toLowerCase().includes(kw));
+  if (!hits.length) {
+    box.innerHTML = '<div class="empty" style="padding:16px">'
+      + (kw ? '没有匹配的记录' : '还没有审计记录') + '</div>';
+    return;
+  }
+  box.innerHTML = '';
+  hits.forEach(a => {
+    const row = document.createElement('div');
+    row.className = 'panelrow';
+    row.style.alignItems = 'flex-start';
+    const tag = document.createElement('span');
+    tag.className = 'stat ' + auditTone(a.action || '');
+    tag.style.flex = '0 0 auto';
+    tag.textContent = AUDIT_ZH[a.action] || a.action;
+    const g = document.createElement('div');
+    g.className = 'grow';
+    g.style.whiteSpace = 'normal';
+    const det = a.detail ? (typeof a.detail === 'string'
+      ? a.detail : JSON.stringify(a.detail)) : '';
+    g.innerHTML = `<span class="kv">${esc(a.target || '')}</span>`
+      + (det ? ` <span class="kv">${esc(det.slice(0, 160))}</span>` : '');
+    const when = document.createElement('span');
+    when.className = 'kv';
+    when.style.flex = '0 0 auto';
+    when.textContent = fmtTime(a.ts_ms);
+    row.appendChild(tag);
+    row.appendChild(g);
+    row.appendChild(when);
+    box.appendChild(row);
+  });
+}
+async function loadAudit(){
+  const box = $('#auditList');
+  box.innerHTML = '<div class="hint">加载中…</div>';
+  try {
+    const d = await jget('/api/audit?limit=100');
+    AUDIT = d.audit || [];
+    renderAudit();
+  } catch (e) {
+    box.innerHTML = '<div class="hint">加载失败：' + esc(e.message) + '</div>';
+  }
+}
+$('#btnAudit').onclick = () => { $('#auditModal').classList.add('show'); loadAudit(); };
+$('#btnAuditClose').onclick = () => $('#auditModal').classList.remove('show');
+$('#btnAuditRefresh').onclick = () => loadAudit();
+$('#auditFilter').oninput = () => renderAudit();
 
 $('#btnBatch').onclick = async () => {
   $('#batchModal').classList.add('show');
