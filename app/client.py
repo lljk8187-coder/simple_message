@@ -251,34 +251,59 @@ def unwrap(raw, cmd):
 
 # -------------------------------------------------------------------- reads
 
+# f8 里出现这些键名时按"非文本消息"归类（贴纸 / 图片 / 视频 / 附件）。
+# 各家客户端版本键名不一，所以按名字匹配而不是穷举结构。
+_MEDIA_KEYS = ('sticker', 'image', 'video', 'attachment', 'media', 'aweurl')
+
+
 def parse_message(entry, my_uid):
     it = pb.parse(entry)
     if it is None:
         return None
     raw_text = pb.text(pb.blob(it, 8)) or ''
-    body, awe = raw_text, 0
-    try:
-        j = json.loads(raw_text)
-        body = j.get('text', '') or ''
-        awe = j.get('aweType', 0)
-    except Exception:
-        pass
+    body, awe, j = raw_text, 0, {}
+    if raw_text:
+        try:
+            parsed = json.loads(raw_text)
+            if isinstance(parsed, dict):
+                j = parsed
+                body = j.get('text', '') or ''
+                awe = j.get('aweType', 0) or 0
+        except Exception:
+            j = {}
     sender = pb.one(it, 7) or 0
     micros = pb.one(it, 4) or 0
     millis = pb.one(it, 10) or (micros // 1000 if micros else 0)
     ext = pb.pairs(pb.all_of(it, 9))
-    # f8 can also carry session-control events ({"command_type":1,...}) instead of
-    # chat text. They travel the same stream, have no client_message_id, and used
-    # to land in the store as empty bubbles — tag them so they can be filtered.
-    kind = 'command' if 'command_type' in (j if isinstance(j, dict) else {}) else 'text'
+    # f8 also carries non-chat payloads. Tag them so the UI can say *what* it is
+    # instead of drawing an unexplained empty bubble:
+    #   command  session-control event ({"command_type":1,...}) — dropped by store
+    #   tip      server notice mixed into the stream; measured live:
+    #            {"tips":"Message request accepted. You can start chatting."}
+    #            -> shown verbatim (it is genuine user-visible text)
+    #   reaction non-zero aweType (emoji/sticker reaction on a message)
+    #   media    sticker/image/video payload (keys vary, matched by name)
+    #   unknown  empty and unrecognised — better an explicit label than a blank
+    if 'command_type' in j:
+        kind = 'command'
+    elif body.strip():
+        kind = 'text'
+    elif j.get('tips'):
+        kind, body = 'tip', str(j['tips'])
+    elif awe:
+        kind = 'reaction'
+    elif any(k in raw_text.lower() for k in _MEDIA_KEYS):
+        kind = 'media'
+    else:
+        kind = 'unknown'
     return {
         'msg_id': str(pb.one(it, 3) or ''),
         'conv_id': pb.text(pb.blob(it, 1)) or '',
         'sender': str(sender),
         'outgoing': str(sender) == str(my_uid),
         'text': body,
-        'awe_type': awe,
         'kind': kind,
+        'awe_type': awe,
         'ms': int(millis),
         'us': int(micros),
         'ext': ext,

@@ -100,7 +100,17 @@ class Conversation:
 
 @dataclass
 class Message:
-    """一条消息。status 走 'sent' | 'pending' | 'failed'（乐观气泡用 pending）。"""
+    """一条消息。status 走 'sent' | 'pending' | 'failed'（乐观气泡用 pending）。
+
+    kind 是消息类型标签，默认 'text'；非文本消息必须贴标签而不是留空文本，
+    否则界面只能画出一个来路不明的空气泡：
+      'text'     普通文本
+      'tip'      平台系统提示（文本内容在 text 里，按系统样式渲染）
+      'reaction' 表情回应（贴在某条消息上的 emoji／贴纸）
+      'media'    贴纸 / 图片 / 视频等非文本载荷
+      'unknown'  未能识别（至少告诉用户"这不是空消息"）
+    内核不解析平台细节，只按这个标签决定怎么显示。
+    """
     platform: str
     account: str
     msg_id: str
@@ -110,6 +120,7 @@ class Message:
     text: str = ''
     ms: int = 0                      # 毫秒时间戳
     status: str = 'sent'
+    kind: str = 'text'
 
     def to_dict(self):
         return asdict(self)
@@ -207,6 +218,12 @@ class PlatformAdapter:
           required_cookies  tuple 判据：这些 cookie 同时出现即视为登录完成
           cookie_domains    tuple 只保留域里含任一子串的 cookie
           hint              str   给用户的一句话提示（弹窗里显示）
+          clear_login_keys  tuple 该平台的"登录态 cookie"名单。驱动在打开
+                           登录页**之前**清掉这些 cookie，从而能登录**第二个**
+                           账号：profile 是持久化的，上次登录的 sessionid 会
+                           让判据立刻成立、窗口秒关。只列登录类 cookie，
+                           设备标识（ttwid / ig_did / mid 等）必须保留——
+                           换新身份反而更容易被风控。
           collect_materials callable(page, ctx, cookie_str) -> dict | None
                            平台专属的额外材料收割（如 TikTok 的 ticket /
                            私钥 / ts_sign）；返回的 dict 并进 add_account 的

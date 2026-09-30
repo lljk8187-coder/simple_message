@@ -48,6 +48,10 @@ class InstagramAdapter(PlatformAdapter):
             'cookie_domains': ('instagram.com',),
             'hint': '在窗口里登录 Instagram（可能要过验证码/挑战）。'
                     '登录后自动抓 sessionid 导入，比输密码更少触发风控。',
+            # 登录类 cookie：开窗口前清掉，否则上次的 sessionid/ds_user_id
+            # 会让判据立刻成立、窗口秒关。设备标识 ig_did / mid / datr 保留。
+            'clear_login_keys': ('sessionid', 'ds_user_id', 'rur',
+                                 'csrftoken'),
         }
 
     def auth_fields(self):

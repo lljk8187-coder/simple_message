@@ -29,6 +29,10 @@ class XAdapter(PlatformAdapter):
             'cookie_domains': ('x.com', 'twitter.com'),
             'hint': '在窗口里登录 X（可能要求手机号/邮箱验证）。'
                     '登录后自动抓取 auth_token 与 ct0，无需手工复制。',
+            # 登录类 cookie：不清掉的话，上次登录的账号会让判据立刻成立、
+            # 窗口秒关；访客标识 guest_id / gt 保留。
+            'clear_login_keys': ('auth_token', 'ct0', 'twid', 'kdt',
+                                 'auth_multi'),
         }
 
     # ------------------------------------------------------------ 认证

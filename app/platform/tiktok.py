@@ -82,6 +82,18 @@ class TikTokAdapter(PlatformAdapter):
             'hint': '在窗口里登录 TikTok（密码 / 扫码 / 验证码都行）。'
                     '登录完成后会自动收割签名材料（ticket + 私钥），'
                     '这一步是最高信任档的输入。',
+            # 登录类 cookie：开窗口前清掉，否则上次的登录态会立刻命中判据、
+            # 窗口秒关（同平台就登不了第二个账号）。设备标识 ttwid / msToken /
+            # tt_chain_token 必须保留——换新设备反而更容易吃风控。
+            'clear_login_keys': (
+                'sessionid', 'sessionid_ss', 'sid_tt', 'sid_guard',
+                'uid_tt', 'uid_tt_ss', 'sid_ucp_v1', 'ssid_ucp_v1',
+                'passport_auth_status', 'passport_auth_status_ss',
+                'multi_sids', 'tt_session_tlb_tag', 'store-idc',
+                'store-country-code', 'store-country-code-src',
+                'tt-target-idc', 'tt-target-idc-sign', 'store-country-sign',
+                'last_login_method', 'passport_fe_beating_status',
+            ),
             'collect_materials': self._collect_materials,
         }
 
@@ -223,7 +235,8 @@ class TikTokAdapter(PlatformAdapter):
                         sender=str(r.get('sender') or ''),
                         outgoing=1 if r.get('outgoing') else 0,
                         text=r.get('text') or '', ms=int(r.get('ms') or 0),
-                        status='sent')
+                        status='sent',
+                        kind=r.get('kind') or 'text')
                 for r in rows]
 
     def poll(self, sess, state):
@@ -237,7 +250,8 @@ class TikTokAdapter(PlatformAdapter):
                          sender=str(m.get('sender') or ''),
                          outgoing=1 if m.get('outgoing') else 0,
                          text=m.get('text') or '', ms=int(m.get('ms') or 0),
-                         status='sent')
+                         status='sent',
+                         kind=m.get('kind') or 'text')
             events.append({'type': 'message', **md.to_dict()})
         return events, str(cursor)
 

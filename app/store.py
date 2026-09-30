@@ -9,6 +9,11 @@ import sqlite3
 import threading
 import time
 
+# 版本化：1 = 阶段 1 重构（统一模型 + 阶段 2 预备表）；
+#          2 = messages.kind（消息类型标签，非文本消息显式标注）。
+# 打开更老的库时先自动留一份快照再升级（见 __init__ / _needs_upgrade）。
+SCHEMA_VERSION = 2
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS accounts (
   name       TEXT PRIMARY KEY,
@@ -53,6 +58,7 @@ CREATE TABLE IF NOT EXISTS messages (
   ms        INTEGER,
   us        INTEGER,
   awe_type  INTEGER,
+  kind      TEXT,
   cid       TEXT,
   PRIMARY KEY (account, msg_id)
 );
@@ -163,7 +169,7 @@ class Store:
                 has_accounts = con.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' "
                     "AND name='accounts'").fetchone()
-                return ver < 1 and bool(has_accounts)
+                return ver < SCHEMA_VERSION and bool(has_accounts)
             finally:
                 con.close()
         except sqlite3.Error:
@@ -183,8 +189,18 @@ class Store:
             # waiting on the server; 0 here would look authoritative until the next
             # list sync, so start them at NULL (rendered as "unknown") instead.
             self._db.execute('UPDATE conversations SET unread = NULL')
+        # kind：消息类型标签（非文本消息不再渲染成空泡）。老库没有这个字段，
+        # 按内容回填：有文本的记 'text'，空文本的记 'unknown'（实测这批就是
+        # TikTok 混在消息流里的系统提示，界面至少会说明"这不是空消息"）。
+        mcols = {r['name'] for r in self._db.execute('PRAGMA table_info(messages)')}
+        if 'kind' not in mcols:
+            self._db.execute('ALTER TABLE messages ADD COLUMN kind TEXT')
+            self._db.execute("UPDATE messages SET kind = "
+                             "CASE WHEN TRIM(COALESCE(text,''))='' "
+                             "THEN 'unknown' ELSE 'text' END")
         # 版本化：阶段 1 重构（统一模型 + 阶段 2 预备表）之后即为 version 1。
-        self._db.execute('PRAGMA user_version = 1')
+        # version 2：messages.kind（消息类型标签，非文本消息显式标注）。
+        self._db.execute('PRAGMA user_version = %d' % SCHEMA_VERSION)
 
     # ------------------------------------------------------------ accounts
 
@@ -415,11 +431,13 @@ class Store:
                     continue
                 self._db.execute(
                     """INSERT OR IGNORE INTO messages
-                         (account, conv_id, msg_id, sender, outgoing, text, ms, us, awe_type, cid)
-                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                         (account, conv_id, msg_id, sender, outgoing, text, ms, us,
+                          awe_type, kind, cid)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                     (account, m.get('conv_id', ''), m['msg_id'], m.get('sender', ''),
                      1 if m.get('outgoing') else 0, m.get('text', ''), m.get('ms') or 0,
                      m.get('us') or 0, m.get('awe_type') or 0,
+                     m.get('kind') or 'text',
                      (m.get('ext') or {}).get('s:client_message_id')))
                 fresh.append(m)
             self._db.commit()

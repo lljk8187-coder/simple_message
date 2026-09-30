@@ -59,6 +59,8 @@
   .msg.in .bubble{background:var(--in);border:1px solid var(--line);border-bottom-left-radius:4px}
   .msg.out .bubble{background:var(--out);color:var(--outfg);border-bottom-right-radius:4px}
   .msg.pending .bubble{opacity:.55}
+  .msg.sys{align-self:center;max-width:80%;text-align:center;font-size:11.5px;
+           color:var(--fg3);padding:2px 10px}
   .meta{font-size:11px;color:var(--fg3);margin-top:3px}
   .daysep{align-self:center;font-size:11.5px;color:var(--fg3);padding:6px 10px}
   .empty{margin:auto;color:var(--fg3);font-size:13px;text-align:center;padding:24px;line-height:1.9}
@@ -533,6 +535,12 @@ function rebuildDaySeps(){
   });
 }
 
+// 非文本消息的显式标签：宁可写清楚"这是什么"，也不要留一个来路不明的空气泡
+// （TikTok 会把 "Message request accepted…" 这类系统提示混进消息流，
+//   贴纸/表情回应也不承载 text）。
+const KIND_LABEL = {reaction: '[表情回应]', media: '[贴纸 / 图片]',
+                    unknown: '[非文本消息]'};
+
 function appendMsg(container, m){
   // server echo of something we just sent -> upgrade the bubble already on screen
   if (m.cid && PENDING[m.cid]) {
@@ -549,12 +557,24 @@ function appendMsg(container, m){
   }
   if (SEEN.has(m.msg_id)) return;
   SEEN.add(m.msg_id);
+  if (m.kind === 'tip') {                       // 系统提示：居中一行，不是气泡
+    const el = document.createElement('div');
+    el.className = 'msg sys';
+    el.dataset.day = dayLabel(m.ms);
+    el.dataset.us = m.us;
+    el.dataset.ms = m.ms;
+    el.textContent = m.text || '系统提示';
+    container.appendChild(el);
+    return;
+  }
   const el = document.createElement('div');
   el.className = 'msg ' + (m.outgoing ? 'out' : 'in');
   el.dataset.day = dayLabel(m.ms);
   el.dataset.us = m.us;
   el.dataset.ms = m.ms;
-  const body = m.text || (m.awe_type ? `[不支持的消息类型 ${m.awe_type}]` : '(空)');
+  const label = (m.kind && m.kind !== 'text')
+    ? (KIND_LABEL[m.kind] || `[非文本消息 ${m.kind}]`) : '';
+  const body = m.text || label || '(空)';
   el.innerHTML = `<div class="bubble">${esc(body)}</div>
                   <div class="meta">${fmtTime(m.ms)}</div>`;
   container.appendChild(el);
@@ -592,7 +612,8 @@ function onIncoming(e){
 $('#sendform').onsubmit = async ev => {
   ev.preventDefault();
   const text = $('#text').value.trim();
-  if (!text || !CUR || !ACCT) return;
+  if (!ACCT || !CUR) { toast('先在左边选一个账号和会话', true); return; }
+  if (!text) { toast('消息不能为空', true); return; }
   $('#sendBtn').disabled = true;
   $('#text').value = '';
   const bubble = appendOptimistic(text);      // show it now, confirm it later
@@ -600,15 +621,31 @@ $('#sendform').onsubmit = async ev => {
     const r = await jpost(`/api/accounts/${encodeURIComponent(ACCT)}/send`,
                           { conv_id: CUR.conv_id, text });
     if (r.ok) {
-      if (bubble) PENDING[r.client_message_id] = bubble;
+      if (bubble && r.client_message_id) {
+        PENDING[r.client_message_id] = bubble;
+        // 兜底：20 秒内没等到服务器回显就解除"发送中"。否则半透明气泡会一直
+        // 挂在界面上（看起来像卡死），用户无从判断到底发出去没有。
+        setTimeout(() => {
+          if (PENDING[r.client_message_id] !== bubble) return;
+          delete PENDING[r.client_message_id];
+          bubble.classList.remove('pending');
+          const meta = bubble.querySelector('.meta');
+          if (meta) meta.textContent = fmtTime(Date.now()) + ' · 未收回执';
+        }, 20000);
+      } else if (bubble) {
+        // 平台不回 client_message_id（X / IG）：没有可匹配的回执，直接落地
+        bubble.classList.remove('pending');
+        const meta = bubble.querySelector('.meta');
+        if (meta) meta.textContent = fmtTime(Date.now());
+      }
       toast(`已发送 · 档位 ${r.tier || '?'} · 信任结果 ${r.guard_result ?? '?'}`);
     } else {
-      if (bubble) bubble.remove();
+      if (bubble) bubble.remove();              // 被拒 -> 回滚乐观气泡，别留空泡
       $('#text').value = text;
-      toast('发送被拒：' + (r.biz_msg || r.biz_code), true);
+      toast('发送被拒：' + (r.biz_msg || r.biz_code || '未知原因'), true);
     }
   } catch (e) {
-    if (bubble) bubble.remove();
+    if (bubble) bubble.remove();                // 失败 -> 回滚
     $('#text').value = text;
     toast('发送失败：' + e.message, true);
   } finally { $('#sendBtn').disabled = false; }

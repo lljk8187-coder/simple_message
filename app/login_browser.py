@@ -9,10 +9,13 @@ cookie 串 →（可选）调用适配器的 collect_materials 在**页面内**�
 所以两条入口不会分叉。
 
 平台差异**不含任何 if**：全部来自 `PlatformAdapter.popup_login_spec()`：
-  login_url / required_cookies / cookie_domains / hint / collect_materials
+  login_url / required_cookies / cookie_domains / hint / clear_login_keys /
+  collect_materials
 
 profile 按平台分目录（<profile_root>/<platform>），各站登录态互不污染；
 profile_root 由 server 传入（跟随 --data-dir），所以换库即换浏览器身份。
+但**同一平台内** profile 是持久的：所以开窗口前会先按 clear_login_keys
+清掉上次的登录类 cookie（否则同平台登录第二个账号时窗口会秒关）。
 
 唯一依赖是 playwright（pip install playwright）。浏览器优先用系统 Chrome
 （channel="chrome"），拿不到才回落内置 chromium。缺少 playwright 时本模块
@@ -167,6 +170,34 @@ class BrowserLogin:
                 except Exception:
                     pass
 
+    def _clear_previous_login(self, ctx, spec):
+        """清掉上次登录留下的登录类 cookie，让同一平台还能再登一个账号。
+
+        profile 是持久化的：上次的 sessionid 还在，登录判据会**立刻**成立，
+        于是窗口刚打开就被判成"已登录"、抓完旧账号的 cookie 秒关 —— 第二个
+        账号根本没机会登。这里只清 spec['clear_login_keys'] 声明的登录类
+        cookie，设备标识（ttwid / ig_did / mid 等）保留：换新设备身份反而更
+        容易被风控盯上。返回清掉的条数（0 = 本来就没登录态）。
+        """
+        keys = set(spec.get('clear_login_keys') or ())
+        if not keys:
+            return 0
+        try:
+            jars = ctx.cookies()
+        except Exception:
+            return 0
+        stale = [c for c in jars if c['name'] in keys]
+        if not stale:
+            return 0
+        keep = [c for c in jars if c['name'] not in keys]
+        try:
+            ctx.clear_cookies()
+            if keep:
+                ctx.add_cookies(keep)
+        except Exception:
+            return 0
+        return len(stale)
+
     def _drive(self, ctx, platform, spec):
         if self._cancel.is_set():
             self._set('cancelled', 'cancelled while opening browser', platform)
@@ -176,9 +207,12 @@ class BrowserLogin:
         domains = tuple(spec.get('cookie_domains') or ())
         origin = '{0.scheme}://{0.netloc}'.format(urlsplit(spec['login_url']))
 
-        self._set('waiting-login',
-                  spec.get('hint') or ('log in to %s in the opened window'
-                                       % origin), platform)
+        cleared = self._clear_previous_login(ctx, spec)
+        hint = spec.get('hint') or ('log in to %s in the opened window' % origin)
+        if cleared:
+            hint = '%s（已清除上次登录态 %d 项 cookie）' % (hint, cleared)
+
+        self._set('waiting-login', hint, platform)
         page = ctx.new_page()
         page.goto(spec['login_url'], timeout=60000)
 
