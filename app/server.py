@@ -112,6 +112,15 @@ class Handler(BaseHTTPRequestHandler):
         ('POST', r'^/api/accounts/(?P<name>[^/]+)/focus$', 'focus'),
         ('POST', r'^/api/x/probe$', 'x_probe'),
         ('POST', r'^/api/batch/send$', 'batch_send'),
+        ('GET', r'^/api/campaigns$', 'campaign_list'),
+        ('POST', r'^/api/campaigns$', 'campaign_create'),
+        ('GET', r'^/api/campaigns/(?P<cid>[^/]+)$', 'campaign_detail'),
+        ('POST', r'^/api/campaigns/(?P<cid>[^/]+)/(?P<action>pause|resume|cancel)$',
+         'campaign_action'),
+        ('GET', r'^/api/blocks$', 'block_list'),
+        ('POST', r'^/api/blocks$', 'block_add'),
+        ('DELETE', r'^/api/blocks$', 'block_remove'),
+        ('GET', r'^/api/audit$', 'audit_list'),
         ('GET', r'^/api/events$', 'events'),
         ('GET', r'^/api/harvest$', 'harvest_get'),
         ('POST', r'^/api/harvest$', 'harvest_post'),
@@ -159,7 +168,10 @@ class Handler(BaseHTTPRequestHandler):
                 except api.ApiError as e:
                     return self._err(e, 502)
                 except KeyError as e:
-                    return self._json({'error': str(e)}, 404)
+                    # str(KeyError) 会带上 Python repr 的引号（{"error": "'x'"}），
+                    # 取 args[0] 才是干净的消息
+                    msg = e.args[0] if e.args else 'not found'
+                    return self._json({'error': str(msg)}, 404)
                 except ValueError as e:
                     return self._json({'error': str(e)}, 400)
                 except Exception as e:
@@ -361,6 +373,93 @@ class Handler(BaseHTTPRequestHandler):
         self._json({'ok': sent == len(results) and bool(results),
                     'sent': sent, 'failed': len(results) - sent,
                     'results': results})
+
+    # ---------------------------------------------------- 代发队列（阶段 2）
+
+    def _actor(self):
+        """操作员标识。S4 接上操作员令牌后，这里换成令牌对应的名字。"""
+        return (self.headers.get('X-Operator') or 'local').strip() or 'local'
+
+    def h_campaign_list(self, q):
+        limit = int((q.get('limit') or ['50'])[0])
+        self._json({'campaigns': self.hub.campaigns(limit=limit)})
+
+    def h_campaign_detail(self, q, cid):
+        camp = self.store.get_campaign(cid)
+        if not camp:
+            raise KeyError('unknown campaign: %s' % cid)
+        self._json({'campaign': camp,
+                    'progress': self.store.campaign_progress(cid),
+                    'items': self.store.list_items(cid)})
+
+    def h_campaign_create(self, q):
+        """建代发任务：{text, targets:[{account,conv_id,label}], batch_size,
+        interval_s, schedule_ms, confirm}。
+
+        `confirm` 是硬性要求：这个接口一次会影响很多人，不能让一次误点或一个
+        随手写的脚本就把消息发出去。
+        """
+        body = self._body()
+        if not body.get('confirm'):
+            return self._json({'error': 'confirm is required — this sends to '
+                                        'every target in the list'}, 400)
+        text = (body.get('text') or '').strip()
+        targets = body.get('targets') or []
+        if not text:
+            return self._json({'error': 'text is required'}, 400)
+        if not isinstance(targets, list) or not targets:
+            return self._json({'error': 'targets are required'}, 400)
+        self._json(self.hub.create_campaign(
+            text, targets,
+            batch_size=body.get('batch_size') or 5,
+            interval_s=body.get('interval_s') or 60,
+            schedule_ms=body.get('schedule_ms') or 0,
+            actor=self._actor()))
+
+    def h_campaign_action(self, q, cid, action):
+        """暂停 / 继续 / 取消。非法迁移由 hub 抛 ValueError（→400）。"""
+        self._json({'ok': True,
+                    'campaign': self.hub.campaign_action(cid, action,
+                                                         actor=self._actor())})
+
+    def h_block_list(self, q):
+        self._json({'blocks': self.store.list_blocks()})
+
+    def h_block_add(self, q):
+        """{platform, peer_uid, account?, reason?} —— account 省略即该平台全局。"""
+        body = self._body()
+        platform = (body.get('platform') or '').strip()
+        peer_uid = (str(body.get('peer_uid') or '')).strip()
+        if not platform or not peer_uid:
+            return self._json({'error': 'platform and peer_uid are required'}, 400)
+        account = (body.get('account') or '').strip()
+        reason = (body.get('reason') or '').strip()
+        self.store.add_block(platform, account, peer_uid, reason)
+        self.store.audit(self._actor(), 'block.add',
+                         '%s:%s' % (platform, peer_uid),
+                         {'account': account, 'reason': reason})
+        self._json({'ok': True, 'blocks': self.store.list_blocks()})
+
+    def h_block_remove(self, q):
+        """DELETE /api/blocks?platform=&peer_uid=&account= —— query 传参，
+        不用 body（DELETE 带 body 各客户端行为不一致）。"""
+        platform = (q.get('platform') or [''])[0].strip()
+        peer_uid = (q.get('peer_uid') or [''])[0].strip()
+        account = (q.get('account') or [''])[0].strip()
+        if not platform or not peer_uid:
+            return self._json({'error': 'platform and peer_uid are required'}, 400)
+        self.store.remove_block(platform, account, peer_uid)
+        self.store.audit(self._actor(), 'block.remove',
+                         '%s:%s' % (platform, peer_uid), {'account': account})
+        self._json({'ok': True, 'blocks': self.store.list_blocks()})
+
+    def h_audit_list(self, q):
+        """审计查询 ?limit=&target=&action= —— append-only 表只有这一个读口。"""
+        limit = int((q.get('limit') or ['100'])[0])
+        target = (q.get('target') or [''])[0] or None
+        action = (q.get('action') or [''])[0] or None
+        self._json({'audit': self.hub.audit_log(limit=limit, target=target,
+                                                action=action)})
 
     # ------------------------------------------------------- harvest (credentials)
 

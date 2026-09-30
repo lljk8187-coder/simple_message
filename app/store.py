@@ -539,6 +539,14 @@ class Store:
                 (int(limit),)).fetchall()
         return [dict(r) for r in rows]
 
+    def list_items(self, campaign_id, limit=500):
+        """任务的队列项（按 seq），任务详情/前端进度用。"""
+        with self._lock:
+            rows = self._db.execute(
+                'SELECT * FROM dispatch_items WHERE campaign_id=? '
+                'ORDER BY seq LIMIT ?', (campaign_id, int(limit))).fetchall()
+        return [dict(r) for r in rows]
+
     def next_active_campaign(self, now_ms):
         """最早创建、且已到点的活跃任务（queued/running）。
 
