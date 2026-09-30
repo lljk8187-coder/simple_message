@@ -6,11 +6,13 @@
 """
 import json
 import threading
+import time
 import uuid
 
 from .sync import Hub as _SyncHub
 from .platform import registry
 from .platform.base import NeedCode
+from .dispatch import Dispatcher
 
 
 class Hub(_SyncHub):
@@ -21,6 +23,7 @@ class Hub(_SyncHub):
         self.ig_sessions = {}       # name -> igconnect.IGSession
         self.fb_sessions = {}       # name -> fbconnect.FBSession
         self.pending = {}           # token -> {'platform','state','username'}
+        self.dispatch = Dispatcher(store, self, config)   # 代发队列（阶段 2）
 
     # ------------------------------------------------------------ 适配器
 
@@ -59,6 +62,84 @@ class Hub(_SyncHub):
         from . import client as api
         _guard, tier = api.ticket_guard_headers(sess, '/v1/message/send')
         return tier
+
+    # ------------------------------------------------------------ 代发队列
+
+    def platform_of(self, name):
+        """账号属于哪个平台（未知账号按历史行为默认 tiktok）。"""
+        return self._platform(name)
+
+    def resolve_peer(self, platform, account, conv_id):
+        """把会话解析成"对端是谁"，用于跨账号判重与黑名单；取不到返回 ''。
+
+        TikTok: conv_id = `0:1:<我>:<对方>` → 直接拆（peer_of）；
+        X:      conv_id 本身就是对端 uid；
+        其它:   conv_id 是 thread id，对端只在会话行里 → 查库补。
+        """
+        conv_id = str(conv_id or '')
+        if not conv_id:
+            return ''
+        if platform == 'tiktok':
+            try:
+                from . import client as api
+                return str(api.peer_of(conv_id, self.session(account).uid) or '')
+            except Exception:
+                return ''
+        if platform == 'x':
+            return conv_id
+        try:
+            for c in self.store.list_conversations(account):
+                if c['conv_id'] == conv_id:
+                    return str(c.get('peer_uid') or '')
+        except Exception:
+            pass
+        return ''
+
+    def create_campaign(self, text, targets, **kw):
+        """建代发任务（入队即冻结配置）。返回 {'campaign_id','queued','deduped'}。"""
+        return self.dispatch.create_campaign(text, targets, **kw)
+
+    def campaigns(self, limit=50):
+        """任务列表（带逐状态进度），交给路由层直接序列化。"""
+        out = []
+        for c in self.store.list_campaigns(limit):
+            c = dict(c)
+            c['progress'] = self.store.campaign_progress(c['campaign_id'])
+            out.append(c)
+        return out
+
+    def campaign_action(self, campaign_id, action, actor='local'):
+        """暂停 / 继续 / 取消。只允许合法迁移，每个动作都写审计。"""
+        camp = self.store.get_campaign(campaign_id)
+        if not camp:
+            raise KeyError('unknown campaign: %s' % campaign_id)
+        status = camp.get('status') or ''
+        a = (action or '').strip().lower()
+        if a == 'pause':
+            if status not in ('queued', 'running'):
+                raise ValueError('cannot pause a %s campaign' % status)
+            self.store.set_campaign_status(campaign_id, 'paused')
+        elif a == 'resume':
+            if status != 'paused':
+                raise ValueError('campaign is not paused')
+            self.store.set_campaign_status(campaign_id, 'running')
+        elif a == 'cancel':
+            if status in ('done', 'cancelled'):
+                raise ValueError('campaign is already %s' % status)
+            self.store.set_campaign_status(campaign_id, 'cancelled',
+                                           finished_ms=int(time.time() * 1000))
+            n = self.store.cancel_pending_items(campaign_id)
+            self.store.audit(actor, 'campaign.cancel', campaign_id,
+                             {'cancelled_items': n})
+            return self.store.get_campaign(campaign_id)
+        else:
+            raise ValueError('unknown action: %s' % action)
+        self.store.audit(actor, 'campaign.%s' % a, campaign_id, None)
+        return self.store.get_campaign(campaign_id)
+
+    def audit_log(self, limit=100, target=None, action=None):
+        """审计查询（append-only 表的唯一读口）。"""
+        return self.store.list_audit(limit=limit, target=target, action=action)
 
     # ---------------------------------------------------- 添加账号（统一入口）
 
@@ -371,7 +452,9 @@ class Hub(_SyncHub):
                                               before_us=before_us)
         return stored, cursor, conv
 
-    def send(self, name, conv_id, text):
+    def send(self, name, conv_id, text, audit=True):
+        """统一发送入口。audit=False 供代发队列使用（它自己写 dispatch.* 审计，
+        否则一次群发会留下两份记录）。"""
         plat = self._platform(name)
         if plat == 'tiktok':
             sess = self.sessions[name]
@@ -384,10 +467,28 @@ class Hub(_SyncHub):
                                       conv['short_id'], text)
             if result.get('ok'):
                 self.nudge(name, conv_id)
+            if audit:
+                self._audit_send(name, conv_id, text, result)
             return result
         ad = self.adapter(plat)
         sess = self.session(name)
-        return ad.send(sess, conv_id, text)
+        res = ad.send(sess, conv_id, text)
+        if audit:
+            self._audit_send(name, conv_id, text,
+                             res if isinstance(res, dict) else {'ok': bool(res)})
+        return res
+
+    def _audit_send(self, name, conv_id, text, result):
+        """手工单发的留痕（谁、何时、给谁、发了什么、结果）。"""
+        try:
+            self.store.audit('local', 'message.send', conv_id,
+                             {'account': name, 'ok': bool(result.get('ok')),
+                              'tier': result.get('tier'),
+                              'guard_result': result.get('guard_result'),
+                              'error': result.get('error') or result.get('biz_msg'),
+                              'text': (text or '')[:120]})
+        except Exception:
+            pass                      # 审计不能反过来把发送搞挂
 
     def mark_read(self, name, conv_id):
         """已读回执：X 暂无；TikTok 用最新消息 us；IG/FB 按会话标已读。"""

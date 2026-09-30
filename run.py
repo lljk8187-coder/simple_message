@@ -83,18 +83,22 @@ def main():
     # 恢复所有已存账号（全平台）：TikTok 同步 + X/IG/FB 会话与各自的实时循环。
     hub.rehydrate_all()
     hub.start()
+    hub.dispatch.start()          # 代发队列 worker（阶段 2）：崩溃残留项在此被标 unknown
 
     httpd = web.create_server(cfg['host'], cfg['port'], hub, store, client, cfg)
     print('tk-message-demo')
     print('  data     : %s' % os.path.join(data_dir, 'hub.db'))
     print('  proxy    : %s' % (client.proxy or '(direct)'))
     print('  accounts : %s' % (', '.join(hub.sessions) or '(none yet)'))
+    print('  dispatch : %s' % ('running' if hub.dispatch.status()['running']
+                               else 'stopped'))
     print('  listening: http://%s:%d' % (cfg['host'], cfg['port']))
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         print('\nbye')
     finally:
+        hub.dispatch.stop()
         hub.stop()
 
 

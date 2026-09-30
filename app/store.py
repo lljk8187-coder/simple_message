@@ -10,9 +10,10 @@ import threading
 import time
 
 # 版本化：1 = 阶段 1 重构（统一模型 + 阶段 2 预备表）；
-#          2 = messages.kind（消息类型标签，非文本消息显式标注）。
+#          2 = messages.kind（消息类型标签，非文本消息显式标注）；
+#          3 = 代发队列落地（campaigns/dispatch_items 补列 + blocks 黑名单）。
 # 打开更老的库时先自动留一份快照再升级（见 __init__ / _needs_upgrade）。
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS accounts (
@@ -100,25 +101,45 @@ CREATE TABLE IF NOT EXISTS campaigns (
   campaign_id TEXT PRIMARY KEY,
   text        TEXT NOT NULL,
   created_by  TEXT,
-  schedule_ms INTEGER,                     -- 首批发送时间
+  schedule_ms INTEGER,                     -- 首批发送时间（0 = 立即）
   batch_size  INTEGER,                     -- 每批人数
   interval_s  INTEGER,                     -- 批间隔秒
-  status      TEXT,                        -- draft|queued|running|paused|done|cancelled
-  created_ms  INTEGER
+  status      TEXT,                        -- queued|running|paused|done|cancelled
+  created_ms  INTEGER,
+  started_ms  INTEGER,
+  finished_ms INTEGER
 );
 
 -- 队列项：逐目标的状态机 queued→sending→sent|failed（含平台信任分留痕）
+--   skipped：被闸门拦下（skip_reason: duplicate|blocked|already-sent|cancelled）
+--   unknown：进程在"发送中"崩溃——不自动重发，留给人工核对（见 dispatch.py）
 CREATE TABLE IF NOT EXISTS dispatch_items (
   campaign_id  TEXT NOT NULL,
   seq          INTEGER NOT NULL,
   platform     TEXT,
   account      TEXT,
   conv_id      TEXT,
+  peer_uid     TEXT,                       -- 跨账号按人判重（不是每个平台都有）
   status       TEXT,
   error        TEXT,
   sent_ms      INTEGER,
   guard_result TEXT,
+  attempts     INTEGER,
+  skip_reason  TEXT,
+  updated_ms   INTEGER,
   PRIMARY KEY (campaign_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_dispatch_state
+  ON dispatch_items(campaign_id, status, seq);
+
+-- 黑名单：account='' 表示该平台下全部账号（peer_uid 在任何平台都不发）
+CREATE TABLE IF NOT EXISTS blocks (
+  platform   TEXT NOT NULL,
+  account    TEXT NOT NULL DEFAULT '',
+  peer_uid   TEXT NOT NULL,
+  reason     TEXT,
+  created_ms INTEGER,
+  PRIMARY KEY (platform, account, peer_uid)
 );
 
 -- 审计日志：append-only，谁/何时/对谁/什么动作/结果
@@ -198,6 +219,17 @@ class Store:
             self._db.execute("UPDATE messages SET kind = "
                              "CASE WHEN TRIM(COALESCE(text,''))='' "
                              "THEN 'unknown' ELSE 'text' END")
+        # version 3：代发队列落地。预备表建得早，但当时只留了最小字段；
+        # 老库里这些表命中过就补列（新库由 SCHEMA 直接建全）。
+        qcols = {r['name'] for r in self._db.execute('PRAGMA table_info(campaigns)')}
+        for name, ddl in (('started_ms', 'INTEGER'), ('finished_ms', 'INTEGER')):
+            if name not in qcols:
+                self._db.execute('ALTER TABLE campaigns ADD COLUMN %s %s' % (name, ddl))
+        dcols = {r['name'] for r in self._db.execute('PRAGMA table_info(dispatch_items)')}
+        for name, ddl in (('peer_uid', 'TEXT'), ('attempts', 'INTEGER'),
+                          ('skip_reason', 'TEXT'), ('updated_ms', 'INTEGER')):
+            if name not in dcols:
+                self._db.execute('ALTER TABLE dispatch_items ADD COLUMN %s %s' % (name, ddl))
         # 版本化：阶段 1 重构（统一模型 + 阶段 2 预备表）之后即为 version 1。
         # version 2：messages.kind（消息类型标签，非文本消息显式标注）。
         self._db.execute('PRAGMA user_version = %d' % SCHEMA_VERSION)
@@ -478,3 +510,243 @@ class Store:
             m = self._db.execute('SELECT COUNT(1) n FROM messages WHERE account=?',
                                  (account,)).fetchone()['n']
         return {'conversations': c, 'messages': m}
+
+    # ------------------------------------------------- 代发队列（阶段 2）
+
+    def create_campaign(self, campaign_id, text, created_by='', schedule_ms=0,
+                        batch_size=1, interval_s=60, status='queued'):
+        with self._lock:
+            self._db.execute(
+                """INSERT INTO campaigns (campaign_id, text, created_by, schedule_ms,
+                       batch_size, interval_s, status, created_ms)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (campaign_id, text, created_by, int(schedule_ms or 0),
+                 int(batch_size or 1), int(interval_s or 0), status,
+                 int(time.time() * 1000)))
+            self._db.commit()
+        return campaign_id
+
+    def get_campaign(self, campaign_id):
+        with self._lock:
+            row = self._db.execute('SELECT * FROM campaigns WHERE campaign_id=?',
+                                   (campaign_id,)).fetchone()
+        return dict(row) if row else None
+
+    def list_campaigns(self, limit=50):
+        with self._lock:
+            rows = self._db.execute(
+                'SELECT * FROM campaigns ORDER BY created_ms DESC LIMIT ?',
+                (int(limit),)).fetchall()
+        return [dict(r) for r in rows]
+
+    def next_active_campaign(self, now_ms):
+        """最早创建、且已到点的活跃任务（queued/running）。
+
+        schedule_ms=0 表示立即；>0 时未到点就跳过（定时任务由这里兜住）。
+        """
+        with self._lock:
+            row = self._db.execute(
+                """SELECT * FROM campaigns
+                    WHERE status IN ('queued','running')
+                      AND COALESCE(schedule_ms,0) <= ?
+                    ORDER BY created_ms LIMIT 1""", (int(now_ms),)).fetchone()
+        return dict(row) if row else None
+
+    def set_campaign_status(self, campaign_id, status, **fields):
+        sets, args = ['status=?'], [status]
+        for k in ('started_ms', 'finished_ms', 'schedule_ms',
+                  'batch_size', 'interval_s'):
+            if k in fields:
+                sets.append('%s=?' % k)
+                args.append(fields[k])
+        args.append(campaign_id)
+        with self._lock:
+            self._db.execute('UPDATE campaigns SET %s WHERE campaign_id=?'
+                             % ','.join(sets), args)
+            self._db.commit()
+
+    def enqueue_items(self, campaign_id, items):
+        """入队，自带去重：同 (platform, account, conv_id) 只保留第一条。
+
+        返回 {'queued': n, 'deduped': m} —— 重复项**不入队**（不是发完再跳过），
+        这样任务总数从一开始就是真实要发的条数。
+        """
+        seen, seq, queued, deduped = set(), 0, 0, 0
+        now = int(time.time() * 1000)
+        with self._lock:
+            for it in items:
+                platform = it.get('platform') or ''
+                account = it.get('account') or ''
+                conv_id = it.get('conv_id') or ''
+                if not account or not conv_id:
+                    continue
+                key = (platform, account, conv_id)
+                if key in seen:
+                    deduped += 1
+                    continue
+                seen.add(key)
+                seq += 1
+                self._db.execute(
+                    """INSERT INTO dispatch_items (campaign_id, seq, platform, account,
+                           conv_id, peer_uid, status, attempts, updated_ms)
+                       VALUES (?,?,?,?,?,?,?,?,?)""",
+                    (campaign_id, seq, platform, account, conv_id,
+                     it.get('peer_uid') or '', 'queued', 0, now))
+                queued += 1
+            self._db.commit()
+        return {'queued': queued, 'deduped': deduped}
+
+    def next_pending_item(self, campaign_id):
+        with self._lock:
+            row = self._db.execute(
+                """SELECT * FROM dispatch_items
+                    WHERE campaign_id=? AND status='queued'
+                    ORDER BY seq LIMIT 1""", (campaign_id,)).fetchone()
+        return dict(row) if row else None
+
+    def mark_item(self, campaign_id, seq, status, error=None, sent_ms=None,
+                  guard_result=None, skip_reason=None, bump_attempts=False):
+        sets, args = ['status=?', 'updated_ms=?'], [status, int(time.time() * 1000)]
+        for col, val in (('error', error), ('sent_ms', sent_ms),
+                         ('guard_result', guard_result), ('skip_reason', skip_reason)):
+            if val is not None:
+                sets.append('%s=?' % col)
+                args.append(val)
+        if bump_attempts:
+            sets.append('attempts=COALESCE(attempts,0)+1')
+        args.extend([campaign_id, seq])
+        with self._lock:
+            self._db.execute('UPDATE dispatch_items SET %s WHERE campaign_id=? AND seq=?'
+                             % ','.join(sets), args)
+            self._db.commit()
+
+    def campaign_progress(self, campaign_id):
+        with self._lock:
+            rows = self._db.execute(
+                'SELECT status, COUNT(1) n FROM dispatch_items WHERE campaign_id=? '
+                'GROUP BY status', (campaign_id,)).fetchall()
+        prog = {r['status']: r['n'] for r in rows}
+        prog['total'] = sum(prog.values())
+        return prog
+
+    def cancel_pending_items(self, campaign_id):
+        """取消任务时把还没发的项标成 skipped(cancelled) —— 保留痕迹，不删行。"""
+        with self._lock:
+            cur = self._db.execute(
+                """UPDATE dispatch_items SET status='skipped',
+                       skip_reason='cancelled', updated_ms=?
+                    WHERE campaign_id=? AND status IN ('queued','sending')""",
+                (int(time.time() * 1000), campaign_id))
+            n = cur.rowcount or 0
+            self._db.commit()
+        return n
+
+    def recover_inflight(self):
+        """把崩在"发送中"的项标成 unknown —— **绝不自动重发**。
+
+        发送是"请求发出 → 收到应答"两段，崩在中间就无从判断对方到底收没收到；
+        群发场景里重发（同一个人收到两条一样的话）比漏一条更像机器人，
+        所以这里只标注、留给人工核对。返回处理条数。
+        """
+        with self._lock:
+            cur = self._db.execute(
+                """UPDATE dispatch_items SET status='unknown',
+                       skip_reason='crashed-inflight', updated_ms=?
+                    WHERE status='sending'""", (int(time.time() * 1000),))
+            n = cur.rowcount or 0
+            self._db.commit()
+        return n
+
+    def sent_recently(self, platform, account, peer_uid, text, within_ms):
+        """已发过滤：同一对端在窗口内已成功收到过**同一文案**。
+
+        刻意限定"同一文案"而不是"窗口内发过任何消息"——否则正常跟同一个人
+        聊天时会把自己拦住。
+        """
+        if not peer_uid:
+            return False
+        with self._lock:
+            row = self._db.execute(
+                """SELECT 1 FROM dispatch_items d
+                     JOIN campaigns c ON c.campaign_id = d.campaign_id
+                    WHERE d.platform=? AND d.account=? AND d.peer_uid=?
+                      AND d.status='sent' AND c.text=?
+                      AND COALESCE(d.sent_ms,0) >= ?
+                    LIMIT 1""",
+                (platform, account, peer_uid, text,
+                 int(time.time() * 1000) - int(within_ms))).fetchone()
+        return bool(row)
+
+    # ------------------------------------------------------------ 黑名单
+
+    def is_blocked(self, platform, account, peer_uid):
+        if not peer_uid:
+            return False
+        with self._lock:
+            row = self._db.execute(
+                """SELECT 1 FROM blocks
+                    WHERE platform=? AND peer_uid=? AND account IN (?, '')
+                    LIMIT 1""", (platform, peer_uid, account)).fetchone()
+        return bool(row)
+
+    def add_block(self, platform, account, peer_uid, reason=''):
+        with self._lock:
+            self._db.execute(
+                """INSERT INTO blocks (platform, account, peer_uid, reason, created_ms)
+                   VALUES (?,?,?,?,?)
+                   ON CONFLICT(platform, account, peer_uid)
+                   DO UPDATE SET reason=excluded.reason""",
+                (platform, account or '', peer_uid, reason,
+                 int(time.time() * 1000)))
+            self._db.commit()
+
+    def remove_block(self, platform, account, peer_uid):
+        with self._lock:
+            self._db.execute(
+                'DELETE FROM blocks WHERE platform=? AND account=? AND peer_uid=?',
+                (platform, account or '', peer_uid))
+            self._db.commit()
+
+    def list_blocks(self, limit=200):
+        with self._lock:
+            rows = self._db.execute(
+                'SELECT * FROM blocks ORDER BY created_ms DESC LIMIT ?',
+                (int(limit),)).fetchall()
+        return [dict(r) for r in rows]
+
+    # -------------------------------------------------------------- 审计
+
+    def audit(self, actor, action, target='', detail=None):
+        """append-only：这是**唯一**的写入口，且没有对应的 update/delete 方法。"""
+        with self._lock:
+            self._db.execute(
+                'INSERT INTO audit_log (ts_ms, actor, action, target, detail) '
+                'VALUES (?,?,?,?,?)',
+                (int(time.time() * 1000), actor or '', action, target or '',
+                 json.dumps(detail, ensure_ascii=False) if detail else None))
+            self._db.commit()
+
+    def list_audit(self, limit=100, target=None, action=None):
+        sql, args, where = 'SELECT * FROM audit_log', [], []
+        if target:
+            where.append('target=?')
+            args.append(target)
+        if action:
+            where.append('action LIKE ?')
+            args.append(action + '%')
+        if where:
+            sql += ' WHERE ' + ' AND '.join(where)
+        sql += ' ORDER BY id DESC LIMIT ?'
+        args.append(int(limit))
+        with self._lock:
+            rows = self._db.execute(sql, args).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            if d.get('detail'):
+                try:
+                    d['detail'] = json.loads(d['detail'])
+                except Exception:
+                    pass
+            out.append(d)
+        return out
