@@ -117,7 +117,7 @@
   <span class="spacer"></span>
   <span style="font-size:12px;color:var(--fg3)" id="who"></span>
   <button class="btn" id="btnHarvest" title="从已登录的浏览器里取写入凭据">收割凭据</button>
-  <button class="btn" id="btnBatch" title="一条消息发送给多个会话（可跨平台）">批量发送</button>
+  <button class="btn" id="btnBatch" title="建立群发任务：同一条消息发给多个会话（可跨平台），可暂停/继续/取消">群发任务</button>
   <button class="btn primary" id="btnAdd">添加账号</button>
 </header>
 
@@ -231,20 +231,38 @@
 </div>
 <div id="batchModal">
   <div class="card">
-    <h3>批量发送</h3>
+    <h3>群发任务</h3>
     <p class="hint">
-      勾选要发送的会话（可跨账号、跨平台），写一份内容，逐条按间隔发送。
-      内容相同注意平台风控：建议只发给已知联系人，勿用于群发营销。
+      勾选要发送的会话（可跨账号、跨平台），写一份内容，<b>建立任务</b>后由服务端排队逐条发送。
+      任务可暂停/继续/取消，关掉页面也会继续跑；实际节奏取「每批设置」与「平台限速申报」中
+      更保守的那个。内容相同注意平台风控：只发给已知联系人，勿用于群发营销。
     </p>
-    <div id="batchList" style="max-height:260px;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin-bottom:12px"></div>
+    <div id="batchList" style="max-height:210px;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin-bottom:12px"></div>
     <div class="field">
       <label>内容</label>
       <textarea id="batchText" rows="3" placeholder="要发送给所有勾选会话的同一条消息"></textarea>
     </div>
+    <div class="field">
+      <label>节奏</label>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <span class="hint">每批</span>
+        <input id="campBatch" type="number" min="1" value="5" style="width:70px">
+        <span class="hint">条，批间隔</span>
+        <input id="campInterval" type="number" min="0" value="60" style="width:80px">
+        <span class="hint">秒</span>
+      </div>
+    </div>
     <div id="batchOut" class="hint" style="margin-top:8px"></div>
     <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px">
-      <button class="btn" id="btnBatchCancel">取消</button>
-      <button class="btn primary" id="btnBatchGo">发送</button>
+      <button class="btn" id="btnBatchCancel">关闭</button>
+      <button class="btn primary" id="btnBatchGo">建立任务</button>
+    </div>
+    <div style="border-top:1px solid var(--line);margin-top:14px;padding-top:10px">
+      <div style="display:flex;align-items:center;gap:8px">
+        <b style="font-size:13px">最近任务</b>
+        <span class="hint" id="campHint">（每 3 秒刷新）</span>
+      </div>
+      <div id="campList" style="max-height:190px;overflow:auto;margin-top:8px"></div>
     </div>
   </div>
 </div>
@@ -667,9 +685,70 @@ $('#btnAdd').onclick = () => {
   syncPlatformFields();
 };
 // ------------------------------------------------------------- batch send
+// ------------------------------------------------------- campaigns (queue)
+let CAMP_TIMER = null;
+const CAMP_ZH = {queued: '待开始', running: '进行中', paused: '已暂停',
+                 done: '已完成', cancelled: '已取消'};
+
+async function loadCampaigns(){
+  const box = $('#campList');
+  if (!box) return;
+  try {
+    const d = await jget('/api/campaigns?limit=8');
+    const list = d.campaigns || [];
+    if (!list.length) { box.innerHTML = '<div class="hint">还没有任务</div>'; return; }
+    box.innerHTML = '';
+    list.forEach(c => {
+      const p = c.progress || {};
+      const parts = [`总数 ${p.total || 0}`, `已发 ${p.sent || 0}`];
+      if (p.failed) parts.push(`失败 ${p.failed}`);
+      if (p.skipped) parts.push(`跳过 ${p.skipped}`);
+      if (p.unknown) parts.push(`未知 ${p.unknown}`);
+      if (p.queued) parts.push(`待发 ${p.queued}`);
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:6px 0;'
+                        + 'border-bottom:1px solid var(--line)';
+      const title = document.createElement('span');
+      title.style.cssText = 'font-size:12px;flex:1;min-width:0;overflow:hidden;'
+                          + 'text-overflow:ellipsis;white-space:nowrap';
+      title.innerHTML = `<b>${esc(CAMP_ZH[c.status] || c.status)}</b> · `
+        + `${esc((c.text || '').slice(0, 16))} `
+        + `<span class="hint">${esc(parts.join(' · '))}</span>`;
+      row.appendChild(title);
+      if (c.status === 'running' || c.status === 'queued') {
+        row.appendChild(campBtn(c, '暂停', 'pause'));
+      }
+      if (c.status === 'paused') row.appendChild(campBtn(c, '继续', 'resume'));
+      if (c.status !== 'done' && c.status !== 'cancelled') {
+        row.appendChild(campBtn(c, '取消', 'cancel'));
+      }
+      box.appendChild(row);
+    });
+  } catch (e) {
+    box.innerHTML = '<div class="hint">任务列表加载失败：' + esc(e.message) + '</div>';
+  }
+}
+function campBtn(c, label, action){
+  const b = document.createElement('button');
+  b.className = 'btn';
+  b.style.cssText = 'padding:3px 9px;font-size:12px;flex:0 0 auto';
+  b.textContent = label;
+  b.onclick = async () => {
+    try {
+      await jpost(`/api/campaigns/${encodeURIComponent(c.campaign_id)}/${action}`);
+      toast('已' + label + '任务');
+      loadCampaigns();
+    } catch (e) { toast(label + '失败：' + e.message, true); }
+  };
+  return b;
+}
+
 $('#btnBatch').onclick = async () => {
   $('#batchModal').classList.add('show');
   $('#batchOut').textContent = '';
+  loadCampaigns();
+  clearInterval(CAMP_TIMER);
+  CAMP_TIMER = setInterval(loadCampaigns, 3000);
   const box = $('#batchList');
   box.innerHTML = '<div class="hint">加载会话…</div>';
   box.innerHTML = '';
@@ -703,28 +782,35 @@ $('#btnBatch').onclick = async () => {
   }
   if (!any) box.insertAdjacentHTML('beforeend', '<div class="hint">所有账号都没有可发送的会话</div>');
 };
-$('#btnBatchCancel').onclick = () => $('#batchModal').classList.remove('show');
+$('#btnBatchCancel').onclick = () => {
+  $('#batchModal').classList.remove('show');
+  clearInterval(CAMP_TIMER); CAMP_TIMER = null;
+};
 $('#btnBatchGo').onclick = async () => {
   const targets = [...$('#batchList').querySelectorAll('input:checked')]
     .map(i => ({ account: i.dataset.account, conv_id: i.dataset.conv, label: i.dataset.label }));
   const text = $('#batchText').value.trim();
   if (!targets.length) { toast('先勾选要发送的会话', true); return; }
   if (!text) { toast('先输入要发送的内容', true); return; }
-  if (!confirm(`将向 ${targets.length} 个会话逐条发送相同内容，继续？`)) return;
+  const batch = Math.max(1, parseInt($('#campBatch').value || '5', 10) || 5);
+  const interval = Math.max(0, parseInt($('#campInterval').value || '60', 10) || 0);
+  if (!confirm(`建立群发任务：${targets.length} 个会话，每批 ${batch} 条、批间隔 ${interval} 秒。\n`
+             + '任务由服务端排队发送，可随时暂停或取消。继续？')) return;
   const btn = $('#btnBatchGo'); btn.disabled = true;
-  $('#batchOut').textContent = `发送中（${targets.length} 条，逐条间隔限速）…`;
   try {
-    const r = await jpost('/api/batch/send', { targets, text });
-    const lines = r.results.map(x =>
-      `${x.ok ? '✓' : '✗'} ${x.account} → ${x.label || x.conv_id}` +
-      (x.ok ? '' : `（${x.error || x.biz_msg || '失败'}）`));
+    const r = await jpost('/api/campaigns',
+                          { text, targets, batch_size: batch,
+                            interval_s: interval, confirm: true });
     $('#batchOut').innerHTML =
-      `完成：成功 ${r.sent} / 失败 ${r.failed}<br>` + lines.map(esc).join('<br>');
-    toast(`批量发送：成功 ${r.sent}，失败 ${r.failed}`, r.failed > 0);
+      `任务已建立：入队 ${r.queued} 个目标`
+      + (r.deduped ? `（自动去重 ${r.deduped} 个）` : '')
+      + `<br><span class="hint">任务号 ${esc(r.campaign_id)}</span>`;
+    toast(`任务已建立：入队 ${r.queued} 个目标`);
     $('#batchText').value = '';
-    if (ACCT) loadConvs(true);
+    loadCampaigns();
   } catch (e) {
-    $('#batchOut').textContent = '发送失败：' + e.message;
+    $('#batchOut').textContent = '建立任务失败：' + e.message;
+    toast('建立任务失败：' + e.message, true);
   } finally { btn.disabled = false; }
 };
 // 浏览器登录：平台差异由后端的 popup_login_spec 决定，这里只放文案与开关
