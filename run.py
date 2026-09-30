@@ -90,6 +90,9 @@ def main():
     print('  data     : %s' % os.path.join(data_dir, 'hub.db'))
     print('  proxy    : %s' % (client.proxy or '(direct)'))
     print('  accounts : %s' % (', '.join(hub.sessions) or '(none yet)'))
+    print('  auth     : %s' % ('Bearer token required for /api'
+                               if (cfg.get('access_token') or '')
+                               else 'not set — /api open (localhost only)'))
     print('  dispatch : %s' % ('running' if hub.dispatch.status()['running']
                                else 'stopped'))
     print('  listening: http://%s:%d' % (cfg['host'], cfg['port']))

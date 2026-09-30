@@ -59,6 +59,7 @@ app/hub.py             统一编排：账号生命周期、四平台会话登记
 | `app/store.py` | SQLite：账号/会话/消息/资料 + 阶段 2 内核表（contacts/campaigns/audit…）；schema v2 起 messages 带 `kind`（消息类型标签） |
 | `app/harvest.py` | TikTok 凭据收割：控制台脚本生成 + 回传暂存 |
 | `app/login_browser.py` | 弹窗登录驱动（**平台无关**，TikTok/X/IG 共用）：按 `popup_login_spec()` 开浏览器登录一次即自动抓取入库；开页前按 `clear_login_keys` 清掉上次登录态 |
+| `app/dispatch.py` | **代发队列**（阶段 2）：单 worker 串行排水 + 三道闸门 + 限速 + 审计回写；崩在"发送中"的项标 `unknown` 且不自动重发 |
 | `web/index.html` | 前端：账号选择器（四通道标签）、会话/消息、批量发送面板 |
 | `tests/smoke.py` | 只读冒烟验收（不发消息） |
 
@@ -88,9 +89,13 @@ app/hub.py             统一编排：账号生命周期、四平台会话登记
 **收**：适配器 poll/sync → hub.bus.publish（SSE）→ 前端刷新；TikTok 同时落库。
 **发**：前端 → `POST /api/accounts/<name>/send` → hub.send → 适配器 send →
 平台；TikTok 发送后立即 nudge 轮询回读确认。
-**批量**：`POST /api/batch/send` → 逐目标串行 + 间隔 → 逐目标结果回报
-（上限 50、间隔默认 2s——风控红线的第一道闸；阶段 2 升级为 Campaign 队列）。
-**审计（规划）**：audit_log 表已建，阶段 2 接入每次发送/登录留痕。
+**批量（阶段 2 已升级为队列）**：`POST /api/campaigns` 建任务 → 落 `dispatch_items` →
+`app/dispatch.py` 的单 worker 逐条排水（三道闸门：入队去重 / 黑名单 / 已发过滤；
+限速取 `max(任务设置, 平台申报)`）→ `hub.send` → 结果与审计回写。旧的
+`POST /api/batch/send`（HTTP 线程内同步阻塞、上限 50）仍保留作兜底，前端已切到队列。
+**审计**：`audit_log` 只增不改，写入点＝手工单发（`message.send`）、队列
+（`campaign.*` / `dispatch.*`，含崩溃标注 `dispatch.orphan`）、黑名单（`block.*`）；
+读取只有 `GET /api/audit` 一个口。
 
 ## 五、设计决策备忘
 
