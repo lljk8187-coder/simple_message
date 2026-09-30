@@ -47,30 +47,36 @@ app/hub.py             统一编排：账号生命周期、四平台会话登记
 | `app/platform/registry.py` | 平台名 → 适配器类；load_adapters 容错缺失模块 |
 | `app/platform/tiktok.py` | TikTok 翻译官：short_id 缓存、档位透传、profiles 富化 |
 | `app/platform/x.py` | X 翻译官：conv_id=对端 uid；无已读回执（如实声明） |
-| `app/platform/instagram.py` | IG 翻译官：两段式登录（NeedCode 契约）、懒 ensure_login |
+| `app/platform/instagram.py` | IG 翻译官：双通道（浏览器抓 sessionid / 账密+验证码 NeedCode）、懒 ensure_login |
 | `app/platform/facebook.py` | FB 翻译官：E2EE 桥事件经 poll 排水 |
 | `app/client.py` | TikTok 协议：protobuf 信封、203/204/301/100/2002、签名档位 B/A/Z |
 | `app/signing.py` | 手写 P-256 ECDSA（标准库）：群律/DER/PKCS#8 |
 | `app/proto.py` | protobuf varint / length-delimited 编解码 |
-| `app/xconnect.py` | X 连接器：twikit 封装 + 自实现收件箱（v1.1 inbox_initial_state） |
+| `app/xconnect.py` | X 连接器：twikit 封装 + 自实现收件箱（v1.1 inbox_initial_state）；签名器降级（v1.1 DM 端点不校验 `X-Client-Transaction-Id`） |
 | `app/igconnect.py` | IG 连接器：instagrapi 封装、两段式登录句柄、代理显式安装 |
 | `app/fbconnect.py` | FB 连接器：fbchat-v2 E2EE 桥封装（校验和下载的 Go 子进程） |
 | `app/sync.py` | TikTok 轮询机制（204 增量+焦点快轮询）+ EventBus（hub.py 的基类） |
-| `app/store.py` | SQLite：账号/会话/消息/资料 + 阶段 2 内核表（contacts/campaigns/audit…） |
+| `app/store.py` | SQLite：账号/会话/消息/资料 + 阶段 2 内核表（contacts/campaigns/audit…）；schema v2 起 messages 带 `kind`（消息类型标签） |
 | `app/harvest.py` | TikTok 凭据收割：控制台脚本生成 + 回传暂存 |
-| `app/login_browser.py` | TikTok 弹窗官方登录：真实浏览器登录一次，自动收割全部凭据 |
+| `app/login_browser.py` | 弹窗登录驱动（**平台无关**，TikTok/X/IG 共用）：按 `popup_login_spec()` 开浏览器登录一次即自动抓取入库；开页前按 `clear_login_keys` 清掉上次登录态 |
 | `web/index.html` | 前端：账号选择器（四通道标签）、会话/消息、批量发送面板 |
 | `tests/smoke.py` | 只读冒烟验收（不发消息） |
 
 ---
 
-## 三、登录/绑定（每通道一种，声明即生效）
+## 三、登录/绑定（弹窗登录为三平台通用驱动；FB 未接）
+
+弹窗登录由 `login_browser.py` 统一驱动，平台差异全部来自适配器的
+`popup_login_spec()`（登录页 / 判据 cookie / 抓取域 / 需清理的登录态 / 可选材料收割），
+驱动里没有任何平台分支。**进入登录页前会先清掉该平台上次的登录态 cookie，并保留设备
+标识**（`ttwid` / `ig_did` / `mid`）——不清的话，持久 profile 会让"判据 cookie 出现即
+登录完成"立刻成立，窗口一开即关，同一平台就登不了第二个账号。
 
 | 通道 | auth_kind | 流程 | 之后的维护 |
 |---|---|---|---|
-| TikTok | `cookies`（+`popup` 挂载点） | 贴 cookie 即全功能；发送走 B 档（自有材料 `0` 分）或 Z 档（无材料 `1104`）自动选 | ticket/ts_sign 轮换由 beat 端点纯 HTTP 续期，私钥不换即免重收割 |
-| X | `cookies` | 贴 x.com cookie（auth_token+ct0） | cookie 失效重贴 |
-| Instagram | `password_2fa` | 页面输用户名密码 → IG 发验证码 → 页面填码 → session 持久化 | 之后免验证码；掉会话需重登 |
+| TikTok | `cookies` + `popup` | 浏览器登录（**密码 / 扫码**；避免走 Google OAuth）或贴 cookie；发送走 B 档（自有材料 `0` 分）或 Z 档（无材料 `1104`）自动选 | ticket/ts_sign 轮换由 beat 端点纯 HTTP 续期，私钥不换即免重收割 |
+| X | `cookies` + `popup` | 浏览器登录自动抓 auth_token+ct0，或贴 cookie | cookie 失效重登 |
+| Instagram | `password_2fa` + `popup` | 浏览器登录抓 sessionid，或页面输用户名密码 → IG 发验证码 → 页面填码 → session 持久化 | 之后免验证码；掉会话需重登 |
 | FB | `cookies` | 贴 facebook.com cookie（c_user+xs） | E2EE 桥自动重连 |
 | 邮箱（规划） | `password_2fa` 变体 | SMTP/IMAP 账号密码 | — |
 

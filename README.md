@@ -29,10 +29,14 @@
 
 | 平台 | 登录方式 | 依赖 | 实时收信 | 已读回执 |
 |---|---|---|---|---|
-| **TikTok** | 贴 cookie（可选：一行命令收割发送材料升级 `result=0`） | 无（纯标准库） | ✅ 204 增量轮询 | ✅ |
-| **X (Twitter)** | 贴 cookie（`auth_token` + `ct0`） | `pip install twikit` | ✅ 每账号会话轮询 | —（X 侧未见回执端点） |
-| **Instagram** | 两段式密码登录（首次要验证码，之后 session 持久化） | `pip install instagrapi` | ✅ | ✅ |
-| **FB Messenger** | 贴 cookie（`c_user` + `xs`） | `pip install fbchat-v2`（自动下载校验过的 E2EE 桥） | ✅ MQTT | ✅ |
+| **TikTok** | 弹窗登录（**密码 / 扫码**）或贴 cookie（可选：一行命令收割发送材料升级 `result=0`） | 无（纯标准库） | ✅ 204 增量轮询 | ✅ |
+| **X (Twitter)** | 弹窗登录或贴 cookie（`auth_token` + `ct0`） | `pip install twikit` | ✅ 每账号会话轮询 | —（X 侧未见回执端点） |
+| **Instagram** | 弹窗登录抓 sessionid，或两段式密码登录（首次要验证码，之后 session 持久化） | `pip install instagrapi` | ✅ | ✅ |
+| **FB Messenger** | 贴 cookie（`c_user` + `xs`）；弹窗登录未接 | `pip install fbchat-v2`（自动下载校验过的 E2EE 桥） | ✅ MQTT | ✅ |
+
+弹窗登录（TikTok / X / Instagram）另需 `pip install playwright`，而它**只在"登录这一次"**
+用到：登录态抓到后浏览器自动关闭，日常收发不依赖它。TikTok 在窗口里请用**密码或扫码**，
+**避免走 Google OAuth**（Google 对自动化窗口的判定更严，会直接拒绝登录）。
 
 平台适配是统一的连接器接口（认证 / 会话列表 / 历史 / 发送 / 已读），新平台照此实现即可。
 未安装某平台的依赖时，其余平台不受影响。
@@ -79,11 +83,11 @@ app/
   signing.py           手写 P-256 ECDSA（标准库实现，含 PKCS#8 解析）
   proto.py             protobuf 线格式编解码（varint / length-delimited）
   xconnect.py          X 私有接口连接器（twikit 封装 + 收件箱自实现）
-  igconnect.py         Instagram 连接器（instagrapi 封装，两段式登录）
+  igconnect.py         Instagram 连接器（instagrapi 封装，两段式 + sessionid 导入）
   fbconnect.py         FB 连接器（fbchat-v2 E2EE 桥封装）
   sync.py              TikTok 轮询机制 + 进程内事件总线（hub.py 的基类）
   harvest.py           TikTok 凭据收割：控制台脚本 + 回传端点
-  login_browser.py     弹窗官方登录：真实浏览器登录一次，自动收割凭据
+  login_browser.py     弹窗登录驱动（TikTok/X/IG 共用）：按适配器声明登录一次即自动抓取
   server.py            见上
 web/
   index.html           单文件前端（含样式与脚本）
@@ -151,10 +155,19 @@ data/                  运行时生成，不要提交
 `docs/credentials-acquisition-options.md`）。也可以先用档位 A 跑起来，之后补上私钥
 升级到档位 B —— 两者随时可切换，服务端按"能否本地签名"自动选档。
 
-**浏览器登录（零手工升级，可选）**：hub 顶部有「浏览器登录」按钮——点击后弹出
-一个 Chrome 窗口，在里面正常登录（密码/扫码/过码均可），登录完成 hub 自动收割
-材料并入库，窗口自动关闭。该功能需要 `pip install playwright`（可选依赖，不影响
-其他功能；未安装时按钮会提示改用一行命令方案）。
+**浏览器登录（零手工升级，可选）**：在「添加账号」弹窗里选好平台后点「浏览器登录」——
+会弹出一个 Chrome 窗口，在里面正常登录（密码/扫码/过码均可），登录完成 hub 自动抓取
+登录态并入库（TikTok 还会额外收割签名材料），窗口自动关闭。该功能需要
+`pip install playwright`（可选依赖，不影响其他功能；未安装时会提示改用一行命令方案）。
+
+进入登录页之前会先清掉该平台上次的登录态 cookie（**保留设备标识**），所以同一个平台
+可以连续登录多个账号；这一点是必需的：profile 是持久的，上次的登录态会让"登录完成"
+判据立刻成立，窗口刚打开就被判成已登录、随即关闭。
+
+**各平台的登录方式**：TikTok / X / Instagram 支持弹窗登录（FB 未接，仍贴 cookie）。
+TikTok 在窗口里请用**密码或扫码**登录，**不要走 Google OAuth**（Google 对自动化窗口
+判定更严，会直接拒绝）；X 登录后在窗口里自动抓 `auth_token`+`ct0`；Instagram 抓
+`sessionid` 导入（账密+验证码通道仍保留作兜底）。
 
 ---
 
