@@ -5,8 +5,15 @@ Auth is the cookie pair from any logged-in x.com browser session
 TikTok side. Under the hood twikit drives the v1.1 DM endpoints, whose
 paths are stable (no rotating GraphQL queryIds); the inbox list wraps the
 same 1.1 `inbox_initial_state` call twikit defines as a constant but never
-wrapped. Raw calls MUST go through `Client.request()`: X now demands the
-`X-Client-Transaction-Id` header on most endpoints and twikit mints it there.
+wrapped.
+
+On `X-Client-Transaction-Id`: twikit mints it from the home page, but X has
+migrated to the x-web shell and the data it needs (`ondemand`) is gone, so
+that computation can only fail. Measured 2026-09-30: the v1.1 DM endpoints
+do *not* verify the header — `dm/inbox_initial_state` and
+`account/multi/list` answered 200 with the header absent, forged and empty.
+`_stub_client_transaction` therefore downgrades the signer to "real if
+computable, empty otherwise" and the requests go through unchanged.
 
 twikit is asyncio-native while the hub is sync threading, so each session
 owns one background thread + event loop and bridges calls with
@@ -123,6 +130,7 @@ class XSession:
         cookies = parse_cookies(self.cookie_str)
         self._client = Client('en-US', proxy=self.proxy)
         self._client.set_cookies(cookies, clear_cookies=True)   # plain dict storage
+        _stub_client_transaction(self._client)
         self._me_uid = None
         twid = cookies.get('twid')                              # 'u%3D<uid>'
         if twid:
@@ -142,46 +150,50 @@ class XSession:
     # ------------------------------------------------------------- identity
 
     async def _verify_raw(self):
-        """v1.1 verify_credentials — raw JSON, no User object.
+        """Who am I — v1.1 `account/multi/list.json`, raw JSON.
 
-        twikit's User constructor hard-crashes (KeyError 'urls') on accounts
-        whose profile omits `entities.description.urls` — raw is robust.
+        This replaced `account/verify_credentials.json`, which X has retired:
+        measured 2026-09-30 it answers 404 (code 34) on every attempt, with or
+        without the transaction header — the earlier "intermittent spurious
+        404, one retry clears it" note was describing a dead endpoint.
+        `account/multi/list` is the same API version, returns the same identity
+        fields, and is not behind the header either.
+
+        Raw JSON instead of a User object on purpose: twikit's User constructor
+        hard-crashes (KeyError 'urls') on accounts whose profile omits
+        `entities.description.urls`.
         """
         out = await self._client.request(
-            'GET', 'https://x.com/i/api/1.1/account/verify_credentials.json',
-            params={'skip_status': 'true', 'include_entities': 'false',
-                    'include_email': 'false'},
+            'GET', 'https://x.com/i/api/1.1/account/multi/list.json',
             headers=self._client._base_headers)
         return out[0] if isinstance(out, tuple) else out
 
-    def verify(self):
-        """Who am I — cheap round trip that also proves the cookies work.
+    @staticmethod
+    def _identity(payload):
+        """Normalize account/multi/list.json -> {'uid', 'username', 'name'}."""
+        users = (payload or {}).get('users') or []
+        u = users[0] if users else {}
+        return {'uid': str(u.get('user_id') or u.get('id') or ''),
+                'username': u.get('screen_name') or '',
+                'name': u.get('name') or ''}
 
-        One retry: X's edge intermittently serves a spurious 404 (code 34)
-        on this endpoint — a single retry clears it (observed live)."""
-        last = None
-        for attempt in range(2):
-            try:
-                d = self._loop.call(self._verify_raw())
-                break
-            except Exception as e:
-                last = e
-        else:
-            raise RuntimeError('%s: %s' % (type(last).__name__, last))
+    def verify(self):
+        """Who am I — cheap round trip that also proves the cookies work."""
+        d = self._loop.call(self._verify_raw())
         if isinstance(d, dict) and d.get('errors'):
             raise RuntimeError(str(d['errors'][0]))
-        return {'uid': str(d.get('id_str') or d.get('id') or ''),
-                'username': d.get('screen_name') or '',
-                'name': d.get('name') or ''}
+        info = self._identity(d)
+        if not info['uid']:
+            raise RuntimeError('account/multi/list returned no user')
+        return info
 
     async def _me(self):
         """Own uid without touching twikit's User constructor (KeyError 'urls'
-        on profiles without description links): twid cookie first, raw
-        verify_credentials as fallback."""
+        on profiles without description links): twid cookie first, then a raw
+        account lookup."""
         if self._me_uid:
             return self._me_uid
-        d = await self._verify_raw()
-        self._me_uid = str(d.get('id_str') or d.get('id') or '')
+        self._me_uid = self._identity(await self._verify_raw())['uid']
         return self._me_uid
 
     # -------------------------------------------------------------- inbox
@@ -291,61 +303,47 @@ class XSession:
                 'ms': ms_from_time(getattr(m, 'time', 0))}
 
 
-# --------------------------------------------------- transaction-id patch
+# --------------------------------------------------- transaction-id strategy
 
-# X moved the ondemand.s chunk hash from the old `{name: hash}` page map into
-# a webpack runtime builder: `.u=e=>""+(({id:name,...})[e]+"."+({id:hash,...})
-# [e]+"a.js"` (verified live 2026-09-29; chunk id 59924 = ondemand.s). twikit
-# 2.3.3 still greps the old shape, so KEY_BYTE extraction always fails. This
-# patch parses the new builder and falls back to upstream's regex when the
-# new shape is absent.
-_NEW_U_RE = None
+# twikit computes X-Client-Transaction-Id from the home page: the `ondemand.s`
+# chunk hash plus four SVG animation frames. X migrated to the x-web shell and
+# that chunk reference is gone (measured 2026-09-30: the string `ondemand` no
+# longer occurs anywhere in the served page, and the old
+# `responsive-web/client-web/` paths answer 404), so the computation can only
+# fail.
+#
+# The failure was also well hidden: `ClientTransaction.init()` assigns
+# `home_page_response` *before* raising on the missing indices, so twikit's
+# `if not self.client_transaction.home_page_response` guard never retries it,
+# `self.key` is never set, and every later request dies with
+# `AttributeError: 'ClientTransaction' object has no attribute 'key'` — the
+# real cause ("Couldn't get KEY_BYTE indices") already lost by then.
+#
+# The v1.1 DM endpoints do not verify that header, so the signer is downgraded
+# here: try the real thing first (if X ever restores the data, the genuine
+# signature returns automatically), fall back to an empty value — which these
+# endpoints accept.
 
-
-def _install_transaction_patch():
-    global _NEW_U_RE
+def _stub_client_transaction(client):
+    """Make twikit's transaction signer non-fatal for this client."""
+    ct = getattr(client, 'client_transaction', None)
+    if ct is None or getattr(ct, '_xconnect_stub', False):
+        return
+    ct.home_page_response = ct.home_page_response or object()   # skip init()
     try:
-        from twikit.x_client_transaction import transaction as _tx
-    except ImportError:
-        return
-    if getattr(_tx.ClientTransaction.get_indices, '_xconnect_patch', False):
-        return
-    import re as _re
-    _NEW_U_RE = _re.compile(
-        r'\.u=e=>""\+\(\(\{(?P<names>.*?)\}\)\[e\](?:\|\|e)?\)\+"\."\s*\+\s*'
-        r'\(\{(?P<hashes>.*?)\}\)\[e\]\+"a\.js"', _re.S)
-    _PAIR_RE = _re.compile(r'(\d+):"([^"]*)"')
-    _ONDEMAND_URL = ('https://abs.twimg.com/responsive-web/client-web/'
-                     'ondemand.s.{hash}a.js')
-    _orig = _tx.ClientTransaction.get_indices
+        ct.key = getattr(ct, 'key', None) or ''
+    except Exception:
+        pass
+    orig = ct.generate_transaction_id
 
-    async def get_indices(self, home_page_response, session, headers):
-        html = str(home_page_response)
-        m = _NEW_U_RE.search(html)
-        indices = None
-        if m:
-            names = dict(_PAIR_RE.findall(m.group('names')))
-            hashes = dict(_PAIR_RE.findall(m.group('hashes')))
-            cid = next((k for k, v in names.items() if v == 'ondemand.s'), None)
-            hash_val = hashes.get(cid or '')
-            if hash_val:
-                resp = await session.request(
-                    method='GET', url=_ONDEMAND_URL.format(hash=hash_val),
-                    headers=headers)
-                indices = [int(item.group(2)) for item in
-                           _tx.INDICES_REGEX.finditer(resp.text)]
-        if indices is None:                    # new shape absent — upstream path
-            return await _orig(self, home_page_response, session, headers)
-        if not indices:
-            raise Exception("Couldn't get KEY_BYTE indices "
-                            '(new page format parsed empty)')
-        return indices[0], indices[1:]
+    def generate_transaction_id(**kwargs):
+        try:
+            return orig(**kwargs)
+        except Exception:
+            return ''
 
-    get_indices._xconnect_patch = True
-    _tx.ClientTransaction.get_indices = get_indices
-
-
-_install_transaction_patch()
+    ct.generate_transaction_id = generate_transaction_id
+    ct._xconnect_stub = True
 
 
 # ------------------------------------------------------------------- probe
