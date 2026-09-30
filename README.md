@@ -1,4 +1,4 @@
-# tk-message-demo
+# simple-message
 
 自托管的多平台私信消息中心：**一个后端服务 + 一个静态页**。
 
@@ -81,6 +81,8 @@ app/
     facebook.py        FB 适配器（包装 fbconnect，E2EE 桥）
   client.py            TikTok 协议客户端：信封构造、各接口、双档签名
   signing.py           手写 P-256 ECDSA（标准库实现，含 PKCS#8 解析）
+  webguard.py          TikTok Web 风控参数层：经典 X-Bogus 算法完整复刻 +
+                       msToken 获取策略（备用模块，未接线；自检 python app/webguard.py）
   proto.py             protobuf 线格式编解码（varint / length-delimited）
   xconnect.py          X 私有接口连接器（twikit 封装 + 收件箱自实现）
   igconnect.py         Instagram 连接器（instagrapi 封装，两段式 + sessionid 导入）
@@ -88,7 +90,6 @@ app/
   sync.py              TikTok 轮询机制 + 进程内事件总线（hub.py 的基类）
   harvest.py           TikTok 凭据收割：控制台脚本 + 回传端点
   login_browser.py     弹窗登录驱动（TikTok/X/IG 共用）：按适配器声明登录一次即自动抓取
-  server.py            见上
 web/
   index.html           单文件前端（含样式与脚本）
 tests/
@@ -222,7 +223,7 @@ TikTok 在窗口里请用**密码或扫码**登录，**不要走 Google OAuth**�
 
 ```bash
 git clone <this repo>
-cd tk-message-demo
+cd simple-message
 python run.py --host 0.0.0.0 --port 8788
 ```
 
@@ -259,7 +260,8 @@ f7 = "1132b10:master"    f8 = { f<命令号>: 载荷 }    f9 = device_id    f11 
 **已读回执（2002，已接入 hub）**：打开会话时自动发送（`POST /api/accounts/<name>/read`）。
 read_index 取库里最新一条消息的微秒时间戳；f5/f6 传 0。实测两账号 `biz=0`。
 注意：服务端会话计数（f11/f9）不因此归零——回执效果在**对方视角**的"已读"标记上，
-本 hub 的未读徽章仍由前端本地基线管理。X-Bogus 用随机 24 位字母数字（web 客户端同款）。
+本 hub 的未读徽章仍由前端本地基线管理。X-Bogus 用随机 24 位字母数字，实测被服务端接受
+（09-30 线上实证：现行 web 客户端发的其实是常量 `1`，经典生成器已退役，见下节）。
 
 **陌生人列表（1001）**：响应 f6 的内层 tag 也是 **f1000**（不是 1001）——
 `{f1 next_cursor, f2 has_more, f3 total_unread（消息请求未读总数）, f4 StrangerConversation[]}`。
@@ -305,9 +307,21 @@ read_index 取库里最新一条消息的微秒时间戳；f5/f6 传 0。实测�
 上报已读：请求被接受（`biz=0 OK`），但 f11 不归零。真实客户端的 mark_read 由 Web Worker 发出，
 页面级抓包看不到它带了什么额外上下文 —— 这是已知盲区，留待附加 worker target 后对比。
 
----
+**风控参数实测（2026-09-30，js-reverse 线上抓包）**：
 
-## 已知限制与 roadmap
+- 线上 web 流量 `X-Bogus=1`（字面常量占位）；真正的签名是 X-Gnarly（~500 字符，由
+  VM 混淆的 webmssdk_ex.js 生成），且 `byted_acrawler.sign()` 已从 SDK 公开 API 删除——
+  **经典 X-Bogus 生成器已退役**。本 hub 用随机值被接受与此实证一致；
+- **msToken 非客户端计算**：由 mssdk（`/web/resource` 首发、`/web/report` 续发，后者 body
+  为加密环境报告）发证，之后每个 API 响应都 Set-Cookie 轮转一个新值，有效期 10 天
+  （Secure / SameSite=None）——会话 cookie 里的现成值即可用，无法也不需要纯算法生成；
+- **im-api 真实请求 URL 无查询串**（不带 X-Bogus / X-Gnarly / msToken），msToken 放在
+  protobuf 体 params 字段 `Web-Sdk-Ms-Token`，`verifyFp` 为空——比本 hub 现行做法
+  （查询串 msToken + 随机 X-Bogus）更"裸"，服务端对两种形态均接受；
+- `app/webguard.py`：经典 X-Bogus 算法的字节级完整复刻 + msToken 策略封装，
+  备用未接线（自检 `python app/webguard.py`；已做 1000 组随机差分对齐公开参考实现）。
+
+---
 
 ## 凭据收割
 
@@ -337,16 +351,6 @@ read_index 取库里最新一条消息的微秒时间戳；f5/f6 传 0。实测�
 
 ---
 
-**限制**
-
-- 发送需要一份该账号的写入凭据。**收割向导**能自动取到私钥 / `ticket` / `ts_sign`，
-  但会话 cookie 里的 `sessionid` 是 `HttpOnly`，**要手工粘一次**；
-  且受站点 CSP 所限，收割结果**要手工粘回**（见[凭据收割](#凭据收割)）。
-- 档位 A 捕获的头在**长时间后可能失效**，届时表现为发送返回失败；重新取一次即可。
-  档位 B 没有这个问题，但也仍依赖 `ticket`（会话级，重新登录后轮换）。
-- 只支持文本消息。图片、表情、撤回等未实现。
-- 无鉴权，不要直接暴露到公网。
-
 **roadmap**
 
 1. ✅ **档位 B（本地签名）**——已完成。`app/signing.py` 是手写的 P-256 ECDSA
@@ -359,8 +363,12 @@ read_index 取库里最新一条消息的微秒时间戳；f5/f6 传 0。实测�
 3. ✅ **多平台**——X / Instagram / Facebook Messenger 适配器已完成（见[平台支持](#平台支持)）。
 4. ✅ **批量发送**——`POST /api/batch/send`：一条消息发给多个自己会话，逐目标回报结果，
    内置逐目标间隔。
-5. **消息类型扩展**——图片 / 表情。已读回执 TikTok/IG/FB 已实现（`v3/conversation/mark_read`）。
+5. **消息类型扩展**——接收侧已按类型分级展示（`messages.kind`：text/tip/reaction/media，
+   schema v2）；图片 / 表情**发送**仍未实现。已读回执 TikTok / IG 已实现（`v3/conversation/mark_read`）。
 6. **推送接入**——如果后续能走通站点的推送通道，可以把轮询频率进一步降下来。
+7. **信号驱动的风控加固**（均已评估、暂不动手，等实测信号再立项）：协议金丝雀
+   （区分"凭据失效"vs"协议漂移"）、TLS 指纹伪装（curl_cffi 移植，当前无实证风险）、
+   发送间隔随机化（一行改动，随下次动 client.py 顺带）。
 
 **已知限制**
 
@@ -369,7 +377,7 @@ read_index 取库里最新一条消息的微秒时间戳；f5/f6 传 0。实测�
   且受站点 CSP 所限，收割结果**要手工粘回**（见[凭据收割](#凭据收割)）。
 - 档位 A 捕获的头在**长时间后可能失效**，届时表现为发送返回失败；重新取一次即可。
   档位 B 没有这个问题，但也仍依赖 `ticket`（会话级，重新登录后轮换）。
-- 只支持文本消息。图片、表情、撤回等未实现。
+- 发送仅支持文本。接收侧已按类型分级展示（text/tip/reaction/media）；图片、表情、撤回等发送未实现。
 - 无鉴权，不要直接暴露到公网。
 
 ---
