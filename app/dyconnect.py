@@ -360,18 +360,18 @@ class DySession:
     # ------------------------------------------------------------------- 发送
 
     def send(self, conv_id, text):
-        """发一条文本。conv_id 形如 '0:1:<uid>:<peer>'；ticket 必须已刷新。"""
+        """发一条文本。conv_id 形如 '0:1:<uid>:<peer>'；ticket 必须已刷新
+        （先 refresh_conversation_info([(conv_id, short_id)])）。"""
         info = self._tickets.get(conv_id)
         if not info or not info.get('ticket'):
-            self.refresh_conversation_info([conv_id])
-            info = self._tickets.get(conv_id)
-        if not info:
-            raise RuntimeError('unknown conversation: %s (refresh failed)' % conv_id)
+            raise RuntimeError('no ticket for %s — call refresh_conversation_info '
+                               '([(conv_id, short_id)]) first' % conv_id)
         short_id = int(info['conv_short_id'])
         inner, cmid = build_send_inner(conv_id, short_id, info['ticket'], text)
         resp = self._post('/v1/message/send',
-                          envelope(CMD_SEND, 100, inner))
+                          envelope(CMD_SEND, body_field=100, inner=inner))
         top = pb.parse(resp)
         ok = pb.text(pb.blob(top, 4)) == 'OK' if top else False
         return {'ok': bool(ok), 'client_message_id': cmid,
-                'status_code': pb.one(top, 5, -1) if top else -1}
+                'status_code': pb.one(top, 5, -1) if top else -1,
+                'error': pb.text(pb.blob(top, 4)) if top and not ok else ''}
