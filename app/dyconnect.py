@@ -237,6 +237,51 @@ def parse_conversation_info(body):
     return out
 
 
+def parse_init_conversations(body):
+    """解析 get_message_by_init 响应 → 全量会话面（每会话一容器）。
+
+    实测结构（init-resp-1010.bin）：
+    top[6] > field2043 > field1(容器，重复，每会话一个) = {
+        1: 会话核心 { 1: conv_id, 2: conv_short_id, 4: ticket(121B) },
+        2: 消息记录（重复，最近最多 20 条）,
+        4/5/...: 参与者等扩展段
+    }
+    init 响应即全量会话列表源（含常规会话的 ticket）——**无需 MGet 端点**。
+    注意 conv_id 有两类形态：'0:1:<uid>:<peer>'（单聊）与纯数字（其他会话
+    类型），core.f1 原样保留。
+    """
+    out = []
+    top = pb.parse(body)
+    if not top:
+        return out
+    f6 = pb.blob(top, 6)
+    if not f6:
+        return out
+    b2043 = pb.blob(pb.parse(f6), 2043)
+    if not b2043:
+        return out
+    for _f, _w, _v, ct_b in pb.all_of(pb.parse(b2043), 1):
+        ct = pb.parse(ct_b)
+        if not ct:
+            continue
+        core_b = pb.blob(ct, 1)
+        if not core_b:
+            continue
+        core = pb.parse(core_b)
+        if not core:
+            continue
+        conv_id = pb.text(pb.blob(core, 1))
+        if not conv_id:
+            continue
+        out.append({
+            'conv_id': conv_id,
+            'conv_short_id': pb.one(core, 2, 0),
+            'ticket': pb.text(pb.blob(core, 4)) or '',
+            'msg_count': sum(1 for _ in pb.all_of(ct, 2)),
+        })
+    return out
+
+
 def parse_stranger_list(body):
     """解析 stranger/get_conversation_list 响应。
 
@@ -321,10 +366,18 @@ class DySession:
 
         注意：init 后服务端有约 5-8 分钟的会话就绪窗口，期间 send 被拒
         （实测数据点：+8s/+15s/+74s/+3min 全败，+8min 起 OK）。
+
+        响应同时携带全量会话面（每会话一容器：core{conv_id,short_id,
+        ticket} + 最近消息）——解析入库 _tickets，常规会话无需 MGet。
         """
         body = self._post('/v1/message/get_message_by_init',
                           envelope(CMD_INIT, body_field=2043, inner=body_init()))
         self._init_at = time.time()
+        convs = parse_init_conversations(body)
+        for c in convs:
+            if c.get('ticket') and c.get('conv_short_id'):
+                self._tickets[c['conv_id']] = c
+        self._init_convs = convs
         return len(body)
 
     # ------------------------------------------------------------ 会话与票据
