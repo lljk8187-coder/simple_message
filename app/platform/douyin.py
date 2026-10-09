@@ -19,15 +19,19 @@
   仅 stranger 列表响应自带的字段。
 
 conv_id = '0:1:<uid>:<peer>'（平台原生格式，直接用于 send 信封）。
-ticket 由服务端随 get_info_list 下发（会话级滚动），发送前现取最新。
-v1 能力：send + conversations；messages/poll 的增量解析下一步接入。
+会话面：get_message_by_init 响应即全量会话列表（含常规会话 ticket 与
+最近 ≤20 条消息）——**无需 MGet 端点**（10-09 逆向定论）。
+消息页：读 init 缓存（DySession.messages），低频重新 init 刷新增量
+（INIT_REFRESH_S；重复 init 会重置就绪窗 ⇒ 刷新后 8 分钟内不能发，
+保守语义对齐服务端）。
+dtrait 头：可选——实测缺省发送成功（10-09 hub 实发验证）。
 """
 import json
 import time
 
 from . import registry
 from .. import dyconnect
-from .base import (PlatformAdapter, Account, Conversation, CAP_SEND)
+from .base import (PlatformAdapter, Account, Conversation, Message, CAP_SEND)
 
 
 @registry.register
@@ -41,6 +45,7 @@ class DouyinAdapter(PlatformAdapter):
     send_limits = {'min_interval_s': 20, 'daily_cap': 80}
 
     STRANGER_TTL_S = 180    # 实测 stranger 列表 ≈1次/2-3分钟，超频 429
+    INIT_REFRESH_S = 900    # 低频重新 init：新常规会话只随 init 下发；会重置就绪窗
 
     # send_blob 必需键（= setup_send_credentials 的必填参数）
     _SEND_BLOB_KEYS = ('verify_fp', 'ms_token', 'tg_private_pem',
@@ -177,11 +182,15 @@ class DouyinAdapter(PlatformAdapter):
 
     def _refresh_cached(self, sess):
         """init → stranger 列表 → info_list，带 STRANGER_TTL_S 节流：
-        陌生人端点超频 429，缓存期内直接信任上一次结果（存活检测延迟 ≤ TTL）。"""
+        陌生人端点超频 429，缓存期内直接信任上一次结果（存活检测延迟 ≤ TTL）。
+        距上次 init 超 INIT_REFRESH_S 时顺带重新 init——新常规会话与新消息
+        只随 init 下发；_init_at 随之重置（就绪窗保守语义）。"""
         now = time.time()
         cached = getattr(sess, '_conv_cache', None)
         if cached and now - getattr(sess, '_conv_at', 0) < self.STRANGER_TTL_S:
             return cached
+        if now - getattr(sess, '_init_at', 0) > self.INIT_REFRESH_S:
+            sess.init()
         convs = sess.refresh_conversations()
         sess._conv_cache = convs
         sess._conv_at = now
@@ -189,15 +198,39 @@ class DouyinAdapter(PlatformAdapter):
 
     def conversations(self, sess):
         convs = self._refresh_cached(sess)
+        uid = str(sess.uid or '')
+        msgs = getattr(sess, '_msgs', {})
         out = []
         for c in convs:
-            parts = c['conv_id'].split(':')
+            cid = c['conv_id']
+            parts = cid.split(':')
             peer = parts[3] if len(parts) > 3 else ''
+            conv_msgs = msgs.get(cid) or []
+            last = conv_msgs[-1] if conv_msgs else None
             out.append(Conversation(platform='douyin', account='',
-                                    conv_id=c['conv_id'],
+                                    conv_id=cid,
                                     peer_uid=peer,
-                                    last_ms=0))
+                                    last_text=(last or {}).get('text', ''),
+                                    last_ms=(last or {}).get('ms', 0),
+                                    last_from_me=1 if last and last.get('sender_uid') == uid else 0,
+                                    unread=0))
         return out
+
+    def messages(self, sess, conv_id, before_ms=None, limit=30):
+        self._refresh_cached(sess)
+        rows = sess.messages(conv_id, before_ms=before_ms, limit=limit)
+        uid = str(sess.uid or '')
+        if not uid and rows:
+            # conv_id = '0:1:<uid>:<peer>'，uid 缺失时从消息里补
+            parts = rows[0]['conv_id'].split(':')
+            uid = parts[2] if len(parts) > 2 else ''
+        return [Message(platform='douyin', account='',
+                        msg_id=m['msg_id'], conv_id=m['conv_id'],
+                        sender=m['sender_uid'],
+                        outgoing=1 if m['sender_uid'] == uid else 0,
+                        text=m['text'], ms=m['ms'], status='sent',
+                        kind=m['kind'])
+                for m in rows]
 
     # -------------------------------------------------------------- 写
 
@@ -208,5 +241,18 @@ class DouyinAdapter(PlatformAdapter):
             sess.refresh_conversation_info(
                 [(conv_id, int(info['conv_short_id']))])
         out = sess.send(conv_id, text)
+        # 本地回显：发出的消息并进 init 缓存（服务器 msg_id 要等下次 init 校正，
+        # 期间消息页不能"发完就没"）
+        msgs = getattr(sess, '_msgs', None)
+        if msgs is not None:
+            msgs.setdefault(conv_id, []).append({
+                'conv_id': conv_id,
+                'msg_id': 'local-%d' % int(time.time() * 1000),
+                'conv_short_id': (info or {}).get('conv_short_id', 0),
+                'kind': 'text',
+                'sender_uid': str(sess.uid or ''),
+                'text': text,
+                'ms': int(time.time() * 1000),
+                'sender_sec_uid': ''})
         out.setdefault('ok', True)
         return out

@@ -282,6 +282,74 @@ def parse_init_conversations(body):
     return out
 
 
+# init 消息 f6 类型 → Message.kind（init-resp-1010.bin 167 条实测归纳；
+# 未收录类型一律 'unknown'，媒体类 text 带描述便于前端渲染）
+_MSG_KIND = {7: 'text', 1: 'tip', 5: 'media', 8: 'media', 15: 'media',
+             17: 'media', 21: 'media', 60: 'media', 77: 'media',
+             105: 'media', 110: 'media', 168: 'media'}
+
+
+def _describe_media(content):
+    for k in ('content_name', 'display_name', 'desc', 'hint_text', 'aweme_title'):
+        v = content.get(k)
+        if isinstance(v, str) and v:
+            return '[媒体] %s' % v
+    return '[媒体消息]'
+
+
+def parse_init_messages(body):
+    """解析 init 响应中的消息记录（每会话容器 field2，重复，最近 ≤20 条）。
+
+    实测字段（init-resp-1010.bin，20 条样本）：
+      1: conv_id（记录内重复内嵌）
+      3: msg_id (int64)
+      5: conv_short_id
+      6: 消息类型（映射见 _MSG_KIND：7=文本 1=系统提示 其余媒体/卡片）
+      7: sender uid（与本账号 uid 比对定 outgoing 方向）
+      8: 内容 JSON（{"type":0,...,"text":"..."}；文本在 text 键）
+      10: 服务器毫秒时间戳（**真实时间**；f4/f13 是服务端混淆时基，勿用）
+      14: sender sec_uid
+    """
+    out = []
+    top = pb.parse(body)
+    if not top:
+        return out
+    f6 = pb.blob(top, 6)
+    if not f6:
+        return out
+    b2043 = pb.blob(pb.parse(f6), 2043)
+    if not b2043:
+        return out
+    for _f, _w, _v, ct_b in pb.all_of(pb.parse(b2043), 1):
+        for _f2, _w2, _v2, m_b in pb.all_of(pb.parse(ct_b), 2):
+            m = pb.parse(m_b)
+            if not m:
+                continue
+            conv_id = pb.text(pb.blob(m, 1)) or ''
+            content_b = pb.blob(m, 8)
+            content = {}
+            if content_b:
+                try:
+                    content = json.loads(pb.text(content_b) or '{}') or {}
+                except ValueError:
+                    content = {}
+            kind = _MSG_KIND.get(pb.one(m, 6, 0), 'unknown')
+            text = content.get('text') or ''
+            if kind != 'text' and not text and content:
+                text = _describe_media(content)
+            out.append({
+                'conv_id': conv_id,
+                'msg_id': str(pb.one(m, 3, 0)),
+                'conv_short_id': pb.one(m, 5, 0),
+                'kind': kind,
+                'sender_uid': str(pb.one(m, 7, 0)),
+                'text': text,
+                'ms': pb.one(m, 10, 0),
+                'sender_sec_uid': pb.text(pb.blob(m, 14)) or '',
+            })
+    return out
+
+
 def parse_stranger_list(body):
     """解析 stranger/get_conversation_list 响应。
 
@@ -334,6 +402,7 @@ class DySession:
             self.curl = curl_requests.Session(impersonate='chrome', proxy=proxy,
                                               verify=_ascii_ca())
         self._tickets = {}       # conv_id(str) -> {'short_id': int, 'ticket': str}
+        self._msgs = {}          # conv_id(str) -> [msg dict, ...]（ms 升序，init 填充）
         self._inited = False
 
     # ------------------------------------------------------------- transport
@@ -378,6 +447,13 @@ class DySession:
             if c.get('ticket') and c.get('conv_short_id'):
                 self._tickets[c['conv_id']] = c
         self._init_convs = convs
+        # 消息记录同源：每会话容器 field2（≤20 条），按会话分组、ms 升序
+        by_conv = {}
+        for m in parse_init_messages(body):
+            by_conv.setdefault(m['conv_id'], []).append(m)
+        for lst in by_conv.values():
+            lst.sort(key=lambda x: x['ms'])
+        self._msgs = by_conv
         return len(body)
 
     # ------------------------------------------------------------ 会话与票据
@@ -420,6 +496,16 @@ class DySession:
     def ticket_for(self, conv_id):
         t = self._tickets.get(conv_id)
         return (t or {}).get('ticket') or ''
+
+    def messages(self, conv_id, before_ms=None, limit=30):
+        """会话消息（init 响应缓存，旧→新升序；before_ms 向前翻页）。
+
+        缓存来自最近一次 init；增量新鲜度由上层控制（低频重新 init）。
+        """
+        rows = self._msgs.get(conv_id) or []
+        if before_ms:
+            rows = [m for m in rows if m['ms'] < int(before_ms)]
+        return rows[-limit:] if limit else rows
 
     # ------------------------------------------------- 发送凭据（登录时收割）
 

@@ -385,9 +385,9 @@ class Hub(_SyncHub):
         threading.Thread(target=loop, name='x-sync-%s' % name, daemon=True).start()
 
     def start_dy_sync(self, name, sess, interval=180):
-        """抖音同步：会话面 delta 播报。适配器内置 180s 节流（stranger 端点
-        限频 ≈1 次/2-3 分钟），周期取同值=每周期最多一次网络刷新。
-        v1 只播报会话列表变化；消息增量解析接入后此处补逐会话拉取。"""
+        """抖音同步：会话面 delta + incoming 消息播报。适配器内置 180s 节流
+        （stranger 端点限频 ≈1 次/2-3 分钟），周期取同值=每周期最多一次网络刷新。
+        消息内容来自 init 缓存（适配器低频重新 init 刷新，INIT_REFRESH_S=15min）。"""
         import time as _time
 
         def loop():
@@ -397,15 +397,27 @@ class Hub(_SyncHub):
                 try:
                     convs = self.conversations(name)
                     changed = False
+                    incoming = []
                     for c in convs:
                         cid = c['conv_id']
                         ms = c.get('last_ms') or 0
                         prev = last.get(cid)
+                        if prev is not None and ms > prev and not c.get('last_from_me'):
+                            incoming.append((cid, prev))
                         if prev is None or ms != prev:
                             changed = True
                         last[cid] = ms
                     if seeded and changed:
                         self.bus.publish({'type': 'conversations', 'account': name})
+                    for cid, prev_ms in incoming:
+                        try:
+                            rows, _cursor, _conv = self.messages(name, cid, limit=50)
+                            fresh = [m for m in rows if m['ms'] > prev_ms]
+                            if fresh:
+                                self.bus.publish({'type': 'message', 'account': name,
+                                                  'conv_id': cid, 'messages': fresh})
+                        except Exception:
+                            pass
                     seeded = True
                 except Exception:
                     pass
