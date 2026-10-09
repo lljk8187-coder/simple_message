@@ -22,6 +22,7 @@ class Hub(_SyncHub):
         self.x_sessions = {}        # name -> xconnect.XSession
         self.ig_sessions = {}       # name -> igconnect.IGSession
         self.fb_sessions = {}       # name -> fbconnect.FBSession
+        self.dy_sessions = {}       # name -> dyconnect.DySession
         self.pending = {}           # token -> {'platform','state','username'}
         self.dispatch = Dispatcher(store, self, config)   # 代发队列（阶段 2）
 
@@ -39,7 +40,8 @@ class Hub(_SyncHub):
         """任意平台的会话对象；未加载抛 KeyError。"""
         if name in self.sessions:
             return self.sessions[name]
-        for reg in (self.x_sessions, self.ig_sessions, self.fb_sessions):
+        for reg in (self.x_sessions, self.ig_sessions, self.fb_sessions,
+                    self.dy_sessions):
             if name in reg:
                 return reg[name]
         raise KeyError('account %r is not loaded' % name)
@@ -154,6 +156,8 @@ class Hub(_SyncHub):
             return self._add_instagram(fields)
         if platform == 'facebook':
             return self._add_facebook(fields)
+        if platform == 'douyin':
+            return self._add_douyin(fields)
         raise KeyError('unknown platform %r' % platform)
 
     def _add_tiktok(self, fields):
@@ -266,6 +270,19 @@ class Hub(_SyncHub):
         except Exception as e:
             print('fb e2ee %s failed: %s' % (name, e))
 
+    def _add_douyin(self, fields):
+        ad = self.adapter('douyin')
+        sess, acct = ad.add_account(fields)      # 含 verify（init→stranger→info_list），无效即抛
+        name = acct.name
+        self.store.save_platform_account(name, acct.uid, acct.username,
+                                         acct.nickname,
+                                         json.dumps(ad.session_dump(sess)), 'douyin')
+        self.dy_sessions[name] = sess
+        self.start_dy_sync(name, sess)
+        return {'ok': True, 'name': name, 'uid': acct.uid, 'platform': 'douyin',
+                'conversations': len(sess._conv_cache),
+                'note': 'init 占座生效：约 8 分钟内 send 会被服务端拒绝（就绪窗）'}
+
     # ---------------------------------------------------- 启动恢复
 
     def rehydrate_all(self):
@@ -311,6 +328,14 @@ class Hub(_SyncHub):
                     self.start_fb_sync(name, sess)
                     threading.Thread(target=self._fb_bridge, args=(name, sess),
                                      daemon=True).start()
+                elif plat == 'douyin':
+                    try:
+                        saved = json.loads(full.get('cookie') or '{}')
+                    except Exception:
+                        saved = {}
+                    sess = self.adapter('douyin').session_load(saved)
+                    self.dy_sessions[name] = sess
+                    self.start_dy_sync(name, sess)
                 else:
                     continue
             except Exception as e:
@@ -358,6 +383,35 @@ class Hub(_SyncHub):
                 _time.sleep(interval)
 
         threading.Thread(target=loop, name='x-sync-%s' % name, daemon=True).start()
+
+    def start_dy_sync(self, name, sess, interval=180):
+        """抖音同步：会话面 delta 播报。适配器内置 180s 节流（stranger 端点
+        限频 ≈1 次/2-3 分钟），周期取同值=每周期最多一次网络刷新。
+        v1 只播报会话列表变化；消息增量解析接入后此处补逐会话拉取。"""
+        import time as _time
+
+        def loop():
+            last = {}
+            seeded = False
+            while True:
+                try:
+                    convs = self.conversations(name)
+                    changed = False
+                    for c in convs:
+                        cid = c['conv_id']
+                        ms = c.get('last_ms') or 0
+                        prev = last.get(cid)
+                        if prev is None or ms != prev:
+                            changed = True
+                        last[cid] = ms
+                    if seeded and changed:
+                        self.bus.publish({'type': 'conversations', 'account': name})
+                    seeded = True
+                except Exception:
+                    pass
+                _time.sleep(interval)
+
+        threading.Thread(target=loop, name='dy-sync-%s' % name, daemon=True).start()
 
     def start_fb_sync(self, name, sess, interval=12):
         """FB 同步：会话列表 delta + E2EE 桥事件泵（行为同旧 server.py）。"""
@@ -524,5 +578,7 @@ class Hub(_SyncHub):
                 sess.close()
         elif plat == 'instagram':
             self.ig_sessions.pop(name, None)
+        elif plat == 'douyin':
+            self.dy_sessions.pop(name, None)
         self.detach(name)
         self.store.delete_account(name)

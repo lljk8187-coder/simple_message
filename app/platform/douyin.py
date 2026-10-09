@@ -54,7 +54,11 @@ class DouyinAdapter(PlatformAdapter):
                  'secret': True},
                 {'key': 'send_blob',
                  'label': '发送凭据 JSON（登录收割产出；不填则仅收信）',
-                 'secret': True}]
+                 'secret': True},
+                {'key': 'uid',
+                 'label': '数字 uid（可选；conv_id 第三段或 IndexedDB 库名前缀）'},
+                {'key': 'known_convs',
+                 'label': '已知会话种子 JSON（MGet 接入前桥接；[[conv_id,short_id],...]）'}]
 
     def _setup_send(self, sess, blob, strict=False):
         """装配发送凭据。strict=True（用户手填）缺字段直接报错；
@@ -92,13 +96,24 @@ class DouyinAdapter(PlatformAdapter):
                 raise ValueError('send_blob 必须是 JSON 对象')
         sess = dyconnect.DySession(cookie, proxy=self._proxy)
         self._setup_send(sess, blob, strict=True)
-        convs = sess.refresh_conversations()      # 顺便证明 cookie 可用
-        if not convs:
-            raise ValueError('cookie 无效或该账号暂无任何会话（无法验证）')
-        sess._conv_cache = convs                  # 入账这一次刷新直接进缓存
+        # init 成功即证明 cookie 可用。stranger 列表允许为空——常规会话不在
+        # stranger 面（MGet 端点尚未接入，v1 靠 known_convs 种子桥接）
+        sess.refresh_conversations()
+        pairs = []
+        for c in (fields.get('known_convs') or []):
+            try:
+                pairs.append((c[0], int(c[1])))
+            except (TypeError, ValueError, IndexError):
+                raise ValueError('known_convs 项须为 [conv_id, short_id] 二元组')
+        if pairs:
+            sess.refresh_conversation_info(pairs)
+        sess._known_convs = pairs          # 持久化：重启后 session_load 重新种子
+        sess._conv_cache = list(sess._tickets.values())   # 种子结果并入会话面
         sess._conv_at = time.time()
         # conversation_id = '0:1:<uid>:<peer>'，取自己的 uid
-        uid = convs[0]['conv_id'].split(':')[2]
+        uid = (fields.get('uid') or '').strip()
+        if not uid and sess._conv_cache:
+            uid = sess._conv_cache[0]['conv_id'].split(':')[2]
         acct = Account(platform='douyin',
                        name=(fields.get('name') or uid),
                        uid=uid, username='', nickname='')
@@ -119,6 +134,9 @@ class DouyinAdapter(PlatformAdapter):
                       'dtrait': c.get('dtrait', ''),
                       'ua': c.get('ua', ''),
                       'tg_private_pem': pem})
+        kc = getattr(sess, '_known_convs', None)
+        if kc:
+            d['known_convs'] = kc
         return d
 
     def session_load(self, d):
@@ -135,7 +153,16 @@ class DouyinAdapter(PlatformAdapter):
                 'user_agent': d.get('ua') or None,
                 'session_dtrait': d.get('dtrait') or ''})
         convs = sess.refresh_conversations()
-        sess._conv_cache = convs
+        kc = []
+        for c in (d.get('known_convs') or []):
+            try:
+                kc.append((c[0], int(c[1])))
+            except (TypeError, ValueError, IndexError):
+                continue
+        if kc:
+            sess.refresh_conversation_info(kc)
+        sess._known_convs = kc
+        sess._conv_cache = list(sess._tickets.values())
         sess._conv_at = time.time()
         return sess
 
