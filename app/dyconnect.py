@@ -49,6 +49,12 @@ def _ascii_ca():
     return dst
 
 IM_API = 'https://imapi.douyin.com'
+path_SEND = '/v1/message/send'
+
+# ticket-guard 的静态服务端证书（CN=ecies-server，2022-2069，内置在页面 SDK 中）
+import os as _os
+_SERVER_CERT_PATH = _os.path.join(_os.path.dirname(__file__), 'dy-server-cert.pem')
+SERVER_CERT_PEM = open(_SERVER_CERT_PATH, encoding='utf-8').read()
 
 BUILD = '0d50935:feat/pc-im-group'
 VERSION = '0.1.8'
@@ -311,9 +317,14 @@ class DySession:
 
     def init(self):
         """会话建立：启动后第一个请求（服务端要求，缺失报
-        'unexpected session length'）。返回响应字节数。"""
+        'unexpected session length'）。返回响应字节数。
+
+        注意：init 后服务端有约 5-8 分钟的会话就绪窗口，期间 send 被拒
+        （实测数据点：+8s/+15s/+74s/+3min 全败，+8min 起 OK）。
+        """
         body = self._post('/v1/message/get_message_by_init',
                           envelope(CMD_INIT, body_field=2043, inner=body_init()))
+        self._init_at = time.time()
         return len(body)
 
     # ------------------------------------------------------------ 会话与票据
@@ -357,20 +368,149 @@ class DySession:
         t = self._tickets.get(conv_id)
         return (t or {}).get('ticket') or ''
 
+    # ------------------------------------------------- 发送凭据（登录时收割）
+
+    def setup_send_credentials(self, verify_fp, ms_token,
+                               tg_private_pem, tg_ticket, tg_ts_sign, tg_ree_pub,
+                               user_agent=None, session_dtrait=''):
+        """装配 send 所需的全套凭据（登录/cookie 收割时一次性传入）。
+
+        - verify_fp: cookie s_v_web_id（URL verifyFp/fp 参数）
+        - ms_token:  msToken（SDK 内存态；收割时从浏览器 localStorage xmst 取）
+        - tg_private_pem: bd-ticket-guard EC P-256 私钥（浏览器 IndexedDB
+          secure-store/cryptvalues 的 ec_privateKey）
+        - tg_ticket / tg_ts_sign: localStorage web_protect 的 ticket/ts_sign
+        - tg_ree_pub: bd-ticket-guard-ree-public-key 头的值
+        """
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+        from .abogus_imapi import ABogus
+
+        self._send_cred = {
+            'verify_fp': verify_fp,
+            'ms_token': ms_token,
+            'tg_ticket': tg_ticket,
+            'tg_ts_sign': tg_ts_sign,
+            'ree_pub': tg_ree_pub,
+            'dtrait': session_dtrait,
+            'ua': user_agent or UA_DESKTOP,
+        }
+        priv = serialization.load_pem_private_key(tg_private_pem.encode(), password=None)
+        cert = x509.load_pem_x509_certificate(SERVER_CERT_PEM.encode())
+        self._send_cred['ecdh_key'] = HKDF(
+            algorithm=hashes.SHA256(), length=32, salt=b'', info=b'').derive(
+            priv.exchange(ec.ECDH(), cert.public_key()))
+        self._abogus = ABogus(user_agent=self._send_cred['ua'])
+
+    def _tg_client_data(self, path):
+        """bd-ticket-guard-client-data 头（timestamp 必须是数字——字符串会被拒）。"""
+        import base64 as _b64
+        import hashlib as _hashlib
+        import hmac as _hmac
+        c = self._send_cred
+        ts_int = int(time.time())
+        payload = 'ticket=%s&path=%s&timestamp=%d' % (c['tg_ticket'], path, ts_int)
+        req_sign = _b64.b64encode(_hmac.new(
+            c['ecdh_key'], payload.encode(), _hashlib.sha256).digest()).decode()
+        cd = {'ts_sign': c['tg_ts_sign'], 'req_content': 'ticket,path,timestamp',
+              'req_sign': req_sign, 'timestamp': ts_int, 't_trust': 1}
+        return _b64.b64encode(json.dumps(cd, separators=(',', ':')).encode()).decode()
+
+    def get_identity_token(self):
+        """取 identity_security_token（send 前现取，passport 端点不占座位）。"""
+        import uuid as _uuid
+        from urllib.parse import quote as _quote
+        c = self._send_cred
+        iparams = [
+            ('passport_jssdk_version', '4.2.3'), ('passport_jssdk_type', 'lite'),
+            ('is_from_ttaccountsdk', '1'), ('aid', '6383'), ('language', 'zh'),
+            ('scene', 'web_im'), ('auto_retry_req', '0'), ('skip_verify', 'false'),
+            ('identity_token_force_get_tag', '0'),
+            ('biz_trace_id', _uuid.uuid4().hex[:16]),
+            ('id_token_version', '1.2.10'), ('msToken', c['ms_token']),
+        ]
+        iquery = '&'.join('%s=%s' % (k, v) for k, v in iparams)
+        iurl = ('https://www.douyin.com/passport/safe/get_identity_security_token/?'
+                + iquery + '&a_bogus=' + _quote(self._abogus.get_value(iquery), safe=''))
+        r = self.curl.get(iurl, headers={
+            'Accept': 'application/json, text/plain, */*', 'User-Agent': c['ua'],
+            'Referer': 'https://www.douyin.com/', 'Cookie': self.cookie}, timeout=30)
+        j = r.json()
+        d = j.get('data') or {}
+        if j.get('message') != 'success' or not d.get('identity_security_token'):
+            raise RuntimeError('get_identity_security_token failed: %s' % j.get('message'))
+        return d['identity_security_token'], d.get('device_id', '')
+
     # ------------------------------------------------------------------- 发送
 
+    INIT_SETTLE_SECONDS = 480   # init 后服务端会话就绪窗口（实测 5-8 分钟）
+
     def send(self, conv_id, text):
-        """发一条文本。conv_id 形如 '0:1:<uid>:<peer>'；ticket 必须已刷新
-        （先 refresh_conversation_info([(conv_id, short_id)])）。"""
+        """发一条文本（全签名链）。
+
+        前置：setup_send_credentials() 已装配凭据；会话 ticket 已刷新
+        （refresh_conversation_info([(conv_id, short_id)])）；init 已过就绪窗口。
+        """
+        if not getattr(self, '_send_cred', None):
+            raise RuntimeError('send credentials missing — call setup_send_credentials() '
+                               'after cookie harvest')
+        since_init = time.time() - getattr(self, '_init_at', 0)
+        if since_init < self.INIT_SETTLE_SECONDS:
+            raise RuntimeError('session warming up: %.0fs since init, send allowed '
+                               'after %ds' % (since_init, self.INIT_SETTLE_SECONDS))
         info = self._tickets.get(conv_id)
         if not info or not info.get('ticket'):
             raise RuntimeError('no ticket for %s — call refresh_conversation_info '
                                '([(conv_id, short_id)]) first' % conv_id)
+        if self.curl is None:
+            raise RuntimeError('send requires the curl_cffi transport')
+
+        c = self._send_cred
         short_id = int(info['conv_short_id'])
+        id_token, id_device = self.get_identity_token()
+
         inner, cmid = build_send_inner(conv_id, short_id, info['ticket'], text)
-        resp = self._post('/v1/message/send',
-                          envelope(CMD_SEND, body_field=100, inner=inner))
-        top = pb.parse(resp)
+
+        global ENVELOPE_PARAMS
+        saved = ENVELOPE_PARAMS
+        ENVELOPE_PARAMS = [
+            ('identity_security_token', json.dumps({'token': id_token}, separators=(',', ':'))),
+            ('identity_security_device_id', id_device),
+            ('identity_security_aid', ''),
+        ] + saved
+        try:
+            env = envelope(CMD_SEND, body_field=100, inner=inner, flag6=0)
+        finally:
+            ENVELOPE_PARAMS = saved
+
+        query = 'verifyFp=%s&fp=%s&msToken=%s' % (c['verify_fp'], c['verify_fp'], c['ms_token'])
+        a_bogus = self._abogus.get_value(query, body=inner)
+        from urllib.parse import quote as _quote
+        url = IM_API + path_SEND + '?' + query + '&a_bogus=' + _quote(a_bogus, safe='')
+        headers = {
+            'Accept': 'application/x-protobuf',
+            'Content-Type': 'application/x-protobuf',
+            'Origin': 'https://www.douyin.com',
+            'Referer': 'https://www.douyin.com/',
+            'Cookie': self.cookie,
+            # UA 必须与 a_bogus 签名所绑定的 UA 完全一致（a_bogus 校验 UA）
+            'User-Agent': c['ua'],
+            'sec-ch-ua': '"Chromium";v="154", "Google Chrome";v="154", "Not A(Brand";v="99"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"Windows"',
+            'bd-ticket-guard-client-data': self._tg_client_data(path_SEND),
+            'bd-ticket-guard-ree-public-key': c['ree_pub'],
+            'bd-ticket-guard-version': '2',
+            'bd-ticket-guard-web-sign-type': '1',
+            'bd-ticket-guard-web-version': '2',
+        }
+        if c.get('dtrait'):
+            headers['x-tt-session-dtrait'] = c['dtrait']
+        r = self.curl.post(url, headers=headers, data=env, timeout=30)
+        top = pb.parse(r.content)
         ok = pb.text(pb.blob(top, 4)) == 'OK' if top else False
         return {'ok': bool(ok), 'client_message_id': cmid,
                 'status_code': pb.one(top, 5, -1) if top else -1,
