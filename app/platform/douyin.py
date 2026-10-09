@@ -4,10 +4,27 @@
 .douyin.com 域登录 cookie）。移动端登录风控对模拟器极严（实测短信通道
 直接禁发），桌面端扫码是获取登录态最省力的入口。
 
+发送：凭据来自一次"登录收割"产出的 send_blob JSON（setup_send_credentials
+的参数集：verify_fp/msToken/tg私钥+ticket+ts_sign/ree_pub/UA/dtrait）。
+只有 cookie 也能入账（仅收信模式），send 时会报缺凭据的清晰错误。
+
+平台硬约束（均为实测，详见仓库 docs 与日报 2026-10-08/09）：
+- 单座位：web IM 一账号同时只有一个 init 座位，新 init 踢旧座 ⇒
+  通道账号必须专用（不要同时在浏览器里登录使用同一账号）；
+- 就绪窗：每次进程启动 init 后约 8 分钟内 send 被服务端拒绝 ⇒
+  hub 重启后抖音发送自然延迟解禁，属预期行为；
+- 陌生人列表端点 ≈1 次/2-3 分钟，超频 429 ⇒ conversations/status
+  走 STRANGER_TTL_S 节流缓存；
+- 陌生人会话 MGet=empty：get_info_list 只服务常规会话，陌生人详情
+  仅 stranger 列表响应自带的字段。
+
 conv_id = '0:1:<uid>:<peer>'（平台原生格式，直接用于 send 信封）。
-ticket 由服务端随 get_info_list 下发、每次发送取最新（会话级滚动票据）。
+ticket 由服务端随 get_info_list 下发（会话级滚动），发送前现取最新。
 v1 能力：send + conversations；messages/poll 的增量解析下一步接入。
 """
+import json
+import time
+
 from . import registry
 from .. import dyconnect
 from .base import (PlatformAdapter, Account, Conversation, CAP_SEND)
@@ -23,12 +40,40 @@ class DouyinAdapter(PlatformAdapter):
     # 与"账号存活 > 送达速度"原则一致（比 TikTok 的 8s 更保守，国内实名号）
     send_limits = {'min_interval_s': 20, 'daily_cap': 80}
 
+    STRANGER_TTL_S = 180    # 实测 stranger 列表 ≈1次/2-3分钟，超频 429
+
+    # send_blob 必需键（= setup_send_credentials 的必填参数）
+    _SEND_BLOB_KEYS = ('verify_fp', 'ms_token', 'tg_private_pem',
+                       'tg_ticket', 'tg_ts_sign', 'tg_ree_pub')
+
     # ------------------------------------------------------------ 认证
 
     def auth_fields(self):
         return [{'key': 'cookie',
                  'label': '抖音 cookie（.douyin.com 域，须含 sessionid）',
+                 'secret': True},
+                {'key': 'send_blob',
+                 'label': '发送凭据 JSON（登录收割产出；不填则仅收信）',
                  'secret': True}]
+
+    def _setup_send(self, sess, blob, strict=False):
+        """装配发送凭据。strict=True（用户手填）缺字段直接报错；
+        strict=False（session_load 恢复）缺字段静默降级为仅收信。"""
+        if not blob:
+            return
+        missing = [k for k in self._SEND_BLOB_KEYS if not blob.get(k)]
+        if missing:
+            if strict:
+                raise ValueError('send_blob 缺少字段: %s' % ', '.join(missing))
+            return
+        sess.setup_send_credentials(
+            verify_fp=blob['verify_fp'], ms_token=blob['ms_token'],
+            tg_private_pem=blob['tg_private_pem'], tg_ticket=blob['tg_ticket'],
+            tg_ts_sign=blob['tg_ts_sign'], tg_ree_pub=blob['tg_ree_pub'],
+            user_agent=blob.get('user_agent') or None,
+            session_dtrait=blob.get('session_dtrait') or '')
+        # 原样留存私钥 PEM：session_dump 回存需要（dyconnect 只留派生钥）
+        sess._tg_private_pem = blob['tg_private_pem']
 
     def add_account(self, fields):
         cookie = (fields.get('cookie') or '').strip()
@@ -36,10 +81,22 @@ class DouyinAdapter(PlatformAdapter):
             raise ValueError('cookie 不能为空')
         if 'sessionid' not in cookie:
             raise ValueError('cookie 里没有 sessionid——请从已登录客户端完整复制')
+        blob = {}
+        raw = (fields.get('send_blob') or '').strip()
+        if raw:
+            try:
+                blob = json.loads(raw)
+            except ValueError:
+                raise ValueError('send_blob 不是合法 JSON')
+            if not isinstance(blob, dict):
+                raise ValueError('send_blob 必须是 JSON 对象')
         sess = dyconnect.DySession(cookie, proxy=self._proxy)
+        self._setup_send(sess, blob, strict=True)
         convs = sess.refresh_conversations()      # 顺便证明 cookie 可用
         if not convs:
             raise ValueError('cookie 无效或该账号暂无任何会话（无法验证）')
+        sess._conv_cache = convs                  # 入账这一次刷新直接进缓存
+        sess._conv_at = time.time()
         # conversation_id = '0:1:<uid>:<peer>'，取自己的 uid
         uid = convs[0]['conv_id'].split(':')[2]
         acct = Account(platform='douyin',
@@ -50,28 +107,63 @@ class DouyinAdapter(PlatformAdapter):
     # ------------------------------------------------------ 会话持久化
 
     def session_dump(self, sess):
-        return {'cookie': sess.cookie, 'uid': sess.uid}
+        d = {'cookie': sess.cookie, 'uid': sess.uid}
+        c = getattr(sess, '_send_cred', None)
+        pem = getattr(sess, '_tg_private_pem', '')
+        if c and pem:
+            d.update({'verify_fp': c.get('verify_fp', ''),
+                      'ms_token': c.get('ms_token', ''),
+                      'tg_ticket': c.get('tg_ticket', ''),
+                      'tg_ts_sign': c.get('tg_ts_sign', ''),
+                      'ree_pub': c.get('ree_pub', ''),
+                      'dtrait': c.get('dtrait', ''),
+                      'ua': c.get('ua', ''),
+                      'tg_private_pem': pem})
+        return d
 
     def session_load(self, d):
         sess = dyconnect.DySession(d.get('cookie') or '', proxy=self._proxy,
                                    uid=d.get('uid') or '')
-        sess.refresh_conversations()
+        if d.get('tg_private_pem'):
+            self._setup_send(sess, {
+                'verify_fp': d.get('verify_fp', ''),
+                'ms_token': d.get('ms_token', ''),
+                'tg_private_pem': d['tg_private_pem'],
+                'tg_ticket': d.get('tg_ticket', ''),
+                'tg_ts_sign': d.get('tg_ts_sign', ''),
+                'tg_ree_pub': d.get('ree_pub', ''),
+                'user_agent': d.get('ua') or None,
+                'session_dtrait': d.get('dtrait') or ''})
+        convs = sess.refresh_conversations()
+        sess._conv_cache = convs
+        sess._conv_at = time.time()
         return sess
 
     def session_status(self, sess):
         try:
-            sess.refresh_conversations()
+            self._refresh_cached(sess)
             return 'ok'
         except Exception:
             return 'error'
 
     # -------------------------------------------------------------- 读
 
-    def conversations(self, sess):
+    def _refresh_cached(self, sess):
+        """init → stranger 列表 → info_list，带 STRANGER_TTL_S 节流：
+        陌生人端点超频 429，缓存期内直接信任上一次结果（存活检测延迟 ≤ TTL）。"""
+        now = time.time()
+        cached = getattr(sess, '_conv_cache', None)
+        if cached and now - getattr(sess, '_conv_at', 0) < self.STRANGER_TTL_S:
+            return cached
         convs = sess.refresh_conversations()
+        sess._conv_cache = convs
+        sess._conv_at = now
+        return convs
+
+    def conversations(self, sess):
+        convs = self._refresh_cached(sess)
         out = []
         for c in convs:
-            my_uid = sess.uid
             parts = c['conv_id'].split(':')
             peer = parts[3] if len(parts) > 3 else ''
             out.append(Conversation(platform='douyin', account='',
@@ -83,6 +175,11 @@ class DouyinAdapter(PlatformAdapter):
     # -------------------------------------------------------------- 写
 
     def send(self, sess, conv_id, text):
+        # ticket 会话级滚动：已知 short_id 的会话发送前现取最新
+        info = sess._tickets.get(conv_id)
+        if info and info.get('conv_short_id'):
+            sess.refresh_conversation_info(
+                [(conv_id, int(info['conv_short_id']))])
         out = sess.send(conv_id, text)
         out.setdefault('ok', True)
         return out
