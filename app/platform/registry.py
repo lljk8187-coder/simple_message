@@ -10,7 +10,7 @@ load_adapters() 在 hub 启动时调用：逐个导入适配器模块触发注�
 ADAPTERS = {}
 
 # 适配器模块清单（app/platform/ 下）。新平台：加文件 + 在此追加一行。
-_MODULES = ('tiktok', 'x', 'instagram', 'facebook', 'email')
+_MODULES = ('tiktok', 'x', 'instagram', 'facebook', 'email', 'douyin')
 
 
 def register(cls):
