@@ -382,13 +382,15 @@ def _dy_attachments(f6, content):
         elif f6 in (105, 110):                         # 视频分享
             info = content.get('aweme_info') or {}
             u = _first_url(info.get('cover_url')) or _first_url(content.get('cover_url'))
+            iid = str(content.get('item_id') or content.get('itemId')
+                      or info.get('item_id') or '')
             out.append({'type': 'video_card', 'url': u,
                         'title': content.get('aweme_title') or content.get('description')
                         or content.get('comment') or '',
+                        # 中性跳转字段：适配器填平台原生 URL，前端只认 link
+                        'link': ('https://www.douyin.com/video/%s' % iid) if iid else '',
                         # 原始 content 与视频 id 留存：send_media 转发时重放
-                        'item_id': str(content.get('item_id')
-                                       or content.get('itemId')
-                                       or info.get('item_id') or ''),
+                        'item_id': iid,
                         'author_uid': str(content.get('aweme_author_id')
                                           or info.get('author_uid') or ''),
                         'content': content})

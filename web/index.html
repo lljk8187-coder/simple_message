@@ -71,7 +71,7 @@
   .att.card .att-title{padding:6px 9px;font-size:12.5px;line-height:1.35}
   .att.voice{padding:8px 12px;border-radius:var(--r);background:var(--in);
              border:1px solid var(--line);font-size:13px}
-  .att.voice a{color:inherit}
+  .att.voice audio{width:100%;max-width:240px;height:32px;margin-top:4px;display:block}
   .daysep{align-self:center;font-size:11.5px;color:var(--fg3);padding:6px 10px}
   .empty{margin:auto;color:var(--fg3);font-size:13px;text-align:center;padding:24px;line-height:1.9}
   .empty code{background:var(--panel);border:1px solid var(--line);padding:1px 5px;border-radius:5px;
@@ -750,10 +750,14 @@ function appendMsg(container, m){
   let att = '';
   (m.attachments || []).forEach(a => {
     const u = a.url || a.thumb || '';
-    if (!u) return;
     if (a.type === 'voice') {
-      att += `<div class="att voice">🎵 语音${a.duration ? ' ' + a.duration + '"' : ''} <a href="${esc(u)}" target="_blank" rel="noopener">收听</a></div>`;
-    } else if (a.type === 'sticker') {
+      // 语音：附件 url 为直链音频（实测 M4A 无签名）——内联播放
+      att += `<div class="att voice">🎵 语音${a.duration ? ' ' + a.duration + '"' : ''}`
+           + `<audio controls preload="none" src="${esc(u)}"></audio></div>`;
+      return;
+    }
+    if (!u && !a.link) return;
+    if (a.type === 'sticker') {
       att += `<img class="att sticker" src="${esc(u)}" loading="lazy" alt="">`;
     } else if (a.type === 'card' || a.type === 'video_card' || a.type === 'link') {
       const t = a.title ? `<div class="att-title">${esc(a.title)}</div>` : '';
@@ -762,8 +766,10 @@ function appendMsg(container, m){
         FWD_POOL[m.msg_id] = a;                 // 转发原料（含 content/item_id）
         fwd = `<button class="att-fwd" data-mid="${esc(m.msg_id)}">↗ 转发</button>`;
       }
-      att += u
-        ? `<a class="att card" href="${esc(u)}" target="_blank" rel="noopener"><img src="${esc(u)}" loading="lazy" alt="">${t}</a>${fwd}`
+      // 中性跳转：a.link 由适配器填平台原生 URL（抖音=视频页），前端不感知平台
+      const href = a.link || '';
+      att += (u || href)
+        ? `<a class="att card" ${href ? `href="${esc(href)}" target="_blank" rel="noopener"` : ''}><img src="${esc(u)}" loading="lazy" alt="">${t}</a>${fwd}`
         : `<div class="att card"><div class="att-title">${esc(a.title)}</div></div>${fwd}`;
     } else {                                          // image 及未知类型
       att += `<a href="${esc(u)}" target="_blank" rel="noopener"><img class="att" src="${esc(u)}" loading="lazy" alt=""></a>`;
