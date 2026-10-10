@@ -83,6 +83,13 @@
   input#text:focus{border-color:var(--accent)}
   #modal{position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;place-items:center;z-index:50}
   #modal.show{display:grid}
+  #fwdModal{position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;place-items:center;z-index:60}
+  #fwdModal.show{display:grid}
+  .att-fwd{margin-top:3px;font-size:11.5px;padding:3px 10px;border-radius:6px;
+           border:1px solid var(--line);background:var(--bg2);color:var(--fg);cursor:pointer}
+  .fwd-item{text-align:left;padding:9px 12px;border:1px solid var(--line);border-radius:var(--r);
+            background:var(--bg2);color:var(--fg);cursor:pointer;font-size:13px}
+  .fwd-item:hover{background:var(--in)}
   #batchModal{position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;place-items:center;z-index:50}
   #batchModal.show{display:grid}
   #blockModal,#auditModal{position:fixed;inset:0;background:rgba(0,0,0,.45);
@@ -400,6 +407,14 @@
 </div>
 <div id="toast"></div>
 
+<div id="fwdModal">
+  <div class="card">
+    <h3>转发视频给…</h3>
+    <div id="fwdList" style="max-height:50vh;overflow:auto;display:flex;flex-direction:column;gap:6px"></div>
+    <button class="btn" id="fwdCancel" style="width:100%;margin-top:10px">取消</button>
+  </div>
+</div>
+
 <script>
 const $ = s => document.querySelector(s);
 let ACCOUNTS = [], ACCT = null, CONVS = [], CUR = null, SEEN = new Set();
@@ -601,6 +616,38 @@ async function loadMsgs(beforeUs){
   } finally { LOADING = false; }
 }
 const PENDING = {};   // client_message_id -> optimistic bubble awaiting confirmation
+const FWD_POOL = {};  // msg_id -> video_card attachment（转发原料，含 content/item_id）
+let FWD_ATT = null;
+
+// 转发：点卡片上的"↗ 转发" → 选目标会话 → POST /send {attachments}
+document.addEventListener('click', ev => {
+  const b = ev.target.closest('.att-fwd');
+  if (!b) return;
+  FWD_ATT = FWD_POOL[b.dataset.mid];
+  if (!FWD_ATT) { toast('转发原料缺失（刷新后重试）', true); return; }
+  const list = $('#fwdList');
+  list.innerHTML = '';
+  CONVS.filter(c => !CUR || c.conv_id !== CUR.conv_id).forEach(c => {
+    const btn = document.createElement('button');
+    btn.className = 'fwd-item';
+    btn.textContent = (c.peer_nickname || c.peer_uid || c.conv_id)
+      + (c.last_text ? ' · ' + c.last_text.slice(0, 16) : '');
+    btn.onclick = () => doForward(c);
+    list.appendChild(btn);
+  });
+  $('#fwdModal').classList.add('show');
+});
+async function doForward(c){
+  if (!FWD_ATT || !ACCT) return;
+  try {
+    const r = await jpost(`/api/accounts/${encodeURIComponent(ACCT)}/send`,
+      {conv_id: c.conv_id, text: '', attachments: [FWD_ATT]});
+    if (r.ok) toast('已转发给 ' + (c.peer_nickname || c.peer_uid || c.conv_id));
+    else toast('转发失败：' + (r.error || '未知错误'), true);
+  } catch (e) { toast('转发失败：' + e.message, true); }
+  $('#fwdModal').classList.remove('show');
+}
+$('#fwdCancel').onclick = () => $('#fwdModal').classList.remove('show');
 
 // Message order is kept by the DOM itself, so the scroll handler reads the oldest
 // rendered message straight from it. (An earlier version tracked a separate array
@@ -684,9 +731,14 @@ function appendMsg(container, m){
       att += `<img class="att sticker" src="${esc(u)}" loading="lazy" alt="">`;
     } else if (a.type === 'card' || a.type === 'video_card' || a.type === 'link') {
       const t = a.title ? `<div class="att-title">${esc(a.title)}</div>` : '';
+      let fwd = '';
+      if (a.type === 'video_card' && (a.content || a.item_id)) {
+        FWD_POOL[m.msg_id] = a;                 // 转发原料（含 content/item_id）
+        fwd = `<button class="att-fwd" data-mid="${esc(m.msg_id)}">↗ 转发</button>`;
+      }
       att += u
-        ? `<a class="att card" href="${esc(u)}" target="_blank" rel="noopener"><img src="${esc(u)}" loading="lazy" alt="">${t}</a>`
-        : `<div class="att card"><div class="att-title">${esc(a.title)}</div></div>`;
+        ? `<a class="att card" href="${esc(u)}" target="_blank" rel="noopener"><img src="${esc(u)}" loading="lazy" alt="">${t}</a>${fwd}`
+        : `<div class="att card"><div class="att-title">${esc(a.title)}</div></div>${fwd}`;
     } else {                                          // image 及未知类型
       att += `<a href="${esc(u)}" target="_blank" rel="noopener"><img class="att" src="${esc(u)}" loading="lazy" alt=""></a>`;
     }
