@@ -606,9 +606,15 @@ const PENDING = {};   // client_message_id -> optimistic bubble awaiting confirm
 // rendered message straight from it. (An earlier version tracked a separate array
 // and never updated it when prepending — which made "load older" refetch the same
 // page forever and look like history had run out.)
+// data-us 只有走库存的通道（TikTok）才有；直连适配器的通道（抖音等）只有
+// data-ms —— 兜底 ms*1000，否则锚点恒 0，滚动到顶永远不触发加载更早。
 function oldestLoadedUs(){
   const first = $('#msgs').querySelector('.msg');
-  return first ? Number(first.dataset.us || 0) : 0;
+  if (!first) return 0;
+  const us = Number(first.dataset.us || 0);
+  if (us) return us;
+  const ms = Number(first.dataset.ms || 0);
+  return ms ? ms * 1000 : 0;
 }
 
 function rebuildDaySeps(){
