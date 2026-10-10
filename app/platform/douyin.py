@@ -198,8 +198,11 @@ class DouyinAdapter(PlatformAdapter):
 
     def conversations(self, sess):
         convs = self._refresh_cached(sess)
+        self._fill_profiles(sess)
         uid = str(sess.uid or '')
         msgs = getattr(sess, '_msgs', {})
+        profiles = getattr(sess, '_profiles', {})
+        sec_by_conv = getattr(sess, '_sec_by_conv', {})
         out = []
         for c in convs:
             cid = c['conv_id']
@@ -207,18 +210,72 @@ class DouyinAdapter(PlatformAdapter):
             peer = parts[3] if len(parts) > 3 else ''
             conv_msgs = msgs.get(cid) or []
             last = conv_msgs[-1] if conv_msgs else None
+            prof = profiles.get(sec_by_conv.get(cid, ''), {})
             out.append(Conversation(platform='douyin', account='',
                                     conv_id=cid,
                                     peer_uid=peer,
+                                    peer_nickname=prof.get('nickname', ''),
+                                    peer_avatar=prof.get('avatar', ''),
                                     last_text=(last or {}).get('text', ''),
                                     last_ms=(last or {}).get('ms', 0),
                                     last_from_me=1 if last and last.get('sender_uid') == uid else 0,
                                     unread=0))
         return out
 
+    PROFILE_TTL_S = 600      # 用户资料缓存（昵称/头像变更不敏感）
+
+    def _fill_profiles(self, sess):
+        """批量拉会话对端资料（A2）并缓存。对端 sec_uid 从该会话消息的
+        sender_sec_uid 提取（init/core 不带资料；有消息即有）。"""
+        now = time.time()
+        profiles = getattr(sess, '_profiles', None)
+        if profiles is None:
+            profiles = sess._profiles = {}
+        if now - getattr(sess, '_prof_at', 0) < self.PROFILE_TTL_S and profiles:
+            return
+        uid = str(sess.uid or '')
+        sec_by_conv = {}
+        for cid, lst in (getattr(sess, '_msgs', {}) or {}).items():
+            for m in reversed(lst):
+                if m.get('sender_uid') != uid and m.get('sender_sec_uid'):
+                    sec_by_conv[cid] = m['sender_sec_uid']
+                    break
+        need = sorted({s for s in sec_by_conv.values() if s not in profiles})
+        if need:
+            try:
+                profiles.update(sess.get_user_infos(need))
+                sess._prof_at = now
+            except Exception:
+                return                      # 资料拉取失败不阻塞会话列表
+        sess._sec_by_conv = sec_by_conv
+
     def messages(self, sess, conv_id, before_ms=None, limit=30):
         self._refresh_cached(sess)
         rows = sess.messages(conv_id, before_ms=before_ms, limit=limit)
+        # 缓存不足 limit（首屏或翻到边界）→ get_history 自动补页
+        # （游标链 10-10 逆向 cmd 301；_hist_done 标记会话已确认到底）
+        fetches = 0
+        done = getattr(sess, '_hist_done', None)
+        if done is None:
+            done = sess._hist_done = set()
+        while len(rows) < limit and fetches < 3 and conv_id not in done:
+            anchor = sess.oldest_cached_us(conv_id)
+            if not anchor:
+                break
+            hist = getattr(sess, '_hist_cursor', None)
+            if hist is None:
+                hist = sess._hist_cursor = {}
+            cursor = hist.get(conv_id) or anchor
+            try:
+                page = sess.get_history(conv_id, cursor)
+            except Exception:
+                break
+            fetches += 1
+            if not page['has_more'] or not page['cursor']:
+                done.add(conv_id)
+                break
+            hist[conv_id] = page['cursor']
+            rows = sess.messages(conv_id, before_ms=before_ms, limit=limit)
         uid = str(sess.uid or '')
         if not uid and rows:
             # conv_id = '0:1:<uid>:<peer>'，uid 缺失时从消息里补

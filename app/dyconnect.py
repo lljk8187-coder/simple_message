@@ -66,6 +66,26 @@ CMD_GET_MSG = 2048
 CMD_STRANGER = 1001
 CMD_INFO = 610
 CMD_INIT = 2043            # 会话建立：启动后第一个请求，响应=全量初始化数据
+CMD_HISTORY = 301          # get_by_conversation：历史消息分页（10-10 逆向）
+
+# 用户资料端点（A2；web 端点，2026-10-10 抓包实物。webid/uifid 为设备级指纹，
+# 与登录会话无关，可复用）
+_USER_INFO_URL = 'https://www-hj.douyin.com/aweme/v1/web/im/user/info/?'
+USER_INFO_QS = {
+    'version_code': '170400', 'device_platform': 'webapp', 'aid': '6383',
+    'channel': 'channel_pc_web', 'pc_client_type': '1',
+    'pc_libra_divert': 'Windows', 'update_version_code': '170400',
+    'support_h265': '1', 'support_dash': '1', 'version_name': '17.4.0',
+    'cookie_enabled': 'true', 'screen_width': '1920', 'screen_height': '1080',
+    'browser_language': 'zh-CN', 'browser_platform': 'Win32',
+    'browser_name': 'Chrome', 'browser_version': '154.0.0.0',
+    'browser_online': 'true', 'engine_name': 'Blink',
+    'engine_version': '154.0.0.0', 'os_name': 'Windows', 'os_version': '10',
+    'cpu_core_num': '16', 'device_memory': '32', 'platform': 'PC',
+    'downlink': '1.4', 'effective_type': '3g', 'round_trip_time': '250',
+    'webid': '7694196726711174656',
+    'uifid': 'c8e4e9571f734f80bfe570d2d6f4308b6d7e878c8513cc69011763d4f6766844e6f70928fb2a3cb0',
+}
 
 
 def body_init():
@@ -345,60 +365,116 @@ def _dy_attachments(f6, content):
     return out
 
 
-def parse_init_messages(body):
-    """解析 init 响应中的消息记录（每会话容器 field2，重复，最近 ≤20 条）。
+def _msg_record(m_b):
+    """单条消息记录 → dict。init f2 与 get_by_conversation f1 同构（10-10 实测）。
 
-    实测字段（init-resp-1010.bin，20 条样本）：
-      1: conv_id（记录内重复内嵌）
-      3: msg_id (int64)
-      5: conv_short_id
-      6: 消息类型（映射见 _MSG_KIND：7=文本 1=系统提示 其余媒体/卡片）
-      7: sender uid（与本账号 uid 比对定 outgoing 方向）
-      8: 内容 JSON（{"type":0,...,"text":"..."}；文本在 text 键）
-      10: 服务器毫秒时间戳（**真实时间**；f4/f13 是服务端混淆时基，勿用）
-      14: sender sec_uid
+    字段：1=conv_id 3=msg_id 4=服务端混淆微秒（**历史翻页游标原料**）
+          5=conv_short_id 6=消息类型 7=sender uid 8=内容 JSON
+          10=服务器毫秒真时间（f4/f13 是混淆时基，勿作展示）
+          14=sender sec_uid
     """
+    m = pb.parse(m_b) or ()
+    conv_id = sec_uid = ''
+    msg_id = us = short_id = msg_type = sender = ms = 0
+    content = {}
+    for x in m:
+        fid, wt, ival, bval = x
+        if wt == 2:
+            if fid == 1:
+                conv_id = pb.text(bval) or ''
+            elif fid == 8:
+                try:
+                    content = json.loads(pb.text(bval) or '{}') or {}
+                except ValueError:
+                    content = {}
+            elif fid == 14:
+                sec_uid = pb.text(bval) or ''
+        else:
+            if fid == 3:
+                msg_id = ival
+            elif fid == 4:
+                us = ival
+            elif fid == 5:
+                short_id = ival
+            elif fid == 6:
+                msg_type = ival
+            elif fid == 7:
+                sender = ival
+            elif fid == 10:
+                ms = ival
+    kind = _MSG_KIND.get(msg_type, 'unknown')
+    text = content.get('text') or ''
+    if kind != 'text' and not text and content:
+        text = _describe_media(content)
+    return {
+        'conv_id': conv_id,
+        'msg_id': str(msg_id),
+        'conv_short_id': short_id,
+        'kind': kind,
+        'sender_uid': str(sender),
+        'text': text,
+        'ms': ms,
+        'us': us,
+        'sender_sec_uid': sec_uid,
+        'attachments': _dy_attachments(msg_type, content),
+    }
+
+
+def parse_init_messages(body):
+    """解析 init 响应中的消息记录（每会话容器 field2，重复，最近 ≤20 条）。"""
     out = []
     top = pb.parse(body)
     if not top:
         return out
-    f6 = pb.blob(top, 6)
+    f6 = next((x[3] for x in top if x[0] == 6 and x[1] == 2), None)
     if not f6:
         return out
-    b2043 = pb.blob(pb.parse(f6), 2043)
+    b2043 = next((x[3] for x in pb.parse(f6) if x[0] == 2043 and x[1] == 2), None)
     if not b2043:
         return out
     for _f, _w, _v, ct_b in pb.all_of(pb.parse(b2043), 1):
         for _f2, _w2, _v2, m_b in pb.all_of(pb.parse(ct_b), 2):
-            m = pb.parse(m_b)
-            if not m:
-                continue
-            conv_id = pb.text(pb.blob(m, 1)) or ''
-            content_b = pb.blob(m, 8)
-            content = {}
-            if content_b:
-                try:
-                    content = json.loads(pb.text(content_b) or '{}') or {}
-                except ValueError:
-                    content = {}
-            kind = _MSG_KIND.get(pb.one(m, 6, 0), 'unknown')
-            msg_type = pb.one(m, 6, 0)
-            kind = _MSG_KIND.get(msg_type, 'unknown')
-            text = content.get('text') or ''
-            if kind != 'text' and not text and content:
-                text = _describe_media(content)
-            out.append({
-                'conv_id': conv_id,
-                'msg_id': str(pb.one(m, 3, 0)),
-                'conv_short_id': pb.one(m, 5, 0),
-                'kind': kind,
-                'sender_uid': str(pb.one(m, 7, 0)),
-                'text': text,
-                'ms': pb.one(m, 10, 0),
-                'sender_sec_uid': pb.text(pb.blob(m, 14)) or '',
-                'attachments': _dy_attachments(msg_type, content),
-            })
+            rec = _msg_record(m_b)
+            if rec['conv_id']:
+                out.append(rec)
     return out
+
+
+def body_history(conv_id, conv_short_id, anchor_us, limit=50, direction=1):
+    """get_by_conversation 业务体（两页实物对比 2026-10-10）：
+    f1=conv_id, f2=1(向旧), f3=short_id, f4=1, f5=游标(混淆微秒),
+    f6=每页条数（实测 50）。"""
+    return (pb.s(1, conv_id) + pb.vint(2, direction)
+            + pb.vint(3, int(conv_short_id)) + pb.vint(4, 1)
+            + pb.vint(5, int(anchor_us)) + pb.vint(6, limit))
+
+
+def parse_history_page(body):
+    """get_by_conversation 响应 → {'messages', 'cursor', 'has_more'}。
+
+    top[6] > field301 = { 1: 消息记录（重复，与 init f2 同构，≤50 条/页）,
+                          2: 下一页游标（= 本页最旧记录的混淆微秒）,
+                          3: 是否还有更早的消息,
+                          5: read-index 相关段 }
+    """
+    top = pb.parse(body) or ()
+    f6 = next((x[3] for x in top if x[0] == 6 and x[1] == 2), None)
+    if not f6:
+        return {'messages': [], 'cursor': 0, 'has_more': False}
+    b301 = next((x[3] for x in pb.parse(f6) if x[0] == 301 and x[1] == 2), None)
+    if not b301:
+        return {'messages': [], 'cursor': 0, 'has_more': False}
+    msgs, cursor, has_more = [], 0, False
+    for x in pb.parse(b301):
+        if x[0] == 1 and x[1] == 2:
+            rec = _msg_record(x[3])
+            if rec['conv_id']:
+                msgs.append(rec)
+        elif x[0] == 2 and x[1] == 0:
+            cursor = x[2]
+        elif x[0] == 3 and x[1] == 0:
+            has_more = bool(x[2])
+    return {'messages': msgs, 'cursor': cursor, 'has_more': has_more}
 
 
 def parse_stranger_list(body):
@@ -557,6 +633,76 @@ class DySession:
         if before_ms:
             rows = [m for m in rows if m['ms'] < int(before_ms)]
         return rows[-limit:] if limit else rows
+
+    def oldest_cached_us(self, conv_id):
+        """缓存中最旧消息的混淆微秒（历史翻页初始锚点；无消息返回 0）。"""
+        rows = self._msgs.get(conv_id) or []
+        return min((m['us'] for m in rows if m.get('us')), default=0)
+
+    def get_history(self, conv_id, anchor_us, limit=50):
+        """拉一页历史消息（cmd 301，10-10 逆向）。
+
+        anchor_us：上一页返回的游标（混淆微秒）；首页用 oldest_cached_us()。
+        返回 {'messages', 'cursor', 'has_more'}，并把消息并入 _msgs 缓存。
+        """
+        info = self._tickets.get(conv_id) or {}
+        short_id = int(info.get('conv_short_id') or 0)
+        if not short_id:
+            raise RuntimeError('no short_id for %s — cannot page history' % conv_id)
+        inner = body_history(conv_id, short_id, anchor_us, limit=limit)
+        body = self._post('/v1/message/get_by_conversation',
+                          envelope(CMD_HISTORY, body_field=301, inner=inner))
+        page = parse_history_page(body)
+        for m in page['messages']:
+            lst = self._msgs.setdefault(conv_id, [])
+            if not any(x['msg_id'] == m['msg_id'] for x in lst):
+                lst.append(m)
+        lst = self._msgs.get(conv_id) or []
+        lst.sort(key=lambda x: x['ms'])
+        return page
+
+    # ------------------------------------------------- 用户资料（A2，web 端点）
+
+    def get_user_infos(self, sec_uids):
+        """批量拉用户资料 → {sec_uid: {'nickname', 'avatar', 'uid'}}。
+
+        端点：POST /aweme/v1/web/im/user/info/（www-hj.douyin.com，web 端点，
+        2026-10-10 抓包实物）。body=form sec_user_ids=[...]；query 带标准
+        web 参数 + msToken + a_bogus（同一 ABogus 算法，UA 绑定收割值）。
+        依赖 setup_send_credentials（a_bogus/msToken）。
+        """
+        from urllib.parse import quote as _quote, urlencode as _urlencode
+        if not getattr(self, '_send_cred', None):
+            raise RuntimeError('user info needs send credentials (a_bogus/msToken)')
+        ids = [s for s in sec_uids if s][:30]
+        if not ids:
+            return {}
+        c = self._send_cred
+        form = 'sec_user_ids=' + _quote(json.dumps(ids, separators=(',', ':')),
+                                        safe='')
+        qs = dict(USER_INFO_QS)
+        qs['msToken'] = c['ms_token']
+        iquery = _urlencode(qs)
+        iurl = (_USER_INFO_URL + iquery
+                + '&a_bogus=' + _quote(self._abogus.get_value(iquery, body=form.encode()),
+                                       safe=''))
+        r = self.curl.post(iurl, data=form, headers={
+            'Accept': 'application/json, text/plain, */*', 'User-Agent': c['ua'],
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Referer': 'https://www.douyin.com/', 'Cookie': self.cookie}, timeout=30)
+        j = r.json()
+        if j.get('status_code') != 0:
+            raise RuntimeError('im/user/info failed: status_code=%s' % j.get('status_code'))
+        out = {}
+        for u in j.get('data') or []:
+            sec = u.get('sec_uid') or ''
+            if not sec:
+                continue
+            av = (u.get('avatar_thumb') or {}).get('url_list') or []
+            out[sec] = {'nickname': u.get('nickname') or '',
+                        'avatar': av[0] if av else '',
+                        'uid': str(u.get('uid') or '')}
+        return out
 
     # ------------------------------------------------- 发送凭据（登录时收割）
 

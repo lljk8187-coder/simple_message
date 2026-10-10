@@ -500,7 +500,12 @@ class Hub(_SyncHub):
                     ad.messages(sess, conv_id, before_ms=before_ms, limit=limit)]
             for r in rows:
                 r['account'] = name
-            return rows, None, None
+            # 翻页信号：返回本页最旧一条的 us 作为 next_cursor（前端回传
+            # before_us 驱动下一页；适配器内部维护平台原生游标）
+            cursor = None
+            if len(rows) >= limit:
+                cursor = min(int(r['ms']) for r in rows) * 1000
+            return rows, cursor, None
 
         if not conv:
             raise KeyError('unknown conversation')
