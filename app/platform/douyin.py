@@ -120,6 +120,7 @@ class DouyinAdapter(PlatformAdapter):
         uid = (fields.get('uid') or '').strip()
         if not uid and sess._conv_cache:
             uid = sess._conv_cache[0]['conv_id'].split(':')[2]
+        sess.uid = uid                        # 必须回写：WS 推送 URL/access_key 绑定 uid
         acct = Account(platform='douyin',
                        name=(fields.get('name') or uid),
                        uid=uid, username='', nickname='')
@@ -170,6 +171,13 @@ class DouyinAdapter(PlatformAdapter):
         sess._known_convs = kc
         sess._conv_cache = list(sess._tickets.values())
         sess._conv_at = time.time()
+        if not (sess.uid or '').strip():
+            # 兜底：存量 dump 可能缺 uid（WS 推送 URL 依赖它）——从 conv_id 派生
+            for cid in sess._tickets:
+                parts = cid.split(':')
+                if len(parts) > 2 and parts[2].isdigit():
+                    sess.uid = parts[2]
+                    break
         return sess
 
     def session_status(self, sess):

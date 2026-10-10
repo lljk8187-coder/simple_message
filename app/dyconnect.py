@@ -499,22 +499,35 @@ def _dump_ws(frame):
 
 
 def parse_ws_push(frame, sess=None):
-    """frontier-im 推送帧 → 消息列表（best-effort，随实物迭代）。
+    """frontier-im 推送帧 → 消息列表。
 
-    帧为二进制 protobuf，内部包裹与 init/gum 记录同语义的字段集合
-    （f3=msg_id, f6=类型, f7=sender, f8=内容 JSON, f10=毫秒/f4=微秒）。
-    解析路径：递归找出全部"含内容 JSON 的记录"并按 conv_id 聚合；
+    实测帧结构（ws-push/ws-*.bin，2026-10-10 回环实物）：
+      top f8(载荷) > f6 > f500 > { 2: conv_id, 5: 消息记录, 6/7/10/11: 时间戳(us) }
+    消息记录（f5 层，与 init/gum 记录同语义）：
+      f1: 会话子结构（内嵌 conv_id）、f3: msg_id、f5: short_id、
+      f6: 类型、f7: sender uid、f8: 内容 JSON、f10/f4: 时间
+    解析策略：递归下钻，凡某层同时具备"f8=内容 JSON + f3=msg_id"即视为
+    一条消息记录；conv_id 从本层 f1 子结构或父层 500.f2 继承。
     解析失败返回 []，帧原文由 _dump_ws 留档供迭代。
     """
     out = []
     seen_ids = set()
 
-    def from_record(fields, conv_id):
+    def conv_id_of(fields, fallback):
+        for x in fields:
+            if x[1] == 2 and x[3] and x[3].startswith(b'0:1:'):
+                return pb.text(x[3])
+            if x[1] == 2 and x[3] and len(x[3]) < 80 and b'0:1:' in x[3]:
+                m = re.search(rb'0:1:\d{10,}:\d{10,}', x[3])
+                if m:
+                    return m.group().decode()
+        return fallback
+
+    def from_fields(fields, conv_id):
         d = {}
         for x in fields:
             if x[0] not in d:
                 d[x[0]] = x
-        msg_type = d[6][2] if 6 in d and d[6][1] == 0 else 0
         content_b = d[8][3] if 8 in d and d[8][1] == 2 else b''
         if not content_b:
             return None
@@ -522,15 +535,18 @@ def parse_ws_push(frame, sess=None):
             content = json.loads(pb.text(content_b) or '{}') or {}
         except ValueError:
             return None
-        mid = str(d[3][2] if 3 in d and d[3][1] == 0 else 0)
+        if 3 not in d or d[3][1] != 0:
+            return None
+        mid = str(d[3][2])
         if mid in ('', '0'):
             return None
+        msg_type = d[6][2] if 6 in d and d[6][1] == 0 else 0
         kind = _MSG_KIND.get(msg_type, 'unknown')
         text = content.get('text') or ''
         if kind != 'text' and not text and content:
             text = _describe_media(content)
         us = 0
-        for fid in (10, 4):                     # init 记录 f10=毫秒，gum 记录 f4=微秒
+        for fid in (10, 4):
             if fid in d and d[fid][1] == 0:
                 v = d[fid][2]
                 if v > 1e15:
@@ -539,12 +555,16 @@ def parse_ws_push(frame, sess=None):
                     us = v * 1000
                 break
         sid = d[5][2] if 5 in d and d[5][1] == 0 else 0
+        sender = str(d[7][2]) if 7 in d and d[7][1] == 0 else ''
+        cid = conv_id
+        if not cid and 1 in d and d[1][1] == 2 and d[1][3].startswith(b'0:1:'):
+            cid = pb.text(d[1][3])             # 记录自带的会话 ID（WS 推送路径）
         return {
-            'conv_id': conv_id or '',
+            'conv_id': cid or '',
             'msg_id': mid,
             'conv_short_id': sid,
             'kind': kind,
-            'sender_uid': str(d[7][2] if 7 in d and d[7][1] == 0 else 0),
+            'sender_uid': sender,
             'text': text,
             'ms': us // 1000 if us else int(time.time() * 1000),
             'us': us,
@@ -552,29 +572,47 @@ def parse_ws_push(frame, sess=None):
             'attachments': _dy_attachments(msg_type, content),
         }
 
+    # 规范路径（回环实物 ws-*.bin 验证）：top f8 > f6 > f500 > f5(重复) = 消息记录
+    try:
+        _top = pb.parse(frame) or ()
+        _f8 = next(x[3] for x in _top if x[0] == 8 and x[1] == 2)
+        _f6 = next(x[3] for x in (pb.parse(_f8) or ()) if x[0] == 6 and x[1] == 2)
+        _f500 = next(x[3] for x in (pb.parse(_f6) or ()) if x[0] == 500 and x[1] == 2)
+        for _rec in (x[3] for x in (pb.parse(_f500) or ())
+                     if x[0] == 5 and x[1] == 2):
+            rec = from_fields(pb.parse(_rec) or (), None)
+            if rec and rec['msg_id'] not in seen_ids:
+                seen_ids.add(rec['msg_id'])
+                out.append(rec)
+    except (StopIteration, Exception):
+        pass
+    if out:
+        return out
+
     def walk(data, conv_id, depth=0):
-        if depth > 10:
+        if depth > 12:
             return
         try:
             fields = pb.parse(data) or ()
         except Exception:
             return
-        for f in fields:
-            fid, wt, ival, bval = f
-            if wt != 2 or not bval:
-                continue
-            if b'aweType' in bval or b'"text":"' in bval:
-                try:
-                    rec = from_record(pb.parse(bval), conv_id)
-                except Exception:
-                    rec = None
-                if rec and rec['msg_id'] not in seen_ids:
-                    seen_ids.add(rec['msg_id'])
-                    out.append(rec)
-                continue
-            if bval.startswith(b'0:1:') and b'"' not in bval[:1]:
-                conv_id = pb.text(bval)
-            walk(bval, conv_id, depth + 1)
+        d = {}
+        for x in fields:
+            if x[0] not in d:
+                d[x[0]] = x
+        # 本层是否为消息记录：f8=内容 JSON 且 f3=msg_id
+        if (8 in d and d[8][1] == 2
+                and (b'aweType' in d[8][3] or b'"text":"' in d[8][3])
+                and 3 in d and d[3][1] == 0):
+            rec = from_fields(list(d.values()), conv_id)
+            if rec and rec['msg_id'] not in seen_ids:
+                seen_ids.add(rec['msg_id'])
+                out.append(rec)
+            return                       # 记录内部不再下钻
+        nid = conv_id_of(fields, conv_id)
+        for x in fields:
+            if x[1] == 2 and x[3]:
+                walk(x[3], nid, depth + 1)
 
     walk(frame, None)
     return out
@@ -975,6 +1013,19 @@ class DySession:
                             fresh = parse_ws_push(data, sess)
                             if fresh:
                                 _dump_ws(data)
+                                # 并入缓存（gum() 同款）：/messages 读这里
+                                for m in fresh:
+                                    cid = m['conv_id']
+                                    if cid and sess._tickets.get(cid) is None:
+                                        sess._tickets[cid] = {
+                                            'conv_id': cid,
+                                            'conv_short_id': m['conv_short_id'],
+                                            'ticket': ''}
+                                    lst = sess._msgs.setdefault(cid, [])
+                                    if not any(x['msg_id'] == m['msg_id']
+                                               for x in lst):
+                                        lst.append(m)
+                                    lst.sort(key=lambda x: x['ms'])
                                 try:
                                     on_messages(fresh)
                                 except Exception:
