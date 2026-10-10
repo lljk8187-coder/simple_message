@@ -25,6 +25,23 @@ class Hub(_SyncHub):
         self.dy_sessions = {}       # name -> dyconnect.DySession
         self.pending = {}           # token -> {'platform','state','username'}
         self.dispatch = Dispatcher(store, self, config)   # 代发队列（阶段 2）
+        from .canary import Canary
+        self.canary = Canary()    # 协议金丝雀：统一出口采样（09-30 设计案）
+
+    # ------------------------------------------------------------ 金丝雀
+
+    def _guarded(self, name, fn):
+        """统一出口采样：成功记 ok，失败四分类记录后原样上抛（金丝雀 V1）。"""
+        try:
+            r = fn()
+        except Exception as e:
+            self.canary.record_err(name, e)
+            raise
+        self.canary.record_ok(name)
+        return r
+
+    def canary_snapshot(self):
+        return self.canary.snapshot()
 
     # ------------------------------------------------------------ 适配器
 
@@ -478,8 +495,14 @@ class Hub(_SyncHub):
         """会话列表：TikTok 走库存（含资料合并），其它平台适配器现取。"""
         plat = self._platform(name)
         if plat == 'tiktok':
-            self.sync_conversations(name)
-            return self.store.list_conversations(name)
+            return self._guarded(name, lambda: self._tiktok_conversations(name))
+        return self._guarded(name, lambda: self._conv_other(plat, name))
+
+    def _tiktok_conversations(self, name):
+        self.sync_conversations(name)
+        return self.store.list_conversations(name)
+
+    def _conv_other(self, plat, name):
         ad = self.adapter(plat)
         sess = self.session(name)
         rows = [c.to_dict() for c in ad.conversations(sess)]
@@ -493,19 +516,8 @@ class Hub(_SyncHub):
         conv = next((c for c in self.store.list_conversations(name)
                      if c['conv_id'] == conv_id), None) if plat == 'tiktok' else None
         if plat != 'tiktok':
-            ad = self.adapter(plat)
-            sess = self.session(name)
-            before_ms = (before_us // 1000) if before_us else None
-            rows = [m.to_dict() for m in
-                    ad.messages(sess, conv_id, before_ms=before_ms, limit=limit)]
-            for r in rows:
-                r['account'] = name
-            # 翻页信号：返回本页最旧一条的 us 作为 next_cursor（前端回传
-            # before_us 驱动下一页；适配器内部维护平台原生游标）
-            cursor = None
-            if len(rows) >= limit:
-                cursor = min(int(r['ms']) for r in rows) * 1000
-            return rows, cursor, None
+            return self._guarded(name, lambda: self._msgs_other(
+                plat, name, conv_id, before_us, limit))
 
         if not conv:
             raise KeyError('unknown conversation')
@@ -523,6 +535,21 @@ class Hub(_SyncHub):
                                               before_us=before_us)
         return stored, cursor, conv
 
+    def _msgs_other(self, plat, name, conv_id, before_us, limit):
+        ad = self.adapter(plat)
+        sess = self.session(name)
+        before_ms = (before_us // 1000) if before_us else None
+        rows = [m.to_dict() for m in
+                ad.messages(sess, conv_id, before_ms=before_ms, limit=limit)]
+        for r in rows:
+            r['account'] = name
+        # 翻页信号：返回本页最旧一条的 us 作为 next_cursor（前端回传
+        # before_us 驱动下一页；适配器内部维护平台原生游标）
+        cursor = None
+        if len(rows) >= limit:
+            cursor = min(int(r['ms']) for r in rows) * 1000
+        return rows, cursor, None
+
     def send(self, name, conv_id, text, audit=True, attachments=None):
         """统一发送入口。audit=False 供代发队列使用（它自己写 dispatch.* 审计，
         否则一次群发会留下两份记录）。attachments 非空且适配器申报
@@ -534,7 +561,7 @@ class Hub(_SyncHub):
             if CAP_SEND_MEDIA not in ad.capabilities:
                 return {'ok': False, 'error': '%s 不支持媒体发送' % plat}
             sess = self.session(name)
-            res = ad.send_media(sess, conv_id, attachments, text=text)
+            res = self._guarded(name, lambda: ad.send_media(sess, conv_id, attachments, text=text))
             if audit:
                 self._audit_send(name, conv_id, text or '[媒体]',
                                  res if isinstance(res, dict) else {'ok': bool(res)})
@@ -546,8 +573,8 @@ class Hub(_SyncHub):
             if not conv or not conv['short_id']:
                 return {'ok': False, 'error': 'unknown conversation (no short_id)'}
             from . import client as api
-            result = api.send_message(self.client, sess, conv_id,
-                                      conv['short_id'], text)
+            result = self._guarded(name, lambda: api.send_message(
+                self.client, sess, conv_id, conv['short_id'], text))
             if result.get('ok'):
                 self.nudge(name, conv_id)
             if audit:
@@ -555,7 +582,7 @@ class Hub(_SyncHub):
             return result
         ad = self.adapter(plat)
         sess = self.session(name)
-        res = ad.send(sess, conv_id, text)
+        res = self._guarded(name, lambda: ad.send(sess, conv_id, text))
         if audit:
             self._audit_send(name, conv_id, text,
                              res if isinstance(res, dict) else {'ok': bool(res)})

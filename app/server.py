@@ -131,6 +131,7 @@ class Handler(BaseHTTPRequestHandler):
         ('GET', r'^/api/login/state$', 'login_state'),
         ('POST', r'^/api/login/cancel$', 'login_cancel'),
         ('GET', r'^/api/health$', 'health'),
+        ('GET', r'^/api/canary$', 'canary'),
     ]
 
     def _dispatch(self, method):
@@ -208,6 +209,12 @@ class Handler(BaseHTTPRequestHandler):
     def h_health(self, q):
         self._json({'ok': True, 'ts': int(time.time() * 1000),
                     'proxy': self.client.proxy, 'accounts': len(self.store.list_accounts())})
+
+    def h_canary(self, q):
+        """协议金丝雀：每账号健康 + protocol 漂移账号清单（红牌口）。"""
+        snap = self.hub.canary_snapshot()
+        self._json({'accounts': snap,
+                    'drift': sorted({n for n, v in snap.items() if v['protocol_drift']})})
 
     def h_get_config(self, q):
         cfg = dict(self.config)
