@@ -179,6 +179,9 @@
     </div>
     <div id="msgs"><div class="empty" id="welcome"></div></div>
     <form id="sendform">
+      <button type="button" id="imgBtn" disabled
+              style="flex:0 0 auto;padding:8px 12px" title="发送图片">🖼</button>
+      <input type="file" id="imgFile" accept="image/png,image/jpeg,image/webp" style="display:none">
       <input id="text" placeholder="输入消息，回车发送" autocomplete="off" disabled>
       <button class="btn primary" type="submit" id="sendBtn" disabled>发送</button>
     </form>
@@ -580,6 +583,7 @@ async function openConv(c){
   $('#chatTitle').textContent = c.peer_nickname || c.peer_unique || ('uid ' + c.peer_uid);
   $('#chatSub').textContent = `uid ${c.peer_uid}${c.short_id ? ' · short_id ' + c.short_id : ''}`;
   $('#text').disabled = $('#sendBtn').disabled = false;
+  $('#imgBtn').disabled = false;
   $('#btnBlockPeer').style.display = c.peer_uid ? '' : 'none';
   $('#msgs').innerHTML = '<div class="empty">加载消息…</div>';
   renderConvs();
@@ -648,6 +652,28 @@ async function doForward(c){
   $('#fwdModal').classList.remove('show');
 }
 $('#fwdCancel').onclick = () => $('#fwdModal').classList.remove('show');
+
+// 发送图片（B2）：选文件 → base64 → POST /send attachments [{type:'image'}]
+$('#imgBtn').onclick = () => $('#imgFile').click();
+$('#imgFile').onchange = async ev => {
+  const file = ev.target.files[0];
+  ev.target.value = '';
+  if (!file || !ACCT || !CUR) return;
+  if (file.size > 8 * 1024 * 1024) { toast('图片超过 8MB，先压一压', true); return; }
+  const b64 = await new Promise((res, rej) => {
+    const rd = new FileReader();
+    rd.onload = () => res(String(rd.result).split(',', 2)[1]);
+    rd.onerror = () => rej(new Error('读取文件失败'));
+    rd.readAsDataURL(file);
+  });
+  toast('上传图片中…');
+  try {
+    const r = await jpost(`/api/accounts/${encodeURIComponent(ACCT)}/send`,
+      {conv_id: CUR.conv_id, text: '', attachments: [{type: 'image', data_b64: b64}]});
+    if (r.ok) toast('图片已发送');
+    else toast('图片发送失败：' + (r.error || '未知错误'), true);
+  } catch (e) { toast('图片发送失败：' + e.message, true); }
+};
 
 // Message order is kept by the DOM itself, so the scroll handler reads the oldest
 // rendered message straight from it. (An earlier version tracked a separate array

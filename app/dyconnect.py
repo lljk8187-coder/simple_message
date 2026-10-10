@@ -22,6 +22,7 @@ import time
 import uuid
 
 import shutil as _shutil
+import zlib as _zlib
 
 from . import proto as pb
 try:
@@ -843,10 +844,13 @@ class DySession:
     def send_media(self, conv_id, attachments, text=''):
         """发一条带载荷的消息（CAP_SEND_MEDIA；10-10 契约扩展）。
 
-        当前支持 type='video_card'（站内视频转发，msg_type=8 / aweType 800）：
-          attachment 提供 'content'（接收消息里的卡片 JSON dict，原样重放）
-          或 item_id/title/cover/author_uid（由 video_card_content 组装）。
-        自产内容（图片/文件）需平台上传链——独立立项，暂未支持。
+        支持 type：
+          video_card — 站内视频转发（msg_type=8 / aweType 800）：attachment
+            提供 'content'（接收消息里的卡片 JSON dict，原样重放）
+            或 item_id/title/cover/author_uid（由 video_card_content 组装）。
+          image — 自产图片（msg_type=27 / aweType 2702）：attachment 提供
+            'data_b64'（图片二进制的 base64）→ upload_image 五步链
+            （config/Apply/TOS/Commit，B2 10-10 逆向）后引用加密 oid/skey。
         """
         if not getattr(self, '_send_cred', None):
             raise RuntimeError('send credentials missing — call setup_send_credentials() '
@@ -863,25 +867,202 @@ class DySession:
             raise RuntimeError('send requires the curl_cffi transport')
 
         for att in attachments or ():
-            if att.get('type') != 'video_card':
-                continue
-            content = att.get('content') if isinstance(att.get('content'), dict) else None
-            if content is None:
-                content = video_card_content(
-                    att.get('item_id') or '', att.get('title') or '',
-                    att.get('cover') or att.get('thumb') or '',
-                    att.get('author_uid') or 0)
-            inner, cmid = build_send_inner(
-                conv_id, int(info['conv_short_id']), info['ticket'], '',
-                msg_type=8,
-                content=json.dumps(content, ensure_ascii=False,
-                                   separators=(',', ':')))
-            return self._dispatch_inner(conv_id, inner, cmid)
-        raise ValueError("no sendable attachment — only type='video_card' supported")
+            if att.get('type') == 'video_card':
+                content = att.get('content') if isinstance(att.get('content'), dict) else None
+                if content is None:
+                    content = video_card_content(
+                        att.get('item_id') or '', att.get('title') or '',
+                        att.get('cover') or att.get('thumb') or '',
+                        att.get('author_uid') or 0)
+                inner, cmid = build_send_inner(
+                    conv_id, int(info['conv_short_id']), info['ticket'], '',
+                    msg_type=8,
+                    content=json.dumps(content, ensure_ascii=False,
+                                       separators=(',', ':')))
+                return self._dispatch_inner(conv_id, inner, cmid)
+            if att.get('type') == 'image' and att.get('data_b64'):
+                import base64 as _b64
+                image = _b64.b64decode(att['data_b64'])
+                content = self.upload_image(image)
+                inner, cmid = build_send_inner(
+                    conv_id, int(info['conv_short_id']), info['ticket'], '',
+                    msg_type=27,
+                    content=json.dumps(content, ensure_ascii=False,
+                                       separators=(',', ':')))
+                return self._dispatch_inner(conv_id, inner, cmid)
+        raise ValueError("no sendable attachment — supported: video_card / image")
+
+    # ------------------------------------------------- 图片上传（B2，VOD 五步链）
+
+    _img_cfg = None      # 类级 STS 缓存 {'cfg': dict, 'expire': epoch 秒}
+
+    def _image_config(self):
+        """im/upload/config/v2 → public_image_config 块（STS 缓存至过期前 5min）。
+
+        ⚠ 必须用 public_image_config（非 _v2）——同一响应里 v2 块的
+        session_token 与其余三块分属不同 STS 序列，实测用 v2 的 token
+        报 'session token sequence is broken'（100029）；浏览器实物用
+        public_image_config 的（SpaceName=zhenzhen，绑定 uid）。
+        STS PolicyString 授权 vod:ApplyUploadInner/CommitUploadInner，
+        绑定 AppId=6383 与本账号 uid。
+        """
+        from urllib.parse import quote as _quote
+        cached = DySession._img_cfg
+        if cached and cached['expire'] - time.time() > 300:
+            return cached['cfg']
+        c = self._send_cred
+        qs = dict(USER_INFO_QS)
+        qs['msToken'] = c['ms_token']
+        iquery = '&'.join('%s=%s' % (k, _quote(str(v), safe='')) for k, v in qs.items())
+        iurl = ('https://www.douyin.com/aweme/v1/web/im/upload/config/v2?'
+                + iquery + '&a_bogus=' + _quote(self._abogus.get_value(iquery), safe=''))
+        r = self.curl.get(iurl, headers={
+            'Accept': 'application/json, text/plain, */*', 'User-Agent': c['ua'],
+            'Referer': 'https://www.douyin.com/', 'Cookie': self.cookie}, timeout=30)
+        cfg = (r.json() or {}).get('public_image_config') or {}
+        if not cfg.get('session_token'):
+            raise RuntimeError('upload config v2 failed: no session_token')
+        DySession._img_cfg = {'cfg': cfg, 'expire': int(cfg.get('expire_at') or 0)}
+        return cfg
+
+    def _vod_request(self, action, extra_params, payload=b''):
+        """VOD API（vod.bytedanceapi.com，AWS SigV4 兼容鉴权，SDK=45444.js）。
+
+        对照 SDK 的三处关键差异（逐项核对 vod-sdk-45444.js）：
+        ① canonical headers 块尾显式 "\n"（与 join 的分隔符形成空行）；
+        ② POST/Commit 自动加 X-Amz-Content-Sha256 头（= sha256(body 字节)，
+          x-amz- 前缀自动进签名头集合）；③ payload hash 在 canonical 末行
+        （GET=空串 sha256）。
+        """
+        import hashlib as _h
+        import hmac as _hm
+        from urllib.parse import quote as _quote
+        cfg = self._image_config()
+        params = {'Action': action, 'Version': '2020-11-19',
+                  'SpaceName': cfg.get('space_name') or 'zhenzhen', **extra_params}
+        qs = '&'.join('%s=%s' % (k, _quote(str(v), safe=''))
+                      for k, v in sorted(params.items()))
+        amzdate = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
+        datestamp = amzdate[:8]
+        payload_hash = _h.sha256(payload).hexdigest()
+        # SDK addHeaders：有 body 时自动加 X-Amz-Content-Sha256（x-amz- 前缀
+        # 自动参与签名）；canonical headers 按名排序
+        sig_headers = {'x-amz-date': amzdate,
+                       'x-amz-security-token': cfg['session_token']}
+        if payload:
+            sig_headers['x-amz-content-sha256'] = payload_hash
+        names = sorted(sig_headers)
+        canonical_headers = '\n'.join('%s:%s' % (n, sig_headers[n]) for n in names)
+        signed_headers = ';'.join(names)
+        canonical = '\n'.join([
+            'POST' if payload else 'GET', '/', qs,
+            canonical_headers + '\n',       # SDK: headers 块尾显式 \n → 与 join 分隔符形成空行
+            signed_headers, payload_hash])
+        scope = '%s/cn-north-1/vod/aws4_request' % datestamp
+        sts = 'AWS4-HMAC-SHA256\n%s\n%s\n%s' % (
+            amzdate, scope, _h.sha256(canonical.encode()).hexdigest())
+        key = ('AWS4' + cfg['secret_access_key']).encode()
+        for part in (datestamp, 'cn-north-1', 'vod', 'aws4_request'):
+            key = _hm.new(key, part.encode(), _h.sha256).digest()
+        sig = _hm.new(key, sts.encode(), _h.sha256).hexdigest()
+        auth = ('AWS4-HMAC-SHA256 Credential=%s/%s, '
+                'SignedHeaders=%s, Signature=%s'
+                % (cfg['access_key_id'], scope, signed_headers, sig))
+        headers = {'Authorization': auth,
+                   'x-amz-date': amzdate,
+                   'x-amz-security-token': cfg['session_token'],
+                   'Origin': 'https://www.douyin.com',
+                   'Referer': 'https://www.douyin.com/'}
+        if payload:
+            headers['x-amz-content-sha256'] = payload_hash
+            headers['Content-Type'] = 'text/plain;charset=UTF-8'
+            r = self.curl.post('https://vod.bytedanceapi.com/?' + qs,
+                               headers=headers, data=payload, timeout=30)
+        else:
+            # 实物为 GET（浏览器 Apply 无 body）；签名 canonical 也是 GET
+            r = self.curl.get('https://vod.bytedanceapi.com/?' + qs,
+                              headers=headers, timeout=30)
+        return r.json()
+
+    def upload_image(self, image_bytes):
+        """上传图片 → 图片消息 content dict（B2 五步链，2026-10-10 逆向）。
+
+        步骤：config v2(STS) → ApplyUploadInner(SigV4，下发 StoreUri+SpaceKey
+        JWT) → TOS 直传原始字节 → CommitUploadInner（服务端 AES-256-GCM
+        加密，返回加密 Uri/SecretKey）→ 组装 resource_url{oid,skey,md5}。
+        前置：send 凭据已装配（config 的 a_bogus/msToken/UA）。
+        """
+        import hashlib as _h
+        import random as _rd
+        md5 = _h.md5(image_bytes).hexdigest()
+        s = ''.join(_rd.choice('abcdefghijklmnopqrstuvwxyz0123456789')
+                    for _ in range(12))
+        apply_j = self._vod_request('ApplyUploadInner',
+                                    {'FileType': 'image', 'IsInner': '1',
+                                     'NeedFallback': 'true',
+                                     'FileSize': len(image_bytes), 's': s})
+        ua = (apply_j.get('Result') or {}).get('UploadAddress') or {}
+        si = (ua.get('StoreInfos') or [{}])[0]
+        store_uri, auth = si.get('StoreUri'), si.get('Auth')
+        session_key = ua.get('SessionKey') or ''
+        host = (ua.get('UploadHosts') or ['tos-nc2-slb2.douyin.com'])[0]
+        if not store_uri or not auth:
+            raise RuntimeError('ApplyUploadInner failed: %s' % str(apply_j)[:200])
+        if not host.startswith('http'):
+            host = 'https://' + host
+        up = self.curl.post('%s/upload/v1/%s' % (host.rstrip('/'), store_uri),
+                            headers={'Authorization': auth,
+                                     'Content-Type': 'application/octet-stream',
+                                     'content-crc32': '%08x' % (_zlib.crc32(image_bytes) & 0xffffffff),
+                                     'content-disposition': 'attachment; filename="undefined"',
+                                     'x-storage-u': str(self.uid or ''),
+                                     'Origin': 'https://www.douyin.com',
+                                     'Referer': 'https://www.douyin.com/'},
+                            data=image_bytes, timeout=60)
+        if up.status_code not in (200, 201):
+            raise RuntimeError('TOS upload failed: %s %s'
+                               % (up.status_code, up.text[:120]))
+        # Functions=Encryption：触发服务端 AES-256-GCM 加密（缺失则无 Encryption）
+        commit_body = json.dumps({
+            'SessionKey': session_key,
+            'Functions': [{'name': 'Encryption',
+                           'input': {'Config': {'copies': 'cipher_v2'},
+                                     'PolicyParams': {'policy-set': 'check,thumb,medium,large'}}}],
+        }).encode()
+        commit = self._vod_request('CommitUploadInner', {}, payload=commit_body)
+        results = ((commit.get('Result') or {}).get('Results') or [{}])
+        enc = results[0].get('Encryption') or {}
+        oid, skey = enc.get('Uri'), enc.get('SecretKey')
+        if not oid or not skey:
+            raise RuntimeError('CommitUploadInner failed: %s' % str(commit)[:200])
+        extra = enc.get('Extra') or {}
+        return {'resource_url': {'oid': oid, 'skey': skey,
+                                 'data_size': int(extra.get('encryption_size')
+                                                  or len(image_bytes)),
+                                 'md5': enc.get('SourceMd5') or md5},
+                'cover_height': int(extra.get('img_height') or 0),
+                'cover_width': int(extra.get('img_width') or 0),
+                'check_pics': [],
+                'md5': md5,
+                'from_gallery': 1,
+                'aweType': 2702}
+
+    def send_image(self, conv_id, image_bytes):
+        """发一张图片（upload_image 五步链 + msg_type=27 消息体）。"""
+        content = self.upload_image(image_bytes)
+        info = self._tickets.get(conv_id)
+        if not info or not info.get('ticket'):
+            raise RuntimeError('no ticket for %s' % conv_id)
+        inner, cmid = build_send_inner(
+            conv_id, int(info['conv_short_id']), info['ticket'], '',
+            msg_type=27,
+            content=json.dumps(content, ensure_ascii=False,
+                               separators=(',', ':')))
+        return self._dispatch_inner(conv_id, inner, cmid)
 
     def _dispatch_inner(self, conv_id, inner, cmid):
         """发送公共传输：identity token → 信封 → a_bogus → POST → 响应解析。
-        send()/send_media() 共用（守卫已在调用方完成）。"""
+        send()/send_media()/send_image() 共用（守卫已在调用方完成）。"""
         c = self._send_cred
         id_token, id_device = self.get_identity_token()
 

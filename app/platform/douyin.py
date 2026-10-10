@@ -317,31 +317,31 @@ class DouyinAdapter(PlatformAdapter):
         return out
 
     def send_media(self, sess, conv_id, attachments, text=''):
-        """发带载荷的消息（CAP_SEND_MEDIA）。当前支持 video_card：
-        站内视频转发——attachment 直接给 'content'（收到的卡片 JSON dict
-        原样重放）或 item_id/title/cover/author_uid 由 dyconnect 组装
-        aweType 800 卡片（10-10 发送抓包实物）。"""
+        """发带载荷的消息（CAP_SEND_MEDIA）。支持 video_card（站内转发）
+        与 image（data_b64 → upload 五步链 → msg_type=27 引用加密 oid）。"""
         info = sess._tickets.get(conv_id)
         if info and info.get('conv_short_id'):
             sess.refresh_conversation_info(
                 [(conv_id, int(info['conv_short_id']))])
         out = sess.send_media(conv_id, attachments, text=text)
-        # 本地回显（卡片消息 kind=media，载荷原样进缓存）
+        # 本地回显：载荷摘要进 init 缓存（服务器 msg_id 等下次 init 校正）
         msgs = getattr(sess, '_msgs', None)
         if msgs is not None:
-            att = next((dict(a) for a in (attachments or ())
-                        if a.get('type') == 'video_card'), None)
-            if att and not isinstance(att.get('content'), dict):
-                att = {k: v for k, v in att.items() if k != 'content'}
+            first = next((dict(a) for a in (attachments or [])
+                          if a.get('type') in ('video_card', 'image')), None)
+            if first and first.get('type') == 'image':
+                first = {'type': 'image', 'title': '[图片]'}   # 二进制不进缓存
+            elif first and not isinstance(first.get('content'), dict):
+                first = {k: v for k, v in first.items() if k != 'content'}
             msgs.setdefault(conv_id, []).append({
                 'conv_id': conv_id,
                 'msg_id': 'local-%d' % int(time.time() * 1000),
                 'conv_short_id': (info or {}).get('conv_short_id', 0),
                 'kind': 'media',
                 'sender_uid': str(sess.uid or ''),
-                'text': (att or {}).get('title') or '[媒体消息]',
+                'text': (first or {}).get('title') or '[媒体消息]',
                 'ms': int(time.time() * 1000),
                 'sender_sec_uid': '',
-                'attachments': ([att] if att else [])})
+                'attachments': ([first] if first else [])})
         out.setdefault('ok', True)
         return out
