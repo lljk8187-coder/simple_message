@@ -110,6 +110,14 @@ class Message:
       'media'    贴纸 / 图片 / 视频等非文本载荷
       'unknown'  未能识别（至少告诉用户"这不是空消息"）
     内核不解析平台细节，只按这个标签决定怎么显示。
+
+    attachments 是平台无关的载荷列表（A1 消息模型扩展，2026-10-10）：
+      [{'type': 'image'|'sticker'|'voice'|'video_card'|'card'|'link',
+        'url': 资源地址（前端 <img>/<audio> 可直接引用）,
+        'thumb': 缩略图（可选）, 'title': 标题（可选）,
+        'duration': 秒（语音用），...}]
+    适配器从平台原生结构提取，text 仍为人类可读摘要。存量适配器
+    不填即维持现状（向后兼容）。
     """
     platform: str
     account: str
@@ -121,6 +129,7 @@ class Message:
     ms: int = 0                      # 毫秒时间戳
     status: str = 'sent'
     kind: str = 'text'
+    attachments: tuple = ()          # 平台无关载荷（见类注释）
 
     def to_dict(self):
         return asdict(self)

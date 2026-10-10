@@ -229,7 +229,8 @@ class DouyinAdapter(PlatformAdapter):
                         sender=m['sender_uid'],
                         outgoing=1 if m['sender_uid'] == uid else 0,
                         text=m['text'], ms=m['ms'], status='sent',
-                        kind=m['kind'])
+                        kind=m['kind'],
+                        attachments=tuple(m.get('attachments') or ()))
                 for m in rows]
 
     # -------------------------------------------------------------- 写

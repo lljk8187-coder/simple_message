@@ -297,6 +297,54 @@ def _describe_media(content):
     return '[媒体消息]'
 
 
+def _dy_attachments(f6, content):
+    """从消息内容 JSON 提取平台无关载荷（A1，尽力而为：缺失字段即跳过）。
+
+    类型实测依据 init-resp-1010.bin 的 f6 分布：
+      17 语音 → resource_url.url_list + audio_duration
+      5/15 贴纸/大表情 → joker_stickers[].static_url
+      8/77/168 名片/视频卡 → content_name + content_thumb
+      105/110 视频分享 → aweme_title/comment + aweme_info.cover_url
+      60  外链卡片 → desc + icon
+    """
+    out = []
+
+    def _first_url(obj):
+        if not isinstance(obj, dict):
+            return ''
+        urls = obj.get('url_list') or []
+        return urls[0] if urls else (obj.get('uri') or '')
+
+    try:
+        if f6 == 17:                                   # 语音
+            u = _first_url(content.get('resource_url'))
+            if u:
+                out.append({'type': 'voice', 'url': u,
+                            'duration': int(content.get('audio_duration') or 0)})
+        elif f6 in (5, 15):                            # 贴纸 / 大表情
+            st = (content.get('joker_stickers') or [{}])[0]
+            u = _first_url(st.get('static_url'))
+            if u:
+                out.append({'type': 'sticker', 'url': u,
+                            'title': st.get('display_name') or ''})
+        elif f6 in (8, 77, 168):                       # 用户/视频名片卡
+            out.append({'type': 'card',
+                        'url': _first_url(content.get('content_thumb')),
+                        'title': content.get('content_name') or ''})
+        elif f6 in (105, 110):                         # 视频分享
+            info = content.get('aweme_info') or {}
+            u = _first_url(info.get('cover_url')) or _first_url(content.get('cover_url'))
+            out.append({'type': 'video_card', 'url': u,
+                        'title': content.get('aweme_title') or content.get('comment') or ''})
+        elif f6 == 60:                                 # 外链卡片
+            out.append({'type': 'link',
+                        'url': _first_url(content.get('icon')),
+                        'title': content.get('desc') or ''})
+    except Exception:
+        pass                                           # 载荷提取失败不影响消息本体
+    return out
+
+
 def parse_init_messages(body):
     """解析 init 响应中的消息记录（每会话容器 field2，重复，最近 ≤20 条）。
 
@@ -334,6 +382,8 @@ def parse_init_messages(body):
                 except ValueError:
                     content = {}
             kind = _MSG_KIND.get(pb.one(m, 6, 0), 'unknown')
+            msg_type = pb.one(m, 6, 0)
+            kind = _MSG_KIND.get(msg_type, 'unknown')
             text = content.get('text') or ''
             if kind != 'text' and not text and content:
                 text = _describe_media(content)
@@ -346,6 +396,7 @@ def parse_init_messages(body):
                 'text': text,
                 'ms': pb.one(m, 10, 0),
                 'sender_sec_uid': pb.text(pb.blob(m, 14)) or '',
+                'attachments': _dy_attachments(msg_type, content),
             })
     return out
 

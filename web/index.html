@@ -62,6 +62,16 @@
   .msg.sys{align-self:center;max-width:80%;text-align:center;font-size:11.5px;
            color:var(--fg3);padding:2px 10px}
   .meta{font-size:11px;color:var(--fg3);margin-top:3px}
+  .att-wrap{display:flex;flex-direction:column;gap:4px;max-width:240px}
+  .att-wrap img{max-width:200px;max-height:200px;border-radius:var(--r);
+                border:1px solid var(--line);display:block}
+  .att-wrap img.sticker{background:transparent;border:none}
+  .att.card{display:block;text-decoration:none;color:inherit;background:var(--in);
+            border:1px solid var(--line);border-radius:var(--r);overflow:hidden}
+  .att.card .att-title{padding:6px 9px;font-size:12.5px;line-height:1.35}
+  .att.voice{padding:8px 12px;border-radius:var(--r);background:var(--in);
+             border:1px solid var(--line);font-size:13px}
+  .att.voice a{color:inherit}
   .daysep{align-self:center;font-size:11.5px;color:var(--fg3);padding:6px 10px}
   .empty{margin:auto;color:var(--fg3);font-size:13px;text-align:center;padding:24px;line-height:1.9}
   .empty code{background:var(--panel);border:1px solid var(--line);padding:1px 5px;border-radius:5px;
@@ -460,7 +470,8 @@ async function loadAccounts(select) {
     } else if (a.platform === 'facebook') {
       o.textContent = (a.nickname || a.username || a.name) + ' · FB' + (a.writable ? ' · 可发' : ' · 未连');
     } else {
-      const mode = a.write_tier ? ' · 档位' + a.write_tier : ' · 只读';
+      const mode = a.write_tier ? ' · 档位' + a.write_tier
+                 : (a.writable ? ' · 可发' : ' · 只读');
       o.textContent = (a.nickname || a.username || a.name) + ' · ' + a.uid.slice(-6) + mode;
     }
     sel.appendChild(o);
@@ -656,8 +667,27 @@ function appendMsg(container, m){
   el.dataset.ms = m.ms;
   const label = (m.kind && m.kind !== 'text')
     ? (KIND_LABEL[m.kind] || `[非文本消息 ${m.kind}]`) : '';
-  const body = m.text || label || '(空)';
-  el.innerHTML = `<div class="bubble">${esc(body)}</div>
+  // attachments（A1 平台无关载荷）：图片/贴纸直接展示，卡片缩略+标题，语音条
+  let att = '';
+  (m.attachments || []).forEach(a => {
+    const u = a.url || a.thumb || '';
+    if (!u) return;
+    if (a.type === 'voice') {
+      att += `<div class="att voice">🎵 语音${a.duration ? ' ' + a.duration + '"' : ''} <a href="${esc(u)}" target="_blank" rel="noopener">收听</a></div>`;
+    } else if (a.type === 'sticker') {
+      att += `<img class="att sticker" src="${esc(u)}" loading="lazy" alt="">`;
+    } else if (a.type === 'card' || a.type === 'video_card' || a.type === 'link') {
+      const t = a.title ? `<div class="att-title">${esc(a.title)}</div>` : '';
+      att += u
+        ? `<a class="att card" href="${esc(u)}" target="_blank" rel="noopener"><img src="${esc(u)}" loading="lazy" alt="">${t}</a>`
+        : `<div class="att card"><div class="att-title">${esc(a.title)}</div></div>`;
+    } else {                                          // image 及未知类型
+      att += `<a href="${esc(u)}" target="_blank" rel="noopener"><img class="att" src="${esc(u)}" loading="lazy" alt=""></a>`;
+    }
+  });
+  const body = m.text || label || (att ? '' : '(空)');
+  el.innerHTML = `${att ? `<div class="att-wrap">${att}</div>` : ''}
+                  ${body ? `<div class="bubble">${esc(body)}</div>` : ''}
                   <div class="meta">${fmtTime(m.ms)}</div>`;
   container.appendChild(el);
 }
