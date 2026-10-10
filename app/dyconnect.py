@@ -191,18 +191,22 @@ def body_info_list(conv_pairs):
     return bytes(out)
 
 
-def build_send_inner(conv_id, conv_short_id, ticket, text, cmid=None, stime_ms=None):
+def build_send_inner(conv_id, conv_short_id, ticket, text, cmid=None, stime_ms=None,
+                     msg_type=7, content=None):
     """SendMessageRequestBody（field100 的载荷）。
 
     字段号与 jadx 反编译的 WireField 注解 + 抓包实物双重核对：
       1=conversation_id  2=conversation_type  3=conversation_short_id
       4=content(JSON)    5=repeated ext KV    6=message_type
       7=ticket           8=client_message_id
+    msg_type/content：默认 7=文本（aweType 700）。卡片消息传
+    msg_type=8（aweType 800 视频卡等，2026-10-10 发送抓包实物同构）。
     """
     cmid = cmid or str(uuid.uuid4())
     stime_ms = stime_ms or '%d' % int(time.time() * 1000)
-    content = json.dumps({'aweType': 700, 'type': 0, 'richTextInfos': [],
-                          'text': text}, ensure_ascii=False, separators=(',', ':'))
+    if content is None:
+        content = json.dumps({'aweType': 700, 'type': 0, 'richTextInfos': [],
+                              'text': text}, ensure_ascii=False, separators=(',', ':'))
     inner = bytearray()
     inner += pb.s(1, conv_id)
     inner += pb.vint(2, 1)                      # conversation_type = 1 (P2P)
@@ -211,10 +215,30 @@ def build_send_inner(conv_id, conv_short_id, ticket, text, cmid=None, stime_ms=N
     inner += _kv(5, 's:mentioned_users', '')
     inner += _kv(5, 's:client_message_id', cmid)
     inner += _kv(5, 's:stime', stime_ms)
-    inner += pb.vint(6, 7)                      # message_type = 7 (text)
+    inner += pb.vint(6, msg_type)
     inner += pb.s(7, ticket)
     inner += pb.s(8, cmid)
     return bytes(inner), cmid
+
+
+def video_card_content(item_id, title, cover_url='', author_uid=0,
+                       cover_w=1080, cover_h=1920):
+    """转发视频的卡片 content JSON（aweType 800；2026-10-10 发送抓包实物）。
+
+    keys 与实物逐项对照：aweType/content_title/cover_height/cover_width/
+    itemId/cover_url/content_thumb/uid。
+    """
+    cover_url = cover_url or ''
+    return {
+        'aweType': 800,
+        'content_title': title or '',
+        'cover_height': cover_h,
+        'cover_width': cover_w,
+        'itemId': str(item_id),
+        'cover_url': {'url_list': [cover_url]} if cover_url else {'url_list': []},
+        'content_thumb': {'url_list': [cover_url] if cover_url else []},
+        'uid': str(author_uid or 0),
+    }
 
 
 def parse_conversation_info(body):
@@ -355,7 +379,15 @@ def _dy_attachments(f6, content):
             info = content.get('aweme_info') or {}
             u = _first_url(info.get('cover_url')) or _first_url(content.get('cover_url'))
             out.append({'type': 'video_card', 'url': u,
-                        'title': content.get('aweme_title') or content.get('comment') or ''})
+                        'title': content.get('aweme_title') or content.get('description')
+                        or content.get('comment') or '',
+                        # 原始 content 与视频 id 留存：send_media 转发时重放
+                        'item_id': str(content.get('item_id')
+                                       or content.get('itemId')
+                                       or info.get('item_id') or ''),
+                        'author_uid': str(content.get('aweme_author_id')
+                                          or info.get('author_uid') or ''),
+                        'content': content})
         elif f6 == 60:                                 # 外链卡片
             out.append({'type': 'link',
                         'url': _first_url(content.get('icon')),
@@ -804,11 +836,54 @@ class DySession:
         if self.curl is None:
             raise RuntimeError('send requires the curl_cffi transport')
 
-        c = self._send_cred
-        short_id = int(info['conv_short_id'])
-        id_token, id_device = self.get_identity_token()
+        inner, cmid = build_send_inner(conv_id, int(info['conv_short_id']),
+                                       info['ticket'], text)
+        return self._dispatch_inner(conv_id, inner, cmid)
 
-        inner, cmid = build_send_inner(conv_id, short_id, info['ticket'], text)
+    def send_media(self, conv_id, attachments, text=''):
+        """发一条带载荷的消息（CAP_SEND_MEDIA；10-10 契约扩展）。
+
+        当前支持 type='video_card'（站内视频转发，msg_type=8 / aweType 800）：
+          attachment 提供 'content'（接收消息里的卡片 JSON dict，原样重放）
+          或 item_id/title/cover/author_uid（由 video_card_content 组装）。
+        自产内容（图片/文件）需平台上传链——独立立项，暂未支持。
+        """
+        if not getattr(self, '_send_cred', None):
+            raise RuntimeError('send credentials missing — call setup_send_credentials() '
+                               'after cookie harvest')
+        since_init = time.time() - getattr(self, '_init_at', 0)
+        if since_init < self.INIT_SETTLE_SECONDS:
+            raise RuntimeError('session warming up: %.0fs since init, send allowed '
+                               'after %ds' % (since_init, self.INIT_SETTLE_SECONDS))
+        info = self._tickets.get(conv_id)
+        if not info or not info.get('ticket'):
+            raise RuntimeError('no ticket for %s — call refresh_conversation_info '
+                               '([(conv_id, short_id)]) first' % conv_id)
+        if self.curl is None:
+            raise RuntimeError('send requires the curl_cffi transport')
+
+        for att in attachments or ():
+            if att.get('type') != 'video_card':
+                continue
+            content = att.get('content') if isinstance(att.get('content'), dict) else None
+            if content is None:
+                content = video_card_content(
+                    att.get('item_id') or '', att.get('title') or '',
+                    att.get('cover') or att.get('thumb') or '',
+                    att.get('author_uid') or 0)
+            inner, cmid = build_send_inner(
+                conv_id, int(info['conv_short_id']), info['ticket'], '',
+                msg_type=8,
+                content=json.dumps(content, ensure_ascii=False,
+                                   separators=(',', ':')))
+            return self._dispatch_inner(conv_id, inner, cmid)
+        raise ValueError("no sendable attachment — only type='video_card' supported")
+
+    def _dispatch_inner(self, conv_id, inner, cmid):
+        """发送公共传输：identity token → 信封 → a_bogus → POST → 响应解析。
+        send()/send_media() 共用（守卫已在调用方完成）。"""
+        c = self._send_cred
+        id_token, id_device = self.get_identity_token()
 
         global ENVELOPE_PARAMS
         saved = ENVELOPE_PARAMS

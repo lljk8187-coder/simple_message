@@ -57,7 +57,8 @@
 from dataclasses import dataclass, asdict
 
 __all__ = ['Account', 'Conversation', 'Message', 'Contact', 'PlatformAdapter',
-           'NeedCode', 'CAP_SEND', 'CAP_MARK_READ', 'CAP_REALTIME']
+           'NeedCode', 'CAP_SEND', 'CAP_SEND_MEDIA', 'CAP_MARK_READ',
+           'CAP_REALTIME']
 
 
 # ------------------------------------------------------------ 统一消息模型
@@ -154,6 +155,7 @@ class Contact:
 
 # 能力名常量（capabilities 用）
 CAP_SEND = 'send'
+CAP_SEND_MEDIA = 'send_media'    # 实现 send_media 的平台申报（10-10 契约扩展）
 CAP_MARK_READ = 'mark_read'
 CAP_REALTIME = 'realtime'
 
@@ -278,6 +280,20 @@ class PlatformAdapter:
     def send(self, sess, conv_id, text):
         """发一条文本消息。返回 {'ok': bool, ...平台细节（信任分等）}。"""
         raise NotImplementedError('%s 未实现 send' % (self.platform or '?'))
+
+    def send_media(self, sess, conv_id, attachments, text=''):
+        """发一条带载荷的消息（CAP_SEND_MEDIA 平台申报后 hub/前端才启用）。
+
+        attachments 与 Message.attachments 同构：
+          [{'type': 'image'|'video_card'|'voice'|'sticker'|'link'|'file',
+            'url': 资源引用（平台语义由适配器解释——可能是本地上传的
+                   载荷，也可能是站内引用如 aweme_id 对应的卡片）, ...}]
+        两类载荷，成本差一个量级（10-10 架构决议）：
+          - 站内引用（转发视频/分享）：消息体带引用，无上传链
+          - 自产内容（图片/文件）：适配器内部走平台上传端点后再引用
+        返回值同 send()。
+        """
+        raise NotImplementedError('%s 未实现 send_media' % (self.platform or '?'))
 
     def mark_read(self, sess, conv_id, read_index):
         """上报已读（CAP_MARK_READ 平台）。read_index 语义由适配器定义。"""

@@ -523,10 +523,22 @@ class Hub(_SyncHub):
                                               before_us=before_us)
         return stored, cursor, conv
 
-    def send(self, name, conv_id, text, audit=True):
+    def send(self, name, conv_id, text, audit=True, attachments=None):
         """统一发送入口。audit=False 供代发队列使用（它自己写 dispatch.* 审计，
-        否则一次群发会留下两份记录）。"""
+        否则一次群发会留下两份记录）。attachments 非空且适配器申报
+        CAP_SEND_MEDIA 时走 send_media（10-10 契约扩展）。"""
         plat = self._platform(name)
+        if attachments and plat != 'tiktok':
+            from .platform.base import CAP_SEND_MEDIA
+            ad = self.adapter(plat)
+            if CAP_SEND_MEDIA not in ad.capabilities:
+                return {'ok': False, 'error': '%s 不支持媒体发送' % plat}
+            sess = self.session(name)
+            res = ad.send_media(sess, conv_id, attachments, text=text)
+            if audit:
+                self._audit_send(name, conv_id, text or '[媒体]',
+                                 res if isinstance(res, dict) else {'ok': bool(res)})
+            return res
         if plat == 'tiktok':
             sess = self.sessions[name]
             conv = next((c for c in self.store.list_conversations(name)

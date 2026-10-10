@@ -288,9 +288,10 @@ class Handler(BaseHTTPRequestHandler):
         body = self._body()
         conv_id = (body.get('conv_id') or '').strip()
         text = (body.get('text') or '').strip()
-        if not conv_id or not text:
-            return self._json({'error': 'conv_id and text are required'}, 400)
-        self._json(self.hub.send(name, conv_id, text))
+        attachments = body.get('attachments') or None
+        if not conv_id or (not text and not attachments):
+            return self._json({'error': 'conv_id and (text or attachments) are required'}, 400)
+        self._json(self.hub.send(name, conv_id, text, attachments=attachments))
 
     def h_mark_read(self, q, name):
         """已读回执。效果在对方视角的"已读"标记——本地未读徽章仍由前端基线管理。"""

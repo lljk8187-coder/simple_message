@@ -31,7 +31,8 @@ import time
 
 from . import registry
 from .. import dyconnect
-from .base import (PlatformAdapter, Account, Conversation, Message, CAP_SEND)
+from .base import (PlatformAdapter, Account, Conversation, Message,
+                   CAP_SEND, CAP_SEND_MEDIA)
 
 
 @registry.register
@@ -39,7 +40,7 @@ class DouyinAdapter(PlatformAdapter):
     platform = 'douyin'
     display_name = '抖音'
     auth_kind = 'cookies'
-    capabilities = (CAP_SEND,)
+    capabilities = (CAP_SEND, CAP_SEND_MEDIA)   # 媒体当前支持 video_card（转发）
     # 保守申报：桌面客户端官方心跳 5s/发消息走用户手速；我们取 20s，
     # 与"账号存活 > 送达速度"原则一致（比 TikTok 的 8s 更保守，国内实名号）
     send_limits = {'min_interval_s': 20, 'daily_cap': 80}
@@ -312,5 +313,35 @@ class DouyinAdapter(PlatformAdapter):
                 'text': text,
                 'ms': int(time.time() * 1000),
                 'sender_sec_uid': ''})
+        out.setdefault('ok', True)
+        return out
+
+    def send_media(self, sess, conv_id, attachments, text=''):
+        """发带载荷的消息（CAP_SEND_MEDIA）。当前支持 video_card：
+        站内视频转发——attachment 直接给 'content'（收到的卡片 JSON dict
+        原样重放）或 item_id/title/cover/author_uid 由 dyconnect 组装
+        aweType 800 卡片（10-10 发送抓包实物）。"""
+        info = sess._tickets.get(conv_id)
+        if info and info.get('conv_short_id'):
+            sess.refresh_conversation_info(
+                [(conv_id, int(info['conv_short_id']))])
+        out = sess.send_media(conv_id, attachments, text=text)
+        # 本地回显（卡片消息 kind=media，载荷原样进缓存）
+        msgs = getattr(sess, '_msgs', None)
+        if msgs is not None:
+            att = next((dict(a) for a in (attachments or ())
+                        if a.get('type') == 'video_card'), None)
+            if att and not isinstance(att.get('content'), dict):
+                att = {k: v for k, v in att.items() if k != 'content'}
+            msgs.setdefault(conv_id, []).append({
+                'conv_id': conv_id,
+                'msg_id': 'local-%d' % int(time.time() * 1000),
+                'conv_short_id': (info or {}).get('conv_short_id', 0),
+                'kind': 'media',
+                'sender_uid': str(sess.uid or ''),
+                'text': (att or {}).get('title') or '[媒体消息]',
+                'ms': int(time.time() * 1000),
+                'sender_sec_uid': '',
+                'attachments': ([att] if att else [])})
         out.setdefault('ok', True)
         return out
