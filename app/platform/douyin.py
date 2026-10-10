@@ -322,6 +322,11 @@ class DouyinAdapter(PlatformAdapter):
         out.setdefault('ok', True)
         return out
 
+    def mark_read(self, sess, conv_id, read_index):
+        """抖音已读回执协议未逆向——空实现兜底。前端打开会话会调 mark_read，
+        基类默认抛 NotImplementedError 曾致每次打开会话服务端刷 500。"""
+        return {'ok': True, 'noop': True}
+
     def send_media(self, sess, conv_id, attachments, text=''):
         """发带载荷的消息（CAP_SEND_MEDIA）。支持 video_card（站内转发）
         与 image（data_b64 → upload 五步链 → msg_type=27 引用加密 oid）。"""
@@ -330,22 +335,23 @@ class DouyinAdapter(PlatformAdapter):
             sess.refresh_conversation_info(
                 [(conv_id, int(info['conv_short_id']))])
         out = sess.send_media(conv_id, attachments, text=text)
-        # 本地回显：载荷摘要进 init 缓存（服务器 msg_id 等下次 init 校正）
+        # 本地回显：载荷摘要进 init 缓存（服务器 msg_id 等下次 init 校正；
+        # WS 回声到达时 start_realtime 会按 local-* 清掉本条，不会重复显示）
         msgs = getattr(sess, '_msgs', None)
         if msgs is not None:
             first = next((dict(a) for a in (attachments or [])
                           if a.get('type') in ('video_card', 'image')), None)
             if first and first.get('type') == 'image':
-                first = {'type': 'image', 'title': '[图片]'}   # 二进制不进缓存
+                first = {'type': 'image'}   # 二进制不进缓存；无 url 前端显示 [图片] 标签
             elif first and not isinstance(first.get('content'), dict):
                 first = {k: v for k, v in first.items() if k != 'content'}
             msgs.setdefault(conv_id, []).append({
                 'conv_id': conv_id,
                 'msg_id': 'local-%d' % int(time.time() * 1000),
                 'conv_short_id': (info or {}).get('conv_short_id', 0),
-                'kind': 'media',
+                'kind': 'image' if (first or {}).get('type') == 'image' else 'media',
                 'sender_uid': str(sess.uid or ''),
-                'text': (first or {}).get('title') or '[媒体消息]',
+                'text': '',                 # 文案交给前端 KIND_LABEL，别写死
                 'ms': int(time.time() * 1000),
                 'sender_sec_uid': '',
                 'attachments': ([first] if first else [])})

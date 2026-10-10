@@ -333,16 +333,16 @@ def parse_init_conversations(body):
 # init 消息 f6 类型 → Message.kind（init-resp-1010.bin 167 条实测归纳；
 # 未收录类型一律 'unknown'，媒体类 text 带描述便于前端渲染）
 _MSG_KIND = {7: 'text', 1: 'tip', 5: 'media', 8: 'media', 15: 'media',
-             17: 'media', 21: 'media', 60: 'media', 77: 'media',
-             105: 'media', 110: 'media', 168: 'media'}
+             17: 'media', 21: 'media', 27: 'image', 60: 'media',
+             77: 'media', 105: 'media', 110: 'media', 168: 'media'}
 
 
-def _describe_media(content):
+def _describe_media(content, msg_type=0):
     for k in ('content_name', 'display_name', 'desc', 'hint_text', 'aweme_title'):
         v = content.get(k)
         if isinstance(v, str) and v:
             return '[媒体] %s' % v
-    return '[媒体消息]'
+    return '[图片]' if msg_type == 27 else '[媒体消息]'
 
 
 def _dy_attachments(f6, content):
@@ -394,6 +394,12 @@ def _dy_attachments(f6, content):
                         'author_uid': str(content.get('aweme_author_id')
                                           or info.get('author_uid') or ''),
                         'content': content})
+        elif f6 == 27:                                 # 图片（收方常带直链 url_list；
+            u = _first_url(content.get('resource_url'))  # 自己发的为 oid 加密引用，无直链）
+            if isinstance(u, str) and u.startswith('http'):
+                out.append({'type': 'image', 'url': u,
+                            'width': int(content.get('cover_width') or 0),
+                            'height': int(content.get('cover_height') or 0)})
         elif f6 == 60:                                 # 外链卡片
             out.append({'type': 'link',
                         'url': _first_url(content.get('icon')),
@@ -441,9 +447,12 @@ def _msg_record(m_b):
             elif fid == 10:
                 ms = ival
     kind = _MSG_KIND.get(msg_type, 'unknown')
+    atts = _dy_attachments(msg_type, content)
     text = content.get('text') or ''
-    if kind != 'text' and not text and content:
-        text = _describe_media(content)
+    # 占位文案只兜底"啥载荷都没提出来"的消息；提出来了（语音条/图片/卡片）
+    # 就不再挂 '[媒体消息]' 文字——前端附件已表意，多余文字纯属噪音
+    if kind != 'text' and not text and not atts and content:
+        text = _describe_media(content, msg_type)
     return {
         'conv_id': conv_id,
         'msg_id': str(msg_id),
@@ -454,7 +463,7 @@ def _msg_record(m_b):
         'ms': ms,
         'us': us,
         'sender_sec_uid': sec_uid,
-        'attachments': _dy_attachments(msg_type, content),
+        'attachments': atts,
     }
 
 
@@ -544,9 +553,10 @@ def parse_ws_push(frame, sess=None):
             return None
         msg_type = d[6][2] if 6 in d and d[6][1] == 0 else 0
         kind = _MSG_KIND.get(msg_type, 'unknown')
+        atts = _dy_attachments(msg_type, content)
         text = content.get('text') or ''
-        if kind != 'text' and not text and content:
-            text = _describe_media(content)
+        if kind != 'text' and not text and not atts and content:
+            text = _describe_media(content, msg_type)
         us = 0
         for fid in (10, 4):
             if fid in d and d[fid][1] == 0:
@@ -571,7 +581,7 @@ def parse_ws_push(frame, sess=None):
             'ms': us // 1000 if us else int(time.time() * 1000),
             'us': us,
             'sender_sec_uid': pb.text(d[14][3]) if 14 in d and d[14][1] == 2 else '',
-            'attachments': _dy_attachments(msg_type, content),
+            'attachments': atts,
         }
 
     # 规范路径（回环实物 ws-*.bin 验证）：top f8 > f6 > f500 > f5(重复) = 消息记录
@@ -683,9 +693,10 @@ def parse_gum(body):
                         except ValueError:
                             content = {}
                     kind = _MSG_KIND.get(msg_type, 'unknown')
+                    _atts = _dy_attachments(msg_type, content)
                     text = content.get('text') or ''
-                    if kind != 'text' and not text and content:
-                        text = _describe_media(content)
+                    if kind != 'text' and not text and not _atts and content:
+                        text = _describe_media(content, msg_type)
                     us = d[4][2] if 4 in d and d[4][1] == 0 else 0
                     out.append({
                         'conv_id': conv_id,
@@ -697,7 +708,7 @@ def parse_gum(body):
                         'ms': us // 1000 if us else 0,
                         'us': us,
                         'sender_sec_uid': '',
-                        'attachments': _dy_attachments(msg_type, content),
+                        'attachments': _atts,
                     })
                 except Exception:
                     bad += 1
@@ -1024,6 +1035,15 @@ class DySession:
                                             'conv_short_id': m['conv_short_id'],
                                             'ticket': ''}
                                     lst = sess._msgs.setdefault(cid, [])
+                                    # 自发消息的服务器回声到达：清掉发送时写的
+                                    # local-* 本地回显（msg_id 对不上，按 msg_id
+                                    # 去重无效，曾造成同一消息显示两条）
+                                    if m.get('sender_uid') == str(sess.uid or ''):
+                                        lst[:] = [
+                                            x for x in lst
+                                            if not (str(x.get('msg_id', '')).startswith('local-')
+                                                    and abs(int(x.get('ms') or 0)
+                                                            - int(m.get('ms') or 0)) < 120000)]
                                     if not any(x['msg_id'] == m['msg_id']
                                                for x in lst):
                                         lst.append(m)

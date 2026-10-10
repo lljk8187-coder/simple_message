@@ -711,7 +711,7 @@ function rebuildDaySeps(){
 // （TikTok 会把 "Message request accepted…" 这类系统提示混进消息流，
 //   贴纸/表情回应也不承载 text）。
 const KIND_LABEL = {reaction: '[表情回应]', media: '[贴纸 / 图片]',
-                    unknown: '[非文本消息]'};
+                    image: '[图片]', unknown: '[非文本消息]'};
 
 function appendMsg(container, m){
   // server echo of something we just sent -> upgrade the bubble already on screen
@@ -775,7 +775,9 @@ function appendMsg(container, m){
       att += `<a href="${esc(u)}" target="_blank" rel="noopener"><img class="att" src="${esc(u)}" loading="lazy" alt=""></a>`;
     }
   });
-  const body = m.text || label || (att ? '' : '(空)');
+  // 有附件时附件自身已表意（语音条/图片/卡片标题），不再挂标签或占位文字；
+  // 仅当附件一个都没渲染出来（如图片无直链）才回落到 label
+  const body = m.text || (att ? '' : (label || '(空)'));
   el.innerHTML = `${att ? `<div class="att-wrap">${att}</div>` : ''}
                   ${body ? `<div class="bubble">${esc(body)}</div>` : ''}
                   <div class="meta">${fmtTime(m.ms)}</div>`;
