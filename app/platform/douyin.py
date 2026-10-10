@@ -184,14 +184,12 @@ class DouyinAdapter(PlatformAdapter):
     def _refresh_cached(self, sess):
         """init → stranger 列表 → info_list，带 STRANGER_TTL_S 节流：
         陌生人端点超频 429，缓存期内直接信任上一次结果（存活检测延迟 ≤ TTL）。
-        距上次 init 超 INIT_REFRESH_S 时顺带重新 init——新常规会话与新消息
-        只随 init 下发；_init_at 随之重置（就绪窗保守语义）。"""
+        常规收信已由 gum 心跳实时接管（10-10 实时化）——init 仅在启动/
+        add_account 时做一次，不再周期重跑（每次 init 重置 8 分钟就绪窗）。"""
         now = time.time()
         cached = getattr(sess, '_conv_cache', None)
         if cached and now - getattr(sess, '_conv_at', 0) < self.STRANGER_TTL_S:
             return cached
-        if now - getattr(sess, '_init_at', 0) > self.INIT_REFRESH_S:
-            sess.init()
         convs = sess.refresh_conversations()
         sess._conv_cache = convs
         sess._conv_at = now

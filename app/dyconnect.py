@@ -20,6 +20,7 @@ import json
 import os
 import time
 import uuid
+import threading
 
 import shutil as _shutil
 import zlib as _zlib
@@ -68,6 +69,8 @@ CMD_STRANGER = 1001
 CMD_INFO = 610
 CMD_INIT = 2043            # 会话建立：启动后第一个请求，响应=全量初始化数据
 CMD_HISTORY = 301          # get_by_conversation：历史消息分页（10-10 逆向）
+CMD_GUM = 2048             # get_user_message：gum 心跳，实时增量收信（10-10 逆向）
+path_GUM = '/v1/message/get_user_message'
 
 # 用户资料端点（A2；web 端点，2026-10-10 抓包实物。webid/uifid 为设备级指纹，
 # 与登录会话无关，可复用）
@@ -482,6 +485,185 @@ def body_history(conv_id, conv_short_id, anchor_us, limit=50, direction=1):
             + pb.vint(5, int(anchor_us)) + pb.vint(6, limit))
 
 
+def _dump_ws(frame):
+    """WS 推送帧原文落盘（dy-recon/ws-push/），供格式迭代。"""
+    try:
+        import os as _os
+        d = r'D:\wbtools\workspace\dy-recon\ws-push'
+        _os.makedirs(d, exist_ok=True)
+        with open(_os.path.join(d, 'ws-%d.bin' % int(time.time() * 1000)),
+                  'wb') as f:
+            f.write(frame)
+    except Exception:
+        pass
+
+
+def parse_ws_push(frame, sess=None):
+    """frontier-im 推送帧 → 消息列表（best-effort，随实物迭代）。
+
+    帧为二进制 protobuf，内部包裹与 init/gum 记录同语义的字段集合
+    （f3=msg_id, f6=类型, f7=sender, f8=内容 JSON, f10=毫秒/f4=微秒）。
+    解析路径：递归找出全部"含内容 JSON 的记录"并按 conv_id 聚合；
+    解析失败返回 []，帧原文由 _dump_ws 留档供迭代。
+    """
+    out = []
+    seen_ids = set()
+
+    def from_record(fields, conv_id):
+        d = {}
+        for x in fields:
+            if x[0] not in d:
+                d[x[0]] = x
+        msg_type = d[6][2] if 6 in d and d[6][1] == 0 else 0
+        content_b = d[8][3] if 8 in d and d[8][1] == 2 else b''
+        if not content_b:
+            return None
+        try:
+            content = json.loads(pb.text(content_b) or '{}') or {}
+        except ValueError:
+            return None
+        mid = str(d[3][2] if 3 in d and d[3][1] == 0 else 0)
+        if mid in ('', '0'):
+            return None
+        kind = _MSG_KIND.get(msg_type, 'unknown')
+        text = content.get('text') or ''
+        if kind != 'text' and not text and content:
+            text = _describe_media(content)
+        us = 0
+        for fid in (10, 4):                     # init 记录 f10=毫秒，gum 记录 f4=微秒
+            if fid in d and d[fid][1] == 0:
+                v = d[fid][2]
+                if v > 1e15:
+                    us = v
+                elif v > 1e12:
+                    us = v * 1000
+                break
+        sid = d[5][2] if 5 in d and d[5][1] == 0 else 0
+        return {
+            'conv_id': conv_id or '',
+            'msg_id': mid,
+            'conv_short_id': sid,
+            'kind': kind,
+            'sender_uid': str(d[7][2] if 7 in d and d[7][1] == 0 else 0),
+            'text': text,
+            'ms': us // 1000 if us else int(time.time() * 1000),
+            'us': us,
+            'sender_sec_uid': pb.text(d[14][3]) if 14 in d and d[14][1] == 2 else '',
+            'attachments': _dy_attachments(msg_type, content),
+        }
+
+    def walk(data, conv_id, depth=0):
+        if depth > 10:
+            return
+        try:
+            fields = pb.parse(data) or ()
+        except Exception:
+            return
+        for f in fields:
+            fid, wt, ival, bval = f
+            if wt != 2 or not bval:
+                continue
+            if b'aweType' in bval or b'"text":"' in bval:
+                try:
+                    rec = from_record(pb.parse(bval), conv_id)
+                except Exception:
+                    rec = None
+                if rec and rec['msg_id'] not in seen_ids:
+                    seen_ids.add(rec['msg_id'])
+                    out.append(rec)
+                continue
+            if bval.startswith(b'0:1:') and b'"' not in bval[:1]:
+                conv_id = pb.text(bval)
+            walk(bval, conv_id, depth + 1)
+
+    walk(frame, None)
+    return out
+
+
+def body_gum(cursor_us, seq, now_us):
+    """gum（get_user_message, cmd 2048）业务体——10-10 实物（gum-req.bin）：
+    wrapper f2048 > { 1: 上次游标（微秒）, 2: 消息批计数器, 4: 当前时间（微秒）,
+    5: 空串 }。响应带回 f2={3: seq, 4: 游标} 供下一拍回填。"""
+    inner = (pb.vint(1, int(cursor_us)) + pb.vint(2, int(seq))
+             + pb.vint(4, int(now_us)) + pb.s(5, ''))
+    return pb.ld(2048, inner)
+
+
+def parse_gum(body):
+    """gum 响应 → {'messages': [...], 'cursor_us': int, 'seq': int}。
+
+    实物（gum-resp.bin，10-08 桌面抓包）布局：
+      top[6] > f2048 > {
+        1: 会话容器 { 1: 时间戳(us), 2: 每会话一批（重复） },
+        2: 游标 { 3: 批计数器 seq, 4: 游标（微秒） } }
+    每批: { 1: short_id, 5: conv_id, 2: 消息包装（重复） }
+    消息包装: { 3: msg_id, 4: 服务器时间(us), 6: 类型, 7: sender uid,
+                8: 内容 JSON }——与 init 记录同语义（f4 代替 f10，单位 us）。
+    解析失败的包装跳过并计数（格式以后如有漂移由 canary 的 protocol 类兜底）。
+    """
+    out, cursor_us, seq, bad = [], 0, 0, 0
+    try:
+        top = pb.parse(body)
+        biz = next(x[3] for x in top if x[0] == 6 and x[1] == 2)
+        g2048 = next(x[3] for x in pb.parse(biz) if x[0] == 2048 and x[1] == 2)
+        inner = pb.parse(g2048)
+    except Exception:
+        return {'messages': out, 'cursor_us': cursor_us, 'seq': seq, 'bad': bad}
+    f2seg = next((x[3] for x in inner if x[0] == 2 and x[1] == 2), None)
+    if f2seg:
+        for y in pb.parse(f2seg):
+            if y[0] == 3 and y[1] == 0:
+                seq = y[2]
+            elif y[0] == 4 and y[1] == 0:
+                cursor_us = y[2]
+    for cont in (x[3] for x in inner if x[0] == 1 and x[1] == 2):
+        for b in (x[3] for x in pb.parse(cont) if x[0] == 2 and x[1] == 2):
+            conv_id = short_id = None
+            wraps = []
+            for x in pb.parse(b):
+                if x[0] == 5 and x[1] == 2:
+                    conv_id = pb.text(x[3])
+                elif x[0] == 1 and x[1] == 0:
+                    short_id = x[2]
+                elif x[0] == 2 and x[1] == 2:
+                    wraps.append(x[3])
+            if not conv_id:
+                bad += len(wraps)
+                continue
+            for w in wraps:
+                try:
+                    m = pb.parse(w)
+                    d = {x[0]: x for x in m}
+                    msg_type = d[6][2] if 6 in d and d[6][1] == 0 else 0
+                    content_b = d[8][3] if 8 in d and d[8][1] == 2 else b''
+                    content = {}
+                    if content_b:
+                        try:
+                            content = json.loads(pb.text(content_b) or '{}') or {}
+                        except ValueError:
+                            content = {}
+                    kind = _MSG_KIND.get(msg_type, 'unknown')
+                    text = content.get('text') or ''
+                    if kind != 'text' and not text and content:
+                        text = _describe_media(content)
+                    us = d[4][2] if 4 in d and d[4][1] == 0 else 0
+                    out.append({
+                        'conv_id': conv_id,
+                        'msg_id': str(d[3][2] if 3 in d and d[3][1] == 0 else 0),
+                        'conv_short_id': short_id or (d[5][2] if 5 in d and d[5][1] == 0 else 0),
+                        'kind': kind,
+                        'sender_uid': str(d[7][2] if 7 in d and d[7][1] == 0 else 0),
+                        'text': text,
+                        'ms': us // 1000 if us else 0,
+                        'us': us,
+                        'sender_sec_uid': '',
+                        'attachments': _dy_attachments(msg_type, content),
+                    })
+                except Exception:
+                    bad += 1
+    return {'messages': out, 'cursor_us': cursor_us, 'seq': seq, 'bad': bad}
+
+
 def parse_history_page(body):
     """get_by_conversation 响应 → {'messages', 'cursor', 'has_more'}。
 
@@ -564,6 +746,11 @@ class DySession:
         self._tickets = {}       # conv_id(str) -> {'short_id': int, 'ticket': str}
         self._msgs = {}          # conv_id(str) -> [msg dict, ...]（ms 升序，init 填充）
         self._inited = False
+        self._gum_cursor = 0     # gum 游标（微秒，响应 f2.f4 回填）
+        self._gum_seq = 0        # gum 批计数器（响应 f2.f3 回填）
+        self._gum_seen = set()   # 已入库 msg_id（去重）
+        self._gum_stop = threading.Event()
+        self._gum_thread = None
 
     # ------------------------------------------------------------- transport
 
@@ -671,6 +858,148 @@ class DySession:
         """缓存中最旧消息的混淆微秒（历史翻页初始锚点；无消息返回 0）。"""
         rows = self._msgs.get(conv_id) or []
         return min((m['us'] for m in rows if m.get('us')), default=0)
+
+    def gum(self):
+        """一次 gum 心跳（cmd 2048）：拉增量消息并并入缓存。
+
+        返回本拍新消息列表（已按 _gum_seen 去重；拍内无新消息返回 []）。
+        游标/计数器从响应 f2 回填；响应原文带消息时存
+        dy-recon/gum-poll/ 供格式迭代。
+        """
+        if self.curl is None:
+            raise RuntimeError('gum requires the curl_cffi transport')
+        body = body_gum(self._gum_cursor or int(time.time() * 1e6),
+                        self._gum_seq, int(time.time() * 1e6))
+        # 2026-10-10 web 实物（gum-web-5941.json）：f2=10406 固定子号、
+        # 裸 URL（无 query/无 a_bogus）、基础头（无 ticket-guard）
+        env = envelope(CMD_GUM, sub=10406, body_field=2048, inner=body)
+        headers = {
+            'Accept': 'application/x-protobuf',
+            'Content-Type': 'application/x-protobuf',
+            'Origin': 'https://www.douyin.com',
+            'Referer': 'https://www.douyin.com/',
+            'Cookie': self.cookie,
+            'User-Agent': (self._send_cred or {}).get('ua')
+                          or 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                             ' (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36',
+            'sec-ch-ua': '"Chromium";v="154", "Google Chrome";v="154", "Not A(Brand";v="99"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"Windows"',
+        }
+        r = self.curl.post(IM_API + path_GUM, headers=headers, data=env, timeout=15)
+        raw = r.content
+        parsed = parse_gum(raw)
+        if parsed['cursor_us']:
+            self._gum_cursor = parsed['cursor_us']
+        if parsed['seq']:
+            self._gum_seq = parsed['seq']
+        fresh = []
+        for m in parsed['messages']:
+            if m['msg_id'] in self._gum_seen:
+                continue
+            self._gum_seen.add(m['msg_id'])
+            fresh.append(m)
+            cid = m['conv_id']
+            info = self._tickets.get(cid)
+            if info is None:
+                self._tickets[cid] = {'conv_id': cid,
+                                      'conv_short_id': m['conv_short_id'],
+                                      'ticket': ''}
+            lst = self._msgs.setdefault(cid, [])
+            lst.append(m)
+            lst.sort(key=lambda x: x['ms'])
+        if fresh:
+            try:
+                import os as _os
+                d = r'D:\wbtools\workspace\dy-recon\gum-poll'
+                _os.makedirs(d, exist_ok=True)
+                with open(_os.path.join(d, 'gum-%d.bin' % int(time.time())),
+                          'wb') as f:
+                    f.write(raw)
+            except Exception:
+                pass
+        return fresh
+
+    def _ws_push_url(self):
+        """frontier-im 推送长连接 URL（2026-10-10 逆向，公式字节级验证）：
+        access_key = md5(fpid + appKey + device_id + 'f8a69f1719916z')。
+        appKey=e1bd35ec9db7b8d846de66ed140b1ad9（ImEntryVmok 配置），fpid=9。"""
+        import hashlib as _h
+        fpid, appkey = '9', 'e1bd35ec9db7b8d846de66ed140b1ad9'
+        ak = _h.md5((fpid + appkey + str(self.uid or '') + 'f8a69f1719916z')
+                    .encode()).hexdigest()
+        return ('wss://frontier-im.douyin.com/ws/v2?device_platform=web'
+                '&version_code=fws_1.0.0&access_key=%s&fpid=%s&aid=6383'
+                '&device_id=%s&xsack=0&xaack=0&xsqos=0&qos_sdk_version=2'
+                % (ak, fpid, self.uid or ''))
+
+    def start_realtime(self, on_messages, interval=6.0):
+        """启动 frontier-im WebSocket 推送（实时收信正路）。
+
+        2026-10-10 实测定性：gum（cmd 2048）只是周期校验点——官方 web 客户端
+        自己的 gum 在消息到达后也返回空拍，消息实际由 frontier-im 长连接推送。
+        心跳协议：每 ~10s 发 2 字节文本帧 "hi"。推送帧格式首拍落盘
+        dy-recon/ws-push/ 后迭代解析；解析成功才回调 on_messages。
+        重复调用幂等；断线自动重连（5s 退避）。
+        """
+        if self._gum_thread and self._gum_thread.is_alive():
+            return
+        sess = self
+
+        def loop():
+            import select as _select
+            while not sess._gum_stop.wait(1):
+                ws = None
+                try:
+                    from curl_cffi.const import CurlInfo
+                    ws = sess.curl.ws_connect(
+                        sess._ws_push_url(),
+                        headers={'Origin': 'https://www.douyin.com',
+                                 'Cookie': sess.cookie,
+                                 'User-Agent': (sess._send_cred or {}).get('ua')
+                                 or 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'},
+                        impersonate='chrome',
+                        verify=_ascii_ca(), timeout=30)
+                    fd = ws.curl.getinfo(CurlInfo.ACTIVESOCKET)
+                    if fd in (None, -1):
+                        raise RuntimeError('ws no active socket')
+                    last_hi = time.time()
+                    while not sess._gum_stop.is_set():
+                        r, _, _ = _select.select([fd], [], [], 1.0)
+                        if r:
+                            data, op = ws.recv()
+                            if op == 8:            # close
+                                break
+                            if not data:
+                                continue
+                            fresh = parse_ws_push(data, sess)
+                            if fresh:
+                                _dump_ws(data)
+                                try:
+                                    on_messages(fresh)
+                                except Exception:
+                                    pass
+                        now = time.time()
+                        if now - last_hi >= 10:
+                            ws.send_str('hi')
+                            last_hi = now
+                except Exception as e:
+                    print('[dy-ws] 断线重连: %s' % e)
+                finally:
+                    try:
+                        if ws is not None:
+                            ws.close()
+                    except Exception:
+                        pass
+                if not sess._gum_stop.is_set():
+                    sess._gum_stop.wait(5)         # 重连退避
+
+        self._gum_thread = threading.Thread(target=loop, name='dy-ws-push',
+                                            daemon=True)
+        self._gum_thread.start()
+
+    def stop_realtime(self):
+        self._gum_stop.set()
 
     def get_history(self, conv_id, anchor_us, limit=50):
         """拉一页历史消息（cmd 301，10-10 逆向）。

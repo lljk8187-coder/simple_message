@@ -296,9 +296,38 @@ class Hub(_SyncHub):
                                          json.dumps(ad.session_dump(sess)), 'douyin')
         self.dy_sessions[name] = sess
         self.start_dy_sync(name, sess)
+        self._start_dy_realtime(name, sess)
         return {'ok': True, 'name': name, 'uid': acct.uid, 'platform': 'douyin',
                 'conversations': len(sess._conv_cache),
                 'note': 'init 占座生效：约 8 分钟内 send 会被服务端拒绝（就绪窗）'}
+
+    def _start_dy_realtime(self, name, sess):
+        """gum 心跳实时收信：新消息即时经 bus 推给前端（SSE 已有通路）。
+
+        未知会话（新对端）会临时入 _conv_cache 并触发 conversations 事件，
+        ticket 留空——首次回复该会话前由 conversations() 的 info_list 补齐。"""
+        ad = self.adapter('douyin')
+
+        def on_messages(fresh):
+            by_conv = {}
+            for m in fresh:
+                by_conv.setdefault(m['conv_id'], []).append(m)
+            new_conv = False
+            for cid, msgs in by_conv.items():
+                if not any(c.get('conv_id') == cid
+                           for c in (getattr(sess, '_conv_cache', None) or [])):
+                    info = sess._tickets.get(cid) or {}
+                    parts = cid.split(':')
+                    sess._conv_cache = (sess._conv_cache or []) + [{
+                        'conv_id': cid, 'conv_short_id': info.get('conv_short_id', 0),
+                        'ticket': info.get('ticket', ''),
+                        'peer_uid': parts[3] if len(parts) > 3 else ''}]
+                    new_conv = True
+                self.bus.publish({'type': 'message', 'account': name,
+                                  'conv_id': cid, 'messages': msgs})
+            self.bus.publish({'type': 'conversations', 'account': name})
+
+        sess.start_realtime(on_messages)
 
     # ---------------------------------------------------- 启动恢复
 
@@ -353,6 +382,7 @@ class Hub(_SyncHub):
                     sess = self.adapter('douyin').session_load(saved)
                     self.dy_sessions[name] = sess
                     self.start_dy_sync(name, sess)
+                    self._start_dy_realtime(name, sess)
                 else:
                     continue
             except Exception as e:
