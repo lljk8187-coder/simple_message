@@ -236,7 +236,8 @@ class TikTokAdapter(PlatformAdapter):
                         outgoing=1 if r.get('outgoing') else 0,
                         text=r.get('text') or '', ms=int(r.get('ms') or 0),
                         status='sent',
-                        kind=r.get('kind') or 'text')
+                        kind=r.get('kind') or 'text',
+                        attachments=tuple(r.get('attachments') or ()))
                 for r in rows]
 
     def poll(self, sess, state):
@@ -251,7 +252,8 @@ class TikTokAdapter(PlatformAdapter):
                          outgoing=1 if m.get('outgoing') else 0,
                          text=m.get('text') or '', ms=int(m.get('ms') or 0),
                          status='sent',
-                         kind=m.get('kind') or 'text')
+                         kind=m.get('kind') or 'text',
+                         attachments=tuple(m.get('attachments') or ()))
             events.append({'type': 'message', **md.to_dict()})
         return events, str(cursor)
 

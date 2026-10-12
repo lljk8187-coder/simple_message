@@ -218,30 +218,48 @@ class Handler(BaseHTTPRequestHandler):
                     'drift': sorted({n for n, v in snap.items() if v['protocol_drift']})})
 
     def h_img(self, q):
-        """收图解密代理（10-12 实测逆向）：TOS CDN 存的是 AES-256-GCM 密文，
-        浏览器 <img> 直接加载只会拿到乱码。本端点下载密文 → 解密 → 回明文图片。
-        u=b64url(图片URL，host 必须抖音图床)，k=skey(hex64，来自消息 content)。
-        磁盘缓存 data/imgcache/<md5(url)>.img，同一张图只下载解密一次。"""
+        """收图解密代理（10-12 实测逆向，抖音/TikTok 同构）：CDN 存的是
+        AES-256-GCM 密文（nonce=前12B），下载 → 解密 → 回明文图片。
+        u=b64url(图片URL)；k=解密密钥(hex64)；acct=账号名（TikTok 私有 CDN
+        必须带登录会话 cookie，按 acct 从库里取）。
+        域名白名单：*.douyinpic.com（抖音）/ *.tiktok.com（TikTok）。
+        磁盘缓存 data/imgcache/<md5(acct|url)>.img，同一张图只下载解密一次。"""
         import base64, hashlib
         u = (q.get('u') or [''])[0]
         k = (q.get('k') or [''])[0]
+        acct = (q.get('acct') or [''])[0]
         try:
             url = base64.urlsafe_b64decode(u + '=' * (-len(u) % 4)).decode()
         except Exception:
             return self._json({'error': 'bad u'}, 400)
         host = urllib.parse.urlparse(url).hostname or ''
-        if not (host == 'douyinpic.com' or host.endswith('.douyinpic.com')):
+        is_douyin = host == 'douyinpic.com' or host.endswith('.douyinpic.com')
+        is_tiktok = host.endswith('.tiktok.com')
+        if not (is_douyin or is_tiktok):
             return self._json({'error': 'host not allowed'}, 403)   # SSRF 护栏
         if not re.fullmatch(r'[0-9a-f]{64}', k):
             return self._json({'error': 'bad k'}, 400)
         cache = os.path.join(self.img_cache_dir,
-                             hashlib.md5(url.encode()).hexdigest() + '.img')
+                             hashlib.md5((acct + '|' + url).encode()).hexdigest()
+                             + '.img')
         if os.path.exists(cache) and os.path.getsize(cache):
             data = open(cache, 'rb').read()
         else:
             try:
                 from .dyconnect import decrypt_image_bytes
-                data = decrypt_image_bytes(url, k, proxy=self.client.proxy)
+                headers = None
+                if is_tiktok:
+                    # TikTok 私有 CDN 校验登录身份：必须带该账号的会话 cookie
+                    if not acct:
+                        return self._json({'error': 'acct required for tiktok'}, 400)
+                    full = self.store.get_account(acct) or {}
+                    headers = {'Accept': 'image/avif,image/webp,image/apng,'
+                                         'image/*,*/*;q=0.8',
+                               'Origin': 'https://www.tiktok.com',
+                               'Referer': 'https://www.tiktok.com/messages?lang=en',
+                               'Cookie': full.get('cookie') or ''}
+                data = decrypt_image_bytes(url, k, proxy=self.client.proxy,
+                                           headers=headers)
             except Exception as e:
                 return self._json({'error': 'fetch/decrypt failed: %s' % e}, 502)
             os.makedirs(os.path.dirname(cache), exist_ok=True)

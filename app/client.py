@@ -300,6 +300,36 @@ def parse_message(entry, my_uid):
         kind = 'media'
     else:
         kind = 'unknown'
+
+    # f24 private media（10-12 借鉴 matrix-tiktok 逆向）：手机发的图片/语音，
+    # 服务端对 web 通道把 f8 content 换成占位 {"hack":"1"}，但媒体附件在
+    # f24：{decrypt_key=3, variants=20[{label=1, url=2 重复}]}。
+    # private_image 的 full 档 CDN 密文用 decrypt_key AES-256-GCM 解密
+    # （nonce=前12B，与抖音图片同构）；private_video 的 URL 直接可播。
+    atts = []
+    subtype = pb.text(pb.blob(it, 21)) or ''
+    f24 = pb.blob(it, 24)
+    if f24:
+        att = pb.parse(f24)
+        dkey = pb.text(pb.blob(att, 3)) or ''
+        full = thumb = ''
+        for _, _, _, vbl in pb.all_of(att, 20):
+            v = pb.parse(vbl)
+            label = pb.text(pb.blob(v, 1)) or ''
+            for x in v:
+                if x[0] == 2 and x[1] == 2:
+                    u = pb.text(x[3]) or ''
+                    if label == 'full' and not full:
+                        full = u
+                    if label == 'preview' and not thumb:
+                        thumb = u
+        if subtype == 'private_image' and full and dkey:
+            import base64 as _b64
+            uenc = _b64.urlsafe_b64encode(full.encode()).decode().rstrip('=')
+            atts.append({'type': 'image',
+                         'url': '/api/img?u=%s&k=%s' % (uenc, dkey),
+                         'thumb': thumb})
+            kind = 'media'
     return {
         'msg_id': str(pb.one(it, 3) or ''),
         'conv_id': pb.text(pb.blob(it, 1)) or '',
@@ -311,6 +341,7 @@ def parse_message(entry, my_uid):
         'ms': int(millis),
         'us': int(micros),
         'ext': ext,
+        'attachments': tuple(atts),
         # the id we generated when sending; lets a client match its own optimistic
         # bubble against the message that eventually comes back from the server
         'cid': ext.get('s:client_message_id') or '',

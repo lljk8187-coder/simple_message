@@ -563,6 +563,12 @@ class Hub(_SyncHub):
             self.store.save_messages(name, fetched)
             stored = self.store.list_messages(name, conv_id, limit=limit,
                                               before_us=before_us)
+        # TikTok 私有媒体代理需要账号会话 cookie：附件的 /api/img URL 补 acct
+        for m in stored:
+            for a in (m.get('attachments') or []):
+                u = a.get('url') or ''
+                if u.startswith('/api/img') and 'acct=' not in u:
+                    a['url'] = u + '&acct=' + name
         return stored, cursor, conv
 
     def _msgs_other(self, plat, name, conv_id, before_us, limit):

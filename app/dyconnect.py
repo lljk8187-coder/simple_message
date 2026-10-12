@@ -374,6 +374,10 @@ def _dy_attachments(f6, content):
         elif f6 in (5, 15):                            # 贴纸 / 大表情
             st = (content.get('joker_stickers') or [{}])[0]
             u = _first_url(st.get('static_url'))
+            if not u:
+                # 收藏/推荐表情（10-12 实测 aweType 501/510）：无 joker_stickers，
+                # 直链在 content.url.url_list（明文 douyinpic 签名链，非加密）
+                u = _first_url(content.get('url'))
             if u:
                 out.append({'type': 'sticker', 'url': u,
                             'title': st.get('display_name') or ''})
@@ -426,18 +430,22 @@ def _dy_attachments(f6, content):
     return out
 
 
-def decrypt_image_bytes(url, skey_hex, proxy=None):
-    """下载 TOS 图片密文并解密（10-12 实测逆向）。
+def decrypt_image_bytes(url, skey_hex, proxy=None, headers=None):
+    """下载 TOS 图片密文并解密（10-12 实测逆向，抖音/TikTok 同构）。
 
-    CDN 上存的是 AES-256-GCM 密文：key=resource_url.skey(hex)，
+    CDN 上存的是 AES-256-GCM 密文：key=skey/decrypt_key（hex），
     nonce=密文前 12B，tag=尾 16B，明文为 WEBP/JPEG。
     必须用 curl_cffi chrome 指纹——urllib 的 TLS 指纹会被 CDN 拒，
-    且系统环境变量代理不可信（宿主内部通道）。"""
+    且系统环境变量代理不可信（宿主内部通道）。
+    headers：TikTok 私有 CDN 需要 Origin/Referer + 登录会话 cookie。"""
     if curl_requests is None:
         raise RuntimeError('curl_cffi required for image decryption')
-    with curl_requests.Session(impersonate='chrome', proxy=proxy,
-                               verify=_ascii_ca()) as s:
-        r = s.get(url, timeout=20)
+    kw = {'impersonate': 'chrome', 'proxy': proxy, 'verify': _ascii_ca(),
+          'timeout': 30}
+    if headers:
+        kw['headers'] = headers
+    with curl_requests.Session(**kw) as s:
+        r = s.get(url)
     ct = r.content
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     # 布局实测：nonce=密文前 12B，其后=密文体+GCM tag(16B) 连体（cryptography

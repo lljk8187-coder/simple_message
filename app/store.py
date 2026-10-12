@@ -176,6 +176,7 @@ class Store:
         with self._lock:
             self._db.executescript(SCHEMA)
             self._migrate()
+            self._ensure_attachments_col()
             self._db.commit()
 
     @staticmethod
@@ -344,6 +345,14 @@ class Store:
                 self._db.execute(sql, (name,))
             self._db.commit()
 
+    def _ensure_attachments_col(self):
+        """messages.attachments JSON 列（TikTok 媒体渲染，10-12）。幂等迁移。"""
+        try:
+            self._db.execute('ALTER TABLE messages ADD COLUMN attachments TEXT')
+            self._db.commit()
+        except Exception:
+            pass  # 列已存在
+
     # ---------------------------------------------------------- profiles
 
     def get_profiles(self, account):
@@ -464,13 +473,15 @@ class Store:
                 self._db.execute(
                     """INSERT OR IGNORE INTO messages
                          (account, conv_id, msg_id, sender, outgoing, text, ms, us,
-                          awe_type, kind, cid)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                          awe_type, kind, cid, attachments)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (account, m.get('conv_id', ''), m['msg_id'], m.get('sender', ''),
                      1 if m.get('outgoing') else 0, m.get('text', ''), m.get('ms') or 0,
                      m.get('us') or 0, m.get('awe_type') or 0,
                      m.get('kind') or 'text',
-                     (m.get('ext') or {}).get('s:client_message_id')))
+                     (m.get('ext') or {}).get('s:client_message_id'),
+                     json.dumps(list(m.get('attachments') or ()),
+                                ensure_ascii=False) or None))
                 fresh.append(m)
             self._db.commit()
         return fresh
@@ -485,7 +496,18 @@ class Store:
         args.append(int(limit))
         with self._lock:
             rows = self._db.execute(sql, args).fetchall()
-        return [dict(r) for r in reversed(rows)]
+        out = []
+        for r in rows:
+            d = dict(r)
+            if d.get('attachments'):
+                try:
+                    d['attachments'] = json.loads(d['attachments'])
+                except ValueError:
+                    d['attachments'] = []
+            else:
+                d['attachments'] = []
+            out.append(d)
+        return list(reversed(out))
 
     def latest_message(self, account, conv_id):
         """Newest message of a conversation — read_index source for mark_read."""

@@ -123,6 +123,15 @@ class Hub:
         while not self._stop.is_set() and time.monotonic() < end:
             time.sleep(min(0.2, max(0.0, end - time.monotonic())))
 
+    def _stamp_acct(self, name, msgs):
+        """TikTok 私有媒体附件的 /api/img URL 补 acct 参数（解密代理需要
+        对应账号的会话 cookie；库内存无 acct，运行时注入）。"""
+        for m in msgs or []:
+            for a in (m.get('attachments') or []):
+                u = a.get('url') or ''
+                if u.startswith('/api/img') and 'acct=' not in u:
+                    a['url'] = u + '&acct=' + name
+
     def _sync_one(self, name):
         sess = self.sessions.get(name)
         if not sess:
@@ -156,6 +165,7 @@ class Hub:
                     self.store.apply_unread(name, unread)
                     self.bus.publish({'type': 'conversations', 'account': name})
                 if messages:
+                    self._stamp_acct(name, messages)
                     self.store.save_messages(name, messages)
                     grouped = {}
                     for m in messages:
@@ -193,6 +203,7 @@ class Hub:
         # those too: it is what surfaces new messages in conversations we do not
         # poll individually (anything outside the most-recent N).
         fresh = self.store.save_messages(name, [c['last'] for c in convs if c.get('last')])
+        self._stamp_acct(name, fresh)
         if fresh:
             grouped = {}
             for m in fresh:
@@ -236,6 +247,7 @@ class Hub:
             self._set_status(name, 'warn', 'message poll failed: %s' % e)
             return []
         fresh = self.store.save_messages(name, msgs)
+        self._stamp_acct(name, fresh)
         if fresh:
             self.store.save_conversations(name, [{
                 'conv_id': conv_id, 'short_id': short_id,
