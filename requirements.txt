@@ -1,0 +1,13 @@
+# 核心依赖（hub 主程序与抖音通道必装）
+curl_cffi>=0.16          # TLS 指纹对齐官方客户端的 HTTP/WS 传输（全平台）
+cryptography>=42         # AES-256-GCM 图片解密 / bd-ticket-guard ECDH
+certifi                  # ASCII 路径 CA 链（Windows 中文用户名兼容）
+
+# 各平台适配器（按需安装）
+playwright>=1.40         # tiktok：受控浏览器扫码登录与凭据收割
+twikit                   # x：社区库（上游已停更，当前可用）
+instagrapi               # instagram
+fbchat-v2                # facebook：fbchat 的维护 fork
+
+# 安装：pip install -r requirements.txt
+# 仅用抖音通道时，前三个即可运行。

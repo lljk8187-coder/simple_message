@@ -756,6 +756,16 @@ function appendMsg(container, m){
            + `<audio controls preload="none" src="${esc(u)}"></audio></div>`;
       return;
     }
+    if (a.type === 'image') {
+      // 图片：代理直链内联显示；带 content（转发原料）时挂转发按钮，同视频卡
+      let fwd = '';
+      if (a.content) {
+        FWD_POOL[m.msg_id] = a;
+        fwd = `<button class="att-fwd" data-mid="${esc(m.msg_id)}">↗ 转发</button>`;
+      }
+      att += `<a href="${esc(u)}" target="_blank" rel="noopener"><img class="att" src="${esc(u)}" loading="lazy" alt=""></a>${fwd}`;
+      return;
+    }
     if (!u && !a.link) return;
     if (a.type === 'sticker') {
       att += `<img class="att sticker" src="${esc(u)}" loading="lazy" alt="">`;

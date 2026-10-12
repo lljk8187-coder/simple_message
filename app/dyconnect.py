@@ -414,7 +414,9 @@ def _dy_attachments(f6, content):
                     out.append({'type': 'image',
                                 'url': '/api/img?u=%s&k=%s' % (uenc, sk),
                                 'width': int(content.get('cover_width') or 0),
-                                'height': int(content.get('cover_height') or 0)})
+                                'height': int(content.get('cover_height') or 0),
+                                # 转发原料：content 原样重放即转发（10-12）
+                                'content': content})
         elif f6 == 60:                                 # 外链卡片
             out.append({'type': 'link',
                         'url': _first_url(content.get('icon')),
@@ -1345,16 +1347,26 @@ class DySession:
                     content=json.dumps(content, ensure_ascii=False,
                                        separators=(',', ':')))
                 return self._dispatch_inner(conv_id, inner, cmid)
-            if att.get('type') == 'image' and att.get('data_b64'):
-                import base64 as _b64
-                image = _b64.b64decode(att['data_b64'])
-                content = self.upload_image(image)
-                inner, cmid = build_send_inner(
-                    conv_id, int(info['conv_short_id']), info['ticket'], '',
-                    msg_type=27,
-                    content=json.dumps(content, ensure_ascii=False,
-                                       separators=(',', ':')))
-                return self._dispatch_inner(conv_id, inner, cmid)
+            if att.get('type') == 'image':
+                if isinstance(att.get('content'), dict):
+                    # 图片转发：原样重放接收消息的 content（含 oid/skey 引用，
+                    # 同 video_card 重放模式，10-12）——不重新上传
+                    inner, cmid = build_send_inner(
+                        conv_id, int(info['conv_short_id']), info['ticket'], '',
+                        msg_type=27,
+                        content=json.dumps(att['content'], ensure_ascii=False,
+                                           separators=(',', ':')))
+                    return self._dispatch_inner(conv_id, inner, cmid)
+                if att.get('data_b64'):
+                    import base64 as _b64
+                    image = _b64.b64decode(att['data_b64'])
+                    content = self.upload_image(image)
+                    inner, cmid = build_send_inner(
+                        conv_id, int(info['conv_short_id']), info['ticket'], '',
+                        msg_type=27,
+                        content=json.dumps(content, ensure_ascii=False,
+                                           separators=(',', ':')))
+                    return self._dispatch_inner(conv_id, inner, cmid)
         raise ValueError("no sendable attachment — supported: video_card / image")
 
     # ------------------------------------------------- 图片上传（B2，VOD 五步链）
