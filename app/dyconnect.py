@@ -1217,7 +1217,9 @@ class DySession:
 
     # ------------------------------------------------------------------- 发送
 
-    INIT_SETTLE_SECONDS = 480   # init 后服务端会话就绪窗口（实测 5-8 分钟）
+    INIT_SETTLE_SECONDS = 0     # 10-12 实验证实服务端不设就绪窗：init 后 8s/40s/70s
+                                # 发送均 ok(status_code=0)。原 480s 锁是早期误加
+                                # （把 ticket/凭据类失败误判成时间窗），已归零
 
     def send(self, conv_id, text):
         """发一条文本（全签名链）。
