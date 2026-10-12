@@ -94,6 +94,7 @@ class Conversation:
     last_ms: int = 0                 # 最新活动时间（毫秒）
     last_from_me: int = 0            # 最新一条是否本方发出
     unread: int = 0                  # 未读提示数（前端本地基线管理）
+    conv_type: int = 1               # 1=私聊 2=群聊（0=未知/未判定）
 
     def to_dict(self):
         return asdict(self)
@@ -131,6 +132,7 @@ class Message:
     status: str = 'sent'
     kind: str = 'text'
     attachments: tuple = ()          # 平台无关载荷（见类注释）
+    conv_type: int = 1               # 1=私聊 2=群聊（0=未知/未判定）
 
     def to_dict(self):
         return asdict(self)

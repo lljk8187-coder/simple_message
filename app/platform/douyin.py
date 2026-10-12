@@ -223,11 +223,21 @@ class DouyinAdapter(PlatformAdapter):
             conv_msgs = msgs.get(cid) or []
             last = conv_msgs[-1] if conv_msgs else None
             prof = profiles.get(sec_by_conv.get(cid, ''), {})
+            # 群会话（conv_type=2，conv_id 为纯数字）：昵称=群名、头像=群头像，
+            # 对端 uid 无意义。私聊昵称缺失时回退 peer_uid。
+            is_group = (c.get('conv_type') or 0) == 2
+            nick = (c.get('group_name') if is_group else '') or \
+                prof.get('nickname', '') or peer
+            if not (c.get('group_name') if is_group else '') and peer == uid:
+                nick = '我自己（文件/草稿）'   # 0:1:A:A 自己会话（10-12 实测无昵称）
+            avatar = (c.get('group_avatar') if is_group else '') or \
+                prof.get('avatar', '')
             out.append(Conversation(platform='douyin', account='',
                                     conv_id=cid,
                                     peer_uid=peer,
-                                    peer_nickname=prof.get('nickname', ''),
-                                    peer_avatar=prof.get('avatar', ''),
+                                    peer_nickname=nick,
+                                    peer_avatar=avatar,
+                                    conv_type=2 if is_group else 1,
                                     last_text=(last or {}).get('text', ''),
                                     last_ms=(last or {}).get('ms', 0),
                                     last_from_me=1 if last and last.get('sender_uid') == uid else 0,

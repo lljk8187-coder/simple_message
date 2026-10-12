@@ -271,16 +271,40 @@ def parse_conversation_info(body):
         if not m:
             continue
         conv_id = pb.text(pb.blob(m, 1))
-        if not conv_id or ':1:' not in conv_id:
-            continue
+        if not conv_id:
+            continue    # 群会话（纯数字 conv_id）也走这里——10-12 去掉 ':1:' 过滤
         short_id = pb.one(m, 2, 0)
         detail = pb.blob(m, 50)
         if detail and not short_id:
             short_id = pb.one(pb.parse(detail), 2, 0)
+        # f50 群详情（10-12 实测）：f3=类型(2=群)，f5=群名，f42 重复 metadata
+        # 含 a:public_group_avatar_meta → 群头像 URL。单聊该块 f3=1。
+        conv_type, group_name, group_avatar = 1, '', ''
+        if detail:
+            df = pb.parse(detail)
+            conv_type = pb.one(df, 3, 1)
+            gname = pb.text(pb.blob(df, 5))
+            if conv_type == 2 and gname:
+                group_name = gname
+            for _, _, _, mbl in pb.all_of(df, 42):
+                mb = pb.parse(mbl)
+                if not mb:
+                    continue
+                kb = pb.blob(mb, 1)
+                k = (pb.text(kb) or '') if kb is not None else ''
+                if 'avatar' not in k:
+                    continue
+                for _, _, _, vb in pb.all_of(mb, 2):
+                    v = pb.text(vb) or ''
+                    if v.startswith('http'):
+                        group_avatar = v
         out.append({
             'conv_id': conv_id,
             'conv_short_id': short_id,
             'ticket': pb.text(pb.blob(m, 4)) or '',
+            'conv_type': conv_type,
+            'group_name': group_name,
+            'group_avatar': group_avatar,
         })
     return out
 
@@ -326,6 +350,9 @@ def parse_init_conversations(body):
             'conv_short_id': pb.one(core, 2, 0),
             'ticket': pb.text(pb.blob(core, 4)) or '',
             'msg_count': sum(1 for _ in pb.all_of(ct, 2)),
+            # 会话类型（10-12 实测）：core.f3 = 1 单聊 / 2 群聊；conv_id 形态
+            # 相关（群为纯数字短 ID，单聊 '0:1:A:B'，A/B 为 min/max 排序位）
+            'conv_type': pb.one(core, 3, 0),
         })
     return out
 

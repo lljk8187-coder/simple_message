@@ -555,7 +555,10 @@ function renderConvs(){
     (c.last_text||'').toLowerCase().includes(kw));
   if (!list.length) { box.innerHTML = '<div class="empty">' + (kw ? '没有匹配的会话' : '暂无会话') + '</div>'; return; }
   list.forEach(c => {
-    const name = c.peer_nickname || c.peer_unique || ('uid ' + c.peer_uid);
+    // 群会话（conv_type=2）：名字加群标识，帮助区分个人/群
+    const dispName = (c.conv_type === 2 ? '[群] ' : '') +
+        (c.peer_nickname || c.peer_unique || ('uid ' + c.peer_uid));
+    const name = dispName;
     // badge = server unread minus what was on screen when the user opened this
     // conversation. We never send read receipts, so the server count alone would
     // keep showing 41 forever; the baseline is the local "already seen" marker.
@@ -580,7 +583,8 @@ async function openConv(c){
   if (!c) return;
   CUR = c; SEEN = new Set(); LAST_REQUESTED_US = null;
   SEEN_BASE[c.conv_id] = c.unread || 0;   // opening = seen, locally
-  $('#chatTitle').textContent = c.peer_nickname || c.peer_unique || ('uid ' + c.peer_uid);
+  $('#chatTitle').textContent = (c.conv_type === 2 ? '[群] ' : '') +
+      (c.peer_nickname || c.peer_unique || ('uid ' + c.peer_uid));
   $('#chatSub').textContent = `uid ${c.peer_uid}${c.short_id ? ' · short_id ' + c.short_id : ''}`;
   $('#text').disabled = $('#sendBtn').disabled = false;
   $('#imgBtn').disabled = false;
