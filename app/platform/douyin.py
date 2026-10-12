@@ -219,17 +219,20 @@ class DouyinAdapter(PlatformAdapter):
         for c in convs:
             cid = c['conv_id']
             parts = cid.split(':')
-            peer = parts[3] if len(parts) > 3 else ''
+            # 对端 uid：conv_id 两段是 min/max 排序位，取"不是自己"的那段
+            # （同 client.peer_of）。自会话（0:1:A:A）两段都是自己。
+            peer = ''
+            if len(parts) == 4:
+                peer = parts[3] if parts[2] == uid else parts[2]
             conv_msgs = msgs.get(cid) or []
             last = conv_msgs[-1] if conv_msgs else None
             prof = profiles.get(sec_by_conv.get(cid, ''), {})
-            # 群会话（conv_type=2，conv_id 为纯数字）：昵称=群名、头像=群头像，
-            # 对端 uid 无意义。私聊昵称缺失时回退 peer_uid。
+            # 群会话（conv_type=2，conv_id 为纯数字）：昵称=群名、头像=群头像
             is_group = (c.get('conv_type') or 0) == 2
             nick = (c.get('group_name') if is_group else '') or \
                 prof.get('nickname', '') or peer
-            if not (c.get('group_name') if is_group else '') and peer == uid:
-                nick = '我自己（文件/草稿）'   # 0:1:A:A 自己会话（10-12 实测无昵称）
+            if len(parts) == 4 and parts[2] == parts[3] == uid:
+                nick = '我自己（文件/草稿）'   # 自会话唯一特征：两段相等
             avatar = (c.get('group_avatar') if is_group else '') or \
                 prof.get('avatar', '')
             out.append(Conversation(platform='douyin', account='',
