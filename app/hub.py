@@ -299,7 +299,7 @@ class Hub(_SyncHub):
         self._start_dy_realtime(name, sess)
         return {'ok': True, 'name': name, 'uid': acct.uid, 'platform': 'douyin',
                 'conversations': len(sess._conv_cache),
-                'note': 'init 占座生效：约 8 分钟内 send 会被服务端拒绝（就绪窗）'}
+                'note': 'init 完成，发送立即可用（就绪窗已证伪移除）'}
 
     def _start_dy_realtime(self, name, sess):
         """gum 心跳实时收信：新消息即时经 bus 推给前端（SSE 已有通路）。

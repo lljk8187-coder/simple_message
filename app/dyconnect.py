@@ -443,6 +443,27 @@ def decrypt_image_bytes(url, skey_hex, proxy=None):
     return AESGCM(bytes.fromhex(skey_hex)).decrypt(ct[:12], ct[12:], None)
 
 
+def infer_self_uid(conv_ids):
+    """从会话 ID 集合推断自己 uid（10-12 实测：conv_id='0:1:A:B' 的 A/B 是
+    min/max 排序位，与"谁发送"无关——add_account 原取 conv_cache[0] 第三段
+    会随机推成对端）。自己的 uid 出现在每一条 C2C 会话中，取唯一全覆盖者。
+    会话 <2 条或无全覆盖者返回 ''（调用方自行兜底）。"""
+    from collections import Counter
+    c = Counter()
+    total = 0
+    for cid in conv_ids or ():
+        parts = str(cid).split(':')
+        if len(parts) == 4 and parts[0] == '0' and parts[1] == '1':
+            c[parts[2]] += 1
+            c[parts[3]] += 1
+            total += 1
+    if total >= 2:
+        for uid, n in c.most_common(1):
+            if n == total:
+                return uid
+    return ''
+
+
 def _msg_record(m_b):
     """单条消息记录 → dict。init f2 与 get_by_conversation f1 同构（10-10 实测）。
 

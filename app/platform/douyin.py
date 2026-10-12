@@ -116,10 +116,15 @@ class DouyinAdapter(PlatformAdapter):
         sess._known_convs = pairs          # 持久化：重启后 session_load 重新种子
         sess._conv_cache = list(sess._tickets.values())   # 种子结果并入会话面
         sess._conv_at = time.time()
-        # conversation_id = '0:1:<uid>:<peer>'，取自己的 uid
+        # conversation_id = '0:1:<uid>:<peer>'，但两段是 min/max 排序位、与
+        # "谁发送"无关——自己 uid 用统计法（出现在所有会话中的那个）推断，
+        # fields['uid'] 显式传入时优先
         uid = (fields.get('uid') or '').strip()
+        if not uid:
+            uid = dyconnect.infer_self_uid(
+                [c['conv_id'] for c in sess._conv_cache or []])
         if not uid and sess._conv_cache:
-            uid = sess._conv_cache[0]['conv_id'].split(':')[2]
+            uid = sess._conv_cache[0]['conv_id'].split(':')[2]   # 旧兜底：单会话时不可靠
         sess.uid = uid                        # 必须回写：WS 推送 URL/access_key 绑定 uid
         acct = Account(platform='douyin',
                        name=(fields.get('name') or uid),
