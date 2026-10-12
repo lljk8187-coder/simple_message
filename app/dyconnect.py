@@ -345,6 +345,26 @@ def parse_init_conversations(body):
         conv_id = pb.text(pb.blob(core, 1))
         if not conv_id:
             continue
+        # core.f50 群详情（群会话才有）：f5=群名，f42 metadata 含群头像
+        # a:public_group_avatar_meta → 群头像 URL（10-12 实测）
+        gname = gavatar = ''
+        f50 = pb.blob(core, 50)
+        if f50:
+            f50f = pb.parse(f50)
+            if f50f:
+                gname = pb.text(pb.blob(f50f, 5)) or ''
+                for _, _, _, mbl in pb.all_of(f50f, 42):
+                    mb = pb.parse(mbl)
+                    if not mb:
+                        continue
+                    kb = pb.blob(mb, 1)
+                    k = (pb.text(kb) or '') if kb is not None else ''
+                    if 'avatar' not in k:
+                        continue
+                    for _, _, _, vb in pb.all_of(mb, 2):
+                        v = pb.text(vb) or ''
+                        if v.startswith('http'):
+                            gavatar = v
         out.append({
             'conv_id': conv_id,
             'conv_short_id': pb.one(core, 2, 0),
@@ -353,6 +373,8 @@ def parse_init_conversations(body):
             # 会话类型（10-12 实测）：core.f3 = 1 单聊 / 2 群聊；conv_id 形态
             # 相关（群为纯数字短 ID，单聊 '0:1:A:B'，A/B 为 min/max 排序位）
             'conv_type': pb.one(core, 3, 0),
+            'group_name': gname,
+            'group_avatar': gavatar,
         })
     return out
 
