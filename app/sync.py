@@ -165,6 +165,10 @@ class Hub:
                     self.store.apply_unread(name, unread)
                     self.bus.publish({'type': 'conversations', 'account': name})
                 if messages:
+                    # command 信令不入库（store 过滤），SSE 同样不能推——
+                    # 10-12 实测泄漏成 [非文本消息 command] 实体气泡
+                    messages = [m for m in messages if m.get('kind') != 'command']
+                if messages:
                     self._stamp_acct(name, messages)
                     self.store.save_messages(name, messages)
                     grouped = {}
