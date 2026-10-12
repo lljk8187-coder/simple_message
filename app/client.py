@@ -290,6 +290,10 @@ def parse_message(entry, my_uid):
         kind = 'text'
     elif j.get('tips'):
         kind, body = 'tip', str(j['tips'])
+    elif raw_text.strip() == '{"hack":"1"}':
+        # 10-12 实测：手机发的图片/语音，服务端对 web 通道下发的是剥离后的
+        # 占位 {"hack":"1"}（媒体数据不下发，官方网页同样只显示"请下载 App"）
+        kind, body = 'tip', '[图片/语音消息：TikTok 网页端不显示，请在手机 App 查看]'
     elif awe:
         kind = 'reaction'
     elif any(k in raw_text.lower() for k in _MEDIA_KEYS):
