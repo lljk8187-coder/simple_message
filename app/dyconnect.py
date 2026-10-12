@@ -338,6 +338,8 @@ _MSG_KIND = {7: 'text', 1: 'tip', 5: 'media', 8: 'media', 15: 'media',
 
 
 def _describe_media(content, msg_type=0):
+    if msg_type == 1:
+        return '[系统提示]'
     for k in ('content_name', 'display_name', 'desc', 'hint_text', 'aweme_title'):
         v = content.get(k)
         if isinstance(v, str) and v:
@@ -394,19 +396,25 @@ def _dy_attachments(f6, content):
                         'author_uid': str(content.get('aweme_author_id')
                                           or info.get('author_uid') or ''),
                         'content': content})
-        elif f6 == 27:                                 # 图片（10-12 收图实测：
-            r = content.get('resource_url') or {}      # 直链在 large/medium_url_list，
-            u = ''                                     # origin 档 403、无 url_list 键；
-            for k in ('large_url_list', 'medium_url_list',  # 自己发的为 oid 加密引用
-                      'url_list'):                     # 无直链 → 前端 [图片] 占位
+        elif f6 == 27:                                 # 图片（10-12 实测：CDN 存的
+            r = content.get('resource_url') or {}      # 是 AES-256-GCM 密文（skey
+            u = ''                                     # 解密，nonce=密文前12B），直
+            for k in ('large_url_list', 'medium_url_list',  # 链给 <img> 只会乱码——
+                      'url_list'):                     # url 交 hub /api/img 代理解密
                 v = r.get(k) or []
                 if v:
                     u = v[0]
                     break
-            if isinstance(u, str) and u.startswith('http'):
-                out.append({'type': 'image', 'url': u,
-                            'width': int(content.get('cover_width') or 0),
-                            'height': int(content.get('cover_height') or 0)})
+            sk = r.get('skey') or ''
+            if (isinstance(u, str) and u.startswith('http')):
+                import re as _re
+                import base64 as _b64
+                if _re.fullmatch(r'[0-9a-f]{64}', sk):
+                    uenc = _b64.urlsafe_b64encode(u.encode()).decode().rstrip('=')
+                    out.append({'type': 'image',
+                                'url': '/api/img?u=%s&k=%s' % (uenc, sk),
+                                'width': int(content.get('cover_width') or 0),
+                                'height': int(content.get('cover_height') or 0)})
         elif f6 == 60:                                 # 外链卡片
             out.append({'type': 'link',
                         'url': _first_url(content.get('icon')),
@@ -414,6 +422,25 @@ def _dy_attachments(f6, content):
     except Exception:
         pass                                           # 载荷提取失败不影响消息本体
     return out
+
+
+def decrypt_image_bytes(url, skey_hex, proxy=None):
+    """下载 TOS 图片密文并解密（10-12 实测逆向）。
+
+    CDN 上存的是 AES-256-GCM 密文：key=resource_url.skey(hex)，
+    nonce=密文前 12B，tag=尾 16B，明文为 WEBP/JPEG。
+    必须用 curl_cffi chrome 指纹——urllib 的 TLS 指纹会被 CDN 拒，
+    且系统环境变量代理不可信（宿主内部通道）。"""
+    if curl_requests is None:
+        raise RuntimeError('curl_cffi required for image decryption')
+    with curl_requests.Session(impersonate='chrome', proxy=proxy,
+                               verify=_ascii_ca()) as s:
+        r = s.get(url, timeout=20)
+    ct = r.content
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    # 布局实测：nonce=密文前 12B，其后=密文体+GCM tag(16B) 连体（cryptography
+    # 的 decrypt 要求 data=ciphertext||tag，不能手动剥 tag）
+    return AESGCM(bytes.fromhex(skey_hex)).decrypt(ct[:12], ct[12:], None)
 
 
 def _msg_record(m_b):
@@ -454,6 +481,8 @@ def _msg_record(m_b):
             elif fid == 10:
                 ms = ival
     kind = _MSG_KIND.get(msg_type, 'unknown')
+    if msg_type >= 10000:                      # 会话信令（同 WS 路径），不入缓存
+        return None
     atts = _dy_attachments(msg_type, content)
     text = content.get('text') or ''
     # 占位文案只兜底"啥载荷都没提出来"的消息；提出来了（语音条/图片/卡片）
@@ -489,7 +518,7 @@ def parse_init_messages(body):
     for _f, _w, _v, ct_b in pb.all_of(pb.parse(b2043), 1):
         for _f2, _w2, _v2, m_b in pb.all_of(pb.parse(ct_b), 2):
             rec = _msg_record(m_b)
-            if rec['conv_id']:
+            if rec and rec['conv_id']:
                 out.append(rec)
     return out
 
@@ -559,6 +588,8 @@ def parse_ws_push(frame, sess=None):
         if mid in ('', '0'):
             return None
         msg_type = d[6][2] if 6 in d and d[6][1] == 0 else 0
+        if msg_type >= 10000:                  # 50001 等会话信令（已读回执/连续
+            return None                        # 聊天天数），非用户消息——10-12 实测
         kind = _MSG_KIND.get(msg_type, 'unknown')
         atts = _dy_attachments(msg_type, content)
         text = content.get('text') or ''
@@ -700,6 +731,8 @@ def parse_gum(body):
                         except ValueError:
                             content = {}
                     kind = _MSG_KIND.get(msg_type, 'unknown')
+                    if msg_type >= 10000:          # 会话信令（同 WS 路径），跳过
+                        continue
                     _atts = _dy_attachments(msg_type, content)
                     text = content.get('text') or ''
                     if kind != 'text' and not text and not _atts and content:
@@ -741,7 +774,7 @@ def parse_history_page(body):
     for x in pb.parse(b301):
         if x[0] == 1 and x[1] == 2:
             rec = _msg_record(x[3])
-            if rec['conv_id']:
+            if rec and rec['conv_id']:
                 msgs.append(rec)
         elif x[0] == 2 and x[1] == 0:
             cursor = x[2]

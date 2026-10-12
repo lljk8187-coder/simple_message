@@ -132,6 +132,7 @@ class Handler(BaseHTTPRequestHandler):
         ('POST', r'^/api/login/cancel$', 'login_cancel'),
         ('GET', r'^/api/health$', 'health'),
         ('GET', r'^/api/canary$', 'canary'),
+        ('GET', r'^/api/img$', 'img'),
     ]
 
     def _dispatch(self, method):
@@ -215,6 +216,42 @@ class Handler(BaseHTTPRequestHandler):
         snap = self.hub.canary_snapshot()
         self._json({'accounts': snap,
                     'drift': sorted({n for n, v in snap.items() if v['protocol_drift']})})
+
+    def h_img(self, q):
+        """收图解密代理（10-12 实测逆向）：TOS CDN 存的是 AES-256-GCM 密文，
+        浏览器 <img> 直接加载只会拿到乱码。本端点下载密文 → 解密 → 回明文图片。
+        u=b64url(图片URL，host 必须抖音图床)，k=skey(hex64，来自消息 content)。
+        磁盘缓存 data/imgcache/<md5(url)>.img，同一张图只下载解密一次。"""
+        import base64, hashlib
+        u = (q.get('u') or [''])[0]
+        k = (q.get('k') or [''])[0]
+        try:
+            url = base64.urlsafe_b64decode(u + '=' * (-len(u) % 4)).decode()
+        except Exception:
+            return self._json({'error': 'bad u'}, 400)
+        host = urllib.parse.urlparse(url).hostname or ''
+        if not (host == 'douyinpic.com' or host.endswith('.douyinpic.com')):
+            return self._json({'error': 'host not allowed'}, 403)   # SSRF 护栏
+        if not re.fullmatch(r'[0-9a-f]{64}', k):
+            return self._json({'error': 'bad k'}, 400)
+        cache = os.path.join(self.img_cache_dir,
+                             hashlib.md5(url.encode()).hexdigest() + '.img')
+        if os.path.exists(cache) and os.path.getsize(cache):
+            data = open(cache, 'rb').read()
+        else:
+            try:
+                from .dyconnect import decrypt_image_bytes
+                data = decrypt_image_bytes(url, k, proxy=self.client.proxy)
+            except Exception as e:
+                return self._json({'error': 'fetch/decrypt failed: %s' % e}, 502)
+            os.makedirs(os.path.dirname(cache), exist_ok=True)
+            with open(cache, 'wb') as f:
+                f.write(data)
+        ctype = ('image/webp' if data[:4] == b'RIFF'
+                 else 'image/png' if data[:8] == b'\x89PNG\r\n\x1a\n'
+                 else 'image/jpeg' if data[:2] == b'\xff\xd8'
+                 else 'application/octet-stream')
+        self._send(200, data, ctype, {'Cache-Control': 'public, max-age=86400'})
 
     def h_get_config(self, q):
         cfg = dict(self.config)
@@ -619,6 +656,7 @@ def create_server(host, port, hub, store, client, config):
     if not os.path.isabs(data_dir):
         data_dir = os.path.abspath(os.path.join(
             os.path.dirname(WEB_DIR), data_dir))
+    Handler.img_cache_dir = os.path.join(data_dir, 'imgcache')
     Handler.login_flow = login_browser.BrowserLogin(
         store, hub, client,
         profile_root=os.path.join(data_dir, 'login-profile'),

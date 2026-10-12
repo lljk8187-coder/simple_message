@@ -711,7 +711,7 @@ function rebuildDaySeps(){
 // （TikTok 会把 "Message request accepted…" 这类系统提示混进消息流，
 //   贴纸/表情回应也不承载 text）。
 const KIND_LABEL = {reaction: '[表情回应]', media: '[贴纸 / 图片]',
-                    image: '[图片]', unknown: '[非文本消息]'};
+                    image: '[图片]', tip: '[系统提示]', unknown: '[非文本消息]'};
 
 function appendMsg(container, m){
   // server echo of something we just sent -> upgrade the bubble already on screen
