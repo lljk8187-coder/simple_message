@@ -665,6 +665,9 @@ class Hub(_SyncHub):
         elif plat == 'instagram':
             self.ig_sessions.pop(name, None)
         elif plat == 'douyin':
-            self.dy_sessions.pop(name, None)
+            sess = self.dy_sessions.pop(name, None)
+            if sess:
+                sess.stop_realtime()   # 停 WS 循环：只 pop 引用不停线程，
+                                       # 删除账号后会话信令继续刷（10-12 实测）
         self.detach(name)
         self.store.delete_account(name)
