@@ -394,8 +394,15 @@ def _dy_attachments(f6, content):
                         'author_uid': str(content.get('aweme_author_id')
                                           or info.get('author_uid') or ''),
                         'content': content})
-        elif f6 == 27:                                 # 图片（收方常带直链 url_list；
-            u = _first_url(content.get('resource_url'))  # 自己发的为 oid 加密引用，无直链）
+        elif f6 == 27:                                 # 图片（10-12 收图实测：
+            r = content.get('resource_url') or {}      # 直链在 large/medium_url_list，
+            u = ''                                     # origin 档 403、无 url_list 键；
+            for k in ('large_url_list', 'medium_url_list',  # 自己发的为 oid 加密引用
+                      'url_list'):                     # 无直链 → 前端 [图片] 占位
+                v = r.get(k) or []
+                if v:
+                    u = v[0]
+                    break
             if isinstance(u, str) and u.startswith('http'):
                 out.append({'type': 'image', 'url': u,
                             'width': int(content.get('cover_width') or 0),
