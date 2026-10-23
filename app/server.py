@@ -108,6 +108,7 @@ class Handler(BaseHTTPRequestHandler):
         ('GET', r'^/api/accounts/(?P<name>[^/]+)/conversations$', 'conversations'),
         ('GET', r'^/api/accounts/(?P<name>[^/]+)/messages$', 'messages'),
         ('POST', r'^/api/accounts/(?P<name>[^/]+)/send$', 'send'),
+        ('POST', r'^/api/accounts/(?P<name>[^/]+)/send-cold$', 'send_cold'),
         ('POST', r'^/api/accounts/(?P<name>[^/]+)/read$', 'mark_read'),
         ('POST', r'^/api/accounts/(?P<name>[^/]+)/focus$', 'focus'),
         ('POST', r'^/api/x/probe$', 'x_probe'),
@@ -355,6 +356,20 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({'error': 'conv_id and (text or attachments) are required'}, 400)
         self._json(self.hub.send(name, conv_id, text, attachments=attachments))
 
+    def h_send_cold(self, q, name):
+        """冷建联单发：{target, text}。target 可以是 uid 或 @username。
+
+        不需要事先存在会话——服务端建会话（cmd 609）后经 WS 通道发出，
+        这是唯一对"陌生人 / message-request 会话"有效的通道。
+        """
+        body = self._body()
+        target = str(body.get('target') or body.get('uid')
+                     or body.get('username') or '').strip()
+        text = (body.get('text') or '').strip()
+        if not target or not text:
+            return self._json({'error': 'target and text are required'}, 400)
+        self._json(self.hub.send_cold(name, target, text))
+
     def h_mark_read(self, q, name):
         """已读回执。效果在对方视角的"已读"标记——本地未读徽章仍由前端基线管理。"""
         body = self._body()
@@ -456,8 +471,11 @@ class Handler(BaseHTTPRequestHandler):
                     'items': self.store.list_items(cid)})
 
     def h_campaign_create(self, q):
-        """建代发任务：{text, targets:[{account,conv_id,label}], batch_size,
-        interval_s, schedule_ms, confirm}。
+        """建代发任务：{text, targets:[{account,conv_id} | {account,target}],
+        batch_size, interval_s, schedule_ms, confirm}。
+
+        两种目标可混用：`conv_id` = 已有会话；`target` = 冷建联对象
+        （uid 或 @username，会话在排水时建立）。
 
         `confirm` 是硬性要求：这个接口一次会影响很多人，不能让一次误点或一个
         随手写的脚本就把消息发出去。

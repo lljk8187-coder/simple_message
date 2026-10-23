@@ -624,6 +624,105 @@ class Hub(_SyncHub):
                              res if isinstance(res, dict) else {'ok': bool(res)})
         return res
 
+    # ------------------------------------------------------- 冷建联（纯协议）
+
+    def resolve_target_uid(self, name, target):
+        """把"对象"统一成 uid：纯数字直接认，@username / username 走主页 SSR。
+
+        返回 (uid, error)。不抛异常——队列需要把失败原因写进审计而不是炸掉 worker。
+        """
+        t = str(target or '').strip()
+        if not t:
+            return '', 'target is empty'
+        if t.isdigit():
+            return t, ''
+        try:
+            from . import client as api
+            prof = api.profile_by_username(self.client, self.session(name), t)
+            return prof['uid'], ''
+        except Exception as e:
+            return '', '%s: %s' % (type(e).__name__, str(e)[:120])
+
+    def _render_cold_text(self, name, target, uid, text):
+        """填 {nickname}/{unique_id}/{uid}。只在文案里真的出现 {} 时才查资料，
+        避免给每条冷发都多打一次请求。"""
+        if '{' not in (text or ''):
+            return text
+        prof = {}
+        try:
+            from . import client as api
+            if str(target or '').isdigit():
+                prof = (api.user_profiles(self.client, self.session(name), [uid])
+                        or {}).get(str(uid)) or {}
+            else:
+                prof = api.profile_by_username(self.client, self.session(name), target)
+        except Exception:
+            prof = {}
+        out = text
+        for k, v in (('{nickname}', prof.get('nickname') or ''),
+                     ('{unique_id}', prof.get('unique_id') or ''),
+                     ('{uid}', str(uid or ''))):
+            out = out.replace(k, str(v))
+        return out
+
+    def send_cold(self, name, target, text, audit=True):
+        """冷建联发送：对象可以是 uid 或 @username，无需事先存在会话。
+
+        与 send() 的区别：send() 只对"已存在的会话"发（要求库里有 short_id），
+        冷目标两样都没有。这里走 cmd 609 建会话 + WS 通道，并把新会话落库，
+        这样会话列表/历史/后续聊天立刻就接得上。
+        """
+        plat = self._platform(name)
+        if plat != 'tiktok':
+            return {'ok': False, 'stage': 'unsupported',
+                    'error': '冷建联目前仅支持 TikTok（%s 未实现）' % plat}
+        uid, err = self.resolve_target_uid(name, target)
+        if not uid:
+            res = {'ok': False, 'stage': 'profile', 'error': err, 'target': target}
+            if audit:
+                self._audit_cold(name, target, text, res)
+            return res
+        ad = self.adapter(plat)
+        sess = self.session(name)
+        text = self._render_cold_text(name, target, uid, text)
+        try:
+            res = self._guarded(name, lambda: ad.send_to_peer(
+                sess, uid, text, cli=self.client))
+        except Exception as e:
+            res = {'ok': False, 'stage': 'send',
+                   'error': '%s: %s' % (type(e).__name__, str(e)[:120])}
+        res.setdefault('target', target)
+        res['uid'] = uid
+        conv_id = res.get('conv_id')
+        if conv_id:
+            # 落库：新会话立刻出现在列表里，short_id 也就此缓存下来
+            try:
+                self.store.save_conversations(name, [{
+                    'conv_id': conv_id, 'short_id': str(res.get('short_id') or ''),
+                    'peer_uid': uid, 'updated_ms': int(time.time() * 1000),
+                    'unread': 0}])
+            except Exception:
+                pass
+        if audit:
+            self._audit_cold(name, target, text, res)
+        return res
+
+    def _audit_cold(self, name, target, text, res):
+        try:
+            self.store.audit('local' if res.get('ok') else 'system', 'message.cold',
+                             res.get('conv_id') or str(target),
+                             {'account': name, 'target': str(target),
+                              'uid': res.get('uid'), 'ok': bool(res.get('ok')),
+                              'stage': res.get('stage'),
+                              'skipped': res.get('skipped'),
+                              'landed': res.get('landed'),
+                              'tier': res.get('tier'),
+                              'msg_id': res.get('msg_id'),
+                              'error': res.get('error'),
+                              'text': (text or '')[:120]})
+        except Exception:
+            pass                      # 审计不能反过来把发送搞挂
+
     def _audit_send(self, name, conv_id, text, result):
         """手工单发的留痕（谁、何时、给谁、发了什么、结果）。"""
         try:

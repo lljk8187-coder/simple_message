@@ -282,6 +282,18 @@
     </p>
     <div id="batchList" style="max-height:210px;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin-bottom:12px"></div>
     <div class="field">
+      <label>冷建联对象（陌生人，每行一个 @用户名 或 uid）</label>
+      <div style="display:flex;gap:8px;align-items:flex-start">
+        <textarea id="coldTargets" rows="3" style="flex:1"
+          placeholder="例如：&#10;@somebody&#10;7527935828037010438"></textarea>
+        <select id="coldAccount" style="width:150px"></select>
+      </div>
+      <div class="hint" style="margin-top:4px">
+        冷目标会先建会话再发送（纯协议 WS，无需浏览器）。平台规则：对方回复前只能发 1 条，
+        已发过且未回复的会被自动跳过（记 <code>skipped</code>，不占配额）。
+      </div>
+    </div>
+    <div class="field">
       <label>内容</label>
       <textarea id="batchText" rows="3" placeholder="要发送给所有勾选会话的同一条消息"></textarea>
     </div>
@@ -1151,6 +1163,18 @@ $('#btnBatch').onclick = async () => {
     });
   }
   if (!any) box.insertAdjacentHTML('beforeend', '<div class="hint">所有账号都没有可发送的会话</div>');
+  // 冷建联账号下拉：只列可发的 TikTok 账号（冷建联目前仅 TikTok 走 WS 通道）
+  const sel = $('#coldAccount');
+  sel.innerHTML = '';
+  ACCOUNTS.filter(a => a.platform === 'tiktok' && a.writable !== false).forEach(a => {
+    const opt = document.createElement('option');
+    opt.value = a.name; opt.textContent = a.name;
+    sel.appendChild(opt);
+  });
+  if (!sel.options.length) {
+    sel.insertAdjacentHTML('afterend',
+      '<div class="hint">没有可用的 TikTok 账号（冷建联需要已登录且可发的账号）</div>');
+  }
 };
 $('#btnBatchCancel').onclick = () => {
   $('#batchModal').classList.remove('show');
@@ -1159,17 +1183,24 @@ $('#btnBatchCancel').onclick = () => {
 $('#btnBatchGo').onclick = async () => {
   const targets = [...$('#batchList').querySelectorAll('input:checked')]
     .map(i => ({ account: i.dataset.account, conv_id: i.dataset.conv, label: i.dataset.label }));
+  // 冷建联目标：一行一个 @用户名 / uid；同一账号下与勾选会话可混发
+  const coldAcct = $('#coldAccount').value;
+  const coldLines = ($('#coldTargets').value || '').split('\n').map(s => s.trim()).filter(Boolean);
+  const cold = coldAcct ? coldLines.map(t => ({ account: coldAcct, target: t, label: t })) : [];
+  const all = targets.concat(cold);
   const text = $('#batchText').value.trim();
-  if (!targets.length) { toast('先勾选要发送的会话', true); return; }
+  if (!all.length) { toast('先勾选会话或填写冷建联对象', true); return; }
   if (!text) { toast('先输入要发送的内容', true); return; }
   const batch = Math.max(1, parseInt($('#campBatch').value || '5', 10) || 5);
   const interval = Math.max(0, parseInt($('#campInterval').value || '60', 10) || 0);
-  if (!confirm(`建立群发任务：${targets.length} 个会话，每批 ${batch} 条、批间隔 ${interval} 秒。\n`
+  if (!confirm(`建立群发任务：${targets.length} 个会话`
+             + (cold.length ? ` + ${cold.length} 个冷建联对象` : '')
+             + `，每批 ${batch} 条、批间隔 ${interval} 秒。\n`
              + '任务由服务端排队发送，可随时暂停或取消。继续？')) return;
   const btn = $('#btnBatchGo'); btn.disabled = true;
   try {
     const r = await jpost('/api/campaigns',
-                          { text, targets, batch_size: batch,
+                          { text, targets: all, batch_size: batch,
                             interval_s: interval, confirm: true });
     $('#batchOut').innerHTML =
       `任务已建立：入队 ${r.queued} 个目标`
@@ -1177,6 +1208,7 @@ $('#btnBatchGo').onclick = async () => {
       + `<br><span class="hint">任务号 ${esc(r.campaign_id)}</span>`;
     toast(`任务已建立：入队 ${r.queued} 个目标`);
     $('#batchText').value = '';
+    $('#coldTargets').value = '';
     loadCampaigns();
   } catch (e) {
     $('#batchOut').textContent = '建立任务失败：' + e.message;

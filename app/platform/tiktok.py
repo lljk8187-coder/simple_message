@@ -135,7 +135,14 @@ class TikTokAdapter(PlatformAdapter):
     def _client(self):
         with self._lock:
             if self._http is None:
-                self._http = cl.HttpClient(proxy=self._proxy, detect=False)
+                proxy = self._proxy
+                if proxy == 'direct':
+                    # 显式直连：不探测、也不用环境变量里的代理
+                    self._http = cl.HttpClient(proxy=None, detect=False)
+                else:
+                    # 未配置代理时必须探测——否则 urllib 会回落到 HTTPS_PROXY，
+                    # 那个地址常是宿主程序的内部通道（实测 502 连不通）。
+                    self._http = cl.HttpClient(proxy=proxy, detect=not proxy)
             return self._http
 
     def _cache_short(self, sess, rows):
@@ -264,6 +271,84 @@ class TikTokAdapter(PlatformAdapter):
         if not short:
             raise ValueError('unknown conversation (no short_id): %r' % conv_id)
         return cl.send_message(self._client(), sess, conv_id, short, text)
+
+    # ---------------------------------------------------------- 冷建联发送
+
+    def send_to_peer(self, sess, peer_uid, text, verify=True, cli=None):
+        """向"还没有会话"的对端发第一条（冷建联）。
+
+        链路：cmd 609 建会话（幂等）→ 1 条规则预检 → WS 发送 → 回读验证。
+
+        为什么不能直接 send()：send() 要求会话已存在且 short_id 已知；陌生人对端
+        两样都没有。为什么不能用 HTTP：message-request 会话的 HTTP 发送会被服务端
+        静默丢弃（biz=0 但不落地），只有 WS 通道有效。
+
+        返回 dict：ok / conv_id / short_id / cid / msg_id / landed / tier；
+        被平台规则拦下时返回 {'ok': False, 'skipped': 'pending_reply', ...}。
+        """
+        from .. import tkws
+        cli = cli or self._client()
+        peer_uid = str(peer_uid or '').strip()
+        if not peer_uid.isdigit():
+            raise ValueError('peer_uid must be numeric, got %r' % peer_uid)
+
+        conv = cl.create_conversation(cli, sess, peer_uid)
+        conv_id, short = conv['conv_id'], conv['short_id']
+        out = {'conv_id': conv_id, 'short_id': short,
+               'created': bool(conv.get('created')), 'uid': peer_uid}
+
+        # 平台规则：对方回复前只能发 1 条。ACK 侧看不出这条规则（照样回 ok），
+        # 所以必须在发送前判断"最后一条是不是我方且对方没回"。
+        # 注意：create_conversation 的 created 标志恒为 1（复用已有会话也报 true），
+        # 不能拿它判断"是不是新会话"，只能无条件查历史。
+        if verify:
+            try:
+                msgs, _meta = cl.list_messages(cli, sess, conv_id, short, limit=10)
+                chat = [m for m in msgs if m.get('kind') in ('text', 'media', 'reaction')]
+                if chat and chat[-1].get('outgoing'):
+                    out.update(ok=False, skipped='pending_reply', stage='precheck',
+                               error='对方尚未回复（平台规则：回复前仅可发 1 条）')
+                    return out
+            except Exception:
+                pass                      # 读不到历史就不拦，交给发送结果说话
+
+        res = tkws.send_message(sess, conv_id, short, text,
+                                proxy=getattr(cli, 'proxy', None))
+        out.update(res)
+
+        # ACK ok 也可能被静默丢弃 → 回读确认；没落地再给 HTTP 一次机会
+        # （HTTP 只对已接受会话有效，这里相当于"对方已回复"的热会话兜底）。
+        if verify and res.get('ok'):
+            landed = self._landed(cli, sess, conv_id, short, res.get('cid'))
+            out['landed'] = landed
+            if not landed:
+                http_res = cl.send_message(cli, sess, conv_id, short, text)
+                out['http_fallback'] = http_res
+                out['landed'] = self._landed(cli, sess, conv_id, short,
+                                             http_res.get('cid'))
+                if not out['landed']:
+                    out.update(ok=False, stage='verify',
+                               error='ACK ok but dropped（对方未接受 / 触发限流）')
+        return out
+
+    def _landed(self, cli, sess, conv_id, short, cid, tries=5, wait=2.5):
+        """回读会话，确认这条 client_message_id 真的存在。
+
+        服务端回读有延迟（实测 0~4 秒），窗口开太小会把已送达误判成"被丢弃"。
+        """
+        if not cid:
+            return False
+        for i in range(tries):
+            try:
+                msgs, _meta = cl.list_messages(cli, sess, conv_id, short, limit=10)
+                if any(m.get('cid') == cid for m in (msgs or [])):
+                    return True
+            except Exception:
+                pass
+            if i < tries - 1:
+                time.sleep(wait)
+        return False
+
 
     def mark_read(self, sess, conv_id, read_index):
         """read_index = 已读到哪条的时间戳（微秒）；hub 传最新一条消息的 us。"""

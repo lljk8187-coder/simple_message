@@ -49,7 +49,8 @@ app/hub.py             统一编排：账号生命周期、四平台会话登记
 | `app/platform/x.py` | X 翻译官：conv_id=对端 uid；无已读回执（如实声明） |
 | `app/platform/instagram.py` | IG 翻译官：双通道（浏览器抓 sessionid / 账密+验证码 NeedCode）、懒 ensure_login |
 | `app/platform/facebook.py` | FB 翻译官：E2EE 桥事件经 poll 排水 |
-| `app/client.py` | TikTok 协议：protobuf 信封、203/204/301/100/2002、签名档位 B/A/Z |
+| `app/client.py` | TikTok 协议：protobuf 信封、203/204/301/100/609/2002、签名档位 B/A/Z |
+| `app/tkws.py` | TikTok WebSocket 通道（纯标准库）：冷建联发送、WS 构帧、ACK/PUSH 解析 |
 | `app/signing.py` | 手写 P-256 ECDSA（标准库）：群律/DER/PKCS#8 |
 | `app/proto.py` | protobuf varint / length-delimited 编解码 |
 | `app/xconnect.py` | X 连接器：twikit 封装 + 自实现收件箱（v1.1 inbox_initial_state）；签名器降级（v1.1 DM 端点不校验 `X-Client-Transaction-Id`） |

@@ -7,6 +7,7 @@ path needs none and the write path can reuse captured guard headers.
 import base64
 import json
 import os
+import re
 import secrets
 import time
 import urllib.error
@@ -32,6 +33,7 @@ SUB = {
     203: 10001,
     204: 10040,
     301: 10007,
+    609: 10007,   # v2/conversation/create (cold contact) shares 301's sub value
 }
 
 PROXY_CANDIDATES = [
@@ -212,6 +214,44 @@ def envelope(cmd, payload, sess, with_sub=True, feature=False, env_block=False):
         for k, v in _env_pairs(sess):
             body += pb.ld(15, pb.s(1, k) + pb.s(2, v))
     return body
+
+
+def create_envelope(cmd, payload, sess):
+    """Envelope shape used by cmd 609 (conversation/create).
+
+    Diffed against a live UI capture (2026-10-20): f4 present but EMPTY
+    (not the feature tag), an f15 env block with a fuller key set, and a
+    trailing f18=1. Sends to a conversation created without these exact
+    extras were accepted (biz_code=0) but silently dropped, so this shape
+    is reproduced field-for-field.
+    """
+    body = (pb.vint(1, cmd) + pb.vint(2, SUB.get(cmd, 0)) + pb.s(3, ENVELOPE_VER)
+            + pb.s(4, '') + pb.vint(5, 3) + pb.vint(6, 0) + pb.s(7, ENVELOPE_BUILD)
+            + pb.sub(8, pb.sub(cmd, payload))
+            + pb.s(9, sess.device_id) + pb.s(11, 'web') + pb.vint(18, 1))
+    for k, v in _create_env_pairs(sess):
+        body += pb.ld(15, pb.s(1, k) + pb.s(2, v))
+    return body
+
+
+def _create_env_pairs(sess):
+    ua = UA_DEFAULT
+    return [('aid', '1988'), ('app_name', 'tiktok_web'), ('channel', 'web'),
+            ('device_platform', 'web_pc'), ('device_id', sess.device_id),
+            ('region', 'US'), ('priority_region', 'US'), ('os', 'windows'),
+            ('referer', WEB + '/'), ('root_referer', WEB + '/'),
+            ('cookie_enabled', 'true'), ('screen_width', '1920'),
+            ('screen_height', '1080'), ('browser_language', 'zh-CN'),
+            ('browser_platform', 'Win32'), ('browser_name', 'Mozilla'),
+            ('browser_version', ua.split('Mozilla/')[1]),
+            ('browser_online', 'true'), ('verifyFp', ''),
+            ('app_language', 'zh-Hans'), ('webcast_language', 'zh-Hans'),
+            ('tz_name', 'Asia/Shanghai'), ('is_page_visible', 'true'),
+            ('focus_state', 'true'), ('is_fullscreen', 'false'),
+            ('history_len', '13'), ('user_is_login', 'true'),
+            ('data_collection_enabled', 'true'), ('from_appID', '1988'),
+            ('locale', 'zh-Hans'), ('user_agent', ua),
+            ('Web-Sdk-Ms-Token', sess.ms_token)]
 
 
 def _env_pairs(sess):
@@ -520,6 +560,38 @@ def user_profiles(client, sess, uids):
 
 # --------------------------------------------------------------------- write
 
+def profile_by_username(client, sess, username):
+    """@username -> {uid, nickname, unique_id} via the profile page's SSR blob.
+
+    The JSON API (`/api/user/detail/`) is signed and returns an empty body,
+    but the profile page ships the same user object as
+    `__UNIVERSAL_DATA_FOR_REHYDRATION__` → `webapp.user-detail.userInfo.user`,
+    so no signature is needed. The uid field there is `id` (not `id_str`).
+
+    Raises ApiError when the page has no SSR block (bot wall / unknown user).
+    """
+    name = str(username or '').lstrip('@').strip()
+    if not name:
+        raise ApiError('username is empty')
+    url = WEB + '/@' + urllib.parse.quote(name)
+    _, raw, _ = client.get(url, headers={'Cookie': sess.cookie})
+    html = raw.decode('utf-8', 'ignore')
+    m = re.search(r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>',
+                  html, re.S)
+    if not m:
+        raise ApiError('profile page has no SSR block for @%s' % name)
+    try:
+        data = json.loads(m.group(1))
+        ui = data['__DEFAULT_SCOPE__']['webapp.user-detail']['userInfo']['user']
+    except (ValueError, KeyError, TypeError):
+        raise ApiError('profile page structure changed for @%s' % name)
+    uid = ui.get('id') or ui.get('id_str')
+    if not uid:
+        raise ApiError('no uid on profile @%s' % name)
+    return {'uid': str(uid), 'nickname': ui.get('nickname') or '',
+            'unique_id': ui.get('uniqueId') or name}
+
+
 def ts_sign_from_guard(sess):
     """The companion token rides inside the captured client-data as base64 JSON.
 
@@ -633,6 +705,50 @@ def send_message(client, sess, conv_id, short_id, text):
 
 
 ALNUM = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+
+
+def create_conversation(client, sess, peer_uid):
+    """cmd 609 /v2/conversation/create — the cold-contact prelude.
+
+    Measured live (2026-10-20 UI capture): opening a chat with a stranger
+    sends NOTHING; the conversation row is created server-side only when the
+    composer is used, via this call. Payload is f609{f1:1, repeated f2: uid}
+    (both participants); the reply's f1 carries the canonical conv_id and f2
+    the real short_id that cmd 100 requires. Without this prelude a send to a
+    self-constructed conv_id returns biz_code=0 but the message silently
+    never lands.
+
+    No ticket-guard headers are attached (the official client sends none).
+    Idempotent: an existing conversation returns its current (conv_id,
+    short_id).
+    """
+    a, b = sorted([str(sess.uid), str(peer_uid)], key=int)
+    payload = pb.vint(1, 1) + pb.vint(2, int(a)) + pb.vint(2, int(b))
+    body = create_envelope(609, payload, sess)
+    query = ('?aid=1988&version_code=1.0.0&app_name=tiktok_web&device_platform=web_pc'
+             '&msToken=' + urllib.parse.quote(sess.ms_token, safe=''))
+    _, raw, _ = client.post(IM_API + '/v2/conversation/create' + query,
+                            headers=_proto_headers(sess), body=body)
+    fields, meta = unwrap(raw, 609)
+    if fields is None or meta.get('biz_code') != 0:
+        raise ApiError('conversation/create: %s' % (meta.get('biz_msg') or 'no payload'),
+                       biz_code=meta.get('biz_code'))
+    conv = pb.parse(pb.blob(fields, 1) or b'')
+    conv_id = pb.text(pb.blob(conv, 1)) or ''
+    short_id = pb.one(conv, 2)
+    if not conv_id or not short_id:
+        raise ApiError('conversation/create: missing conv_id/short_id in reply')
+    return {'conv_id': conv_id, 'short_id': str(short_id),
+            'created': bool(pb.one(conv, 8)), 'meta': meta}
+
+
+def cold_send(client, sess, peer_uid, text):
+    """Full cold-contact chain: ensure conversation exists, then send."""
+    conv = create_conversation(client, sess, peer_uid)
+    result = send_message(client, sess, conv['conv_id'], conv['short_id'], text)
+    result['conv_id'] = conv['conv_id']
+    result['short_id'] = conv['short_id']
+    return result
 
 
 def mark_read(client, sess, conv_id, short_id, read_index, unread=0):

@@ -285,6 +285,24 @@ read_index 取库里最新一条消息的微秒时间戳；f5/f6 传 0。实测�
 `f1` 会话 id、`f2` 会话类型=1、**`f3` short_id 必填**、`f4` 正文 JSON、
 `f5` ext 映射（`s:client_message_id` 等）、`f6` 消息类型=7、`f7` ticket、`f8` client_message_id。
 
+**冷建联（给陌生人发第一条，纯协议）**：HTTP 发送通道对**陌生人 / message-request 会话**
+一律静默丢弃（`biz_code=0` 但不落地），只有 WebSocket 通道有效：
+
+- 传输：`wss://im-ws.tiktok.com/ws/v2`（二进制 protobuf，双向 2 字节 `hi` 心跳），
+  实现在 `app/tkws.py`（纯标准库 WS 客户端，无新依赖）；
+- 鉴权：`access_key = md5('9' + appKey + device_id + 'f8a69f1719916z')`；
+- 建会话：`cmd 609`（`/v2/conversation/create`，载荷 `f609{f1:1, f2:对端, f2:自己}`），
+  响应给出规范 conv_id 与真实 short_id——对自构 conv_id 直接发会被丢；
+- 帧结构：外层 `{f1 seq, f2 ts, f3 5, f4 1, f5 KV, f7 'pb', f8 内层, f15 guard, f18 1}`，
+  内层 `{f1 100, f2 seq 回显, f3 '1.8.2', f4 '', f5 3, f6 0, f7 build, f8{100 载荷},
+  f9 device_id, f11 'web', f15 环境, f18 1}`，载荷与 HTTP 版相同但
+  `f7='deprecated'`、ext 只带 `s:mentioned_users` + `s:client_message_id`；
+- **平台规则**：对方回复之前只能发 1 条。这条规则**在 ACK 里看不出来**（第 2 条照样回
+  `biz_code=0 / OK`，只是不落地），所以发送前查历史（最后一条是我方且对方未回 → 跳过），
+  发送后回读验证；
+- 入口：`POST /api/accounts/<name>/send-cold` {target, text}（target 可为 uid 或 @username），
+  或把 `{account, target}` 混进群发任务的目标列表，由队列逐条排水。
+
 **实时机制（真增量协议）**：cmd 204（`get_by_user_combo`）是一个完整的增量通道，不是只回游标 ——
 
 - 请求带"上次游标"（微秒），响应 `f1.f2` **直接携带范围内的新消息本体**（与 301 同构）；

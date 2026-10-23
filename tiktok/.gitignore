@@ -1,0 +1,26 @@
+# 研究沙盒：只保留结论文档与可复用的验证脚本，
+# 其余为一次性实验脚本 / 帧样本 / 运行输出（留在本地，不入库）
+*.bin
+*.b64
+*.txt
+matrix_out.txt
+probe_out.txt
+smoke_out.txt
+warm_out.txt
+test-url.txt
+wsrunner.html
+serve.py
+parse_official.py
+test_warm_ws.py
+ws_diag.py
+ws_echo.py
+ws_echo2.py
+ws_hdr_matrix.py
+ws_matrix.py
+ws_mini_test.py
+ws_probe.py
+ws_pyws.py
+ws_send_warm.py
+ws_smoke.py
+ws_url_matrix.py
+__pycache__/

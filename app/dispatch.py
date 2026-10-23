@@ -89,13 +89,21 @@ class Dispatcher:
                 continue
             account = (t.get('account') or '').strip()
             conv_id = (t.get('conv_id') or '').strip()
-            if not account or not conv_id:
+            cold_target = str(t.get('target') or t.get('uid')
+                              or t.get('username') or '').strip()
+            if not account or not (conv_id or cold_target):
                 continue
             platform = self.hub.platform_of(account)
+            if conv_id:
+                peer_uid = self.hub.resolve_peer(platform, account, conv_id)
+            else:
+                # 冷建联：对象可能是 uid 或 @username。能解析就先解析，
+                # 解析不了也入队（排水时再试），失败原因会写进审计而不是消失。
+                peer_uid, _err = self.hub.resolve_target_uid(account, cold_target)
+                peer_uid = peer_uid or cold_target
             items.append({'platform': platform, 'account': account,
-                          'conv_id': conv_id,
-                          'peer_uid': self.hub.resolve_peer(platform, account,
-                                                            conv_id)})
+                          'conv_id': conv_id, 'peer_uid': peer_uid,
+                          'cold': not conv_id})
         if not items:
             raise ValueError('targets are required')
 
@@ -159,28 +167,52 @@ class Dispatcher:
         self.store.mark_item(cid, item['seq'], 'sending', bump_attempts=True)
         try:
             # audit=False：队列自己写 dispatch.* 审计，避免一次群发留两份记录
-            res = self.hub.send(item['account'], item['conv_id'], camp['text'],
-                                audit=False)
+            if item.get('conv_id'):
+                res = self.hub.send(item['account'], item['conv_id'], camp['text'],
+                                    audit=False)
+            else:
+                # 冷建联项：会话在排水时才建立（cmd 609），发完回填 conv_id
+                res = self.hub.send_cold(item['account'],
+                                         item.get('peer_uid') or '',
+                                         camp['text'], audit=False)
+                if res.get('conv_id'):
+                    self.store.set_item_conv(cid, item['seq'], res['conv_id'])
             if not isinstance(res, dict):
                 res = {'ok': bool(res)}
         except Exception as e:
             res = {'ok': False, 'error': '%s: %s' % (type(e).__name__, e)}
 
+        if res.get('skipped'):
+            # 平台规则拦下（如"对方未回复前只能发 1 条"）：不算失败，不算已发
+            self.store.mark_item(cid, item['seq'], 'skipped',
+                                 skip_reason=res['skipped'], error=res.get('error'))
+            self.store.audit('system', 'dispatch.skipped', item['conv_id'],
+                             {'campaign_id': cid, 'seq': item['seq'],
+                              'account': item['account'],
+                              'reason': res['skipped']})
+            self._batch_pos[cid] = self._batch_pos.get(cid, 0) + 1
+            return True
+
         if res.get('ok'):
             guard = res.get('guard_result')
             self.store.mark_item(cid, item['seq'], 'sent', sent_ms=_now_ms(),
                                  guard_result=None if guard is None else str(guard))
-            self.store.audit('system', 'dispatch.sent', item['conv_id'],
+            self.store.audit('system', 'dispatch.sent',
+                             res.get('conv_id') or item['conv_id'],
                              {'campaign_id': cid, 'seq': item['seq'],
                               'account': item['account'], 'tier': res.get('tier'),
-                              'guard_result': guard})
+                              'guard_result': guard,
+                              'cold': not item.get('conv_id')})
         else:
             err = (res.get('error') or res.get('biz_msg')
                    or res.get('biz_code') or 'send failed')
             self.store.mark_item(cid, item['seq'], 'failed', error=str(err))
-            self.store.audit('system', 'dispatch.failed', item['conv_id'],
+            self.store.audit('system', 'dispatch.failed',
+                             res.get('conv_id') or item['conv_id'],
                              {'campaign_id': cid, 'seq': item['seq'],
-                              'account': item['account'], 'error': str(err)[:200]})
+                              'account': item['account'], 'error': str(err)[:200],
+                              'stage': res.get('stage'),
+                              'cold': not item.get('conv_id')})
 
         self._last_send[item['account']] = _now_ms()
         self._batch_pos[cid] = self._batch_pos.get(cid, 0) + 1

@@ -596,7 +596,10 @@ class Store:
             self._db.commit()
 
     def enqueue_items(self, campaign_id, items):
-        """入队，自带去重：同 (platform, account, conv_id) 只保留第一条。
+        """入队，自带去重：同 (platform, account, 会话或对端) 只保留第一条。
+
+        冷建联项（conv_id 为空、只有 peer_uid）也允许入队——它们的会话在排水时
+        才建立，所以去重键退化为 peer_uid。
 
         返回 {'queued': n, 'deduped': m} —— 重复项**不入队**（不是发完再跳过），
         这样任务总数从一开始就是真实要发的条数。
@@ -608,9 +611,10 @@ class Store:
                 platform = it.get('platform') or ''
                 account = it.get('account') or ''
                 conv_id = it.get('conv_id') or ''
-                if not account or not conv_id:
+                peer_uid = str(it.get('peer_uid') or '')
+                if not account or not (conv_id or peer_uid):
                     continue
-                key = (platform, account, conv_id)
+                key = (platform, account, conv_id or ('cold:' + peer_uid))
                 if key in seen:
                     deduped += 1
                     continue
@@ -621,10 +625,18 @@ class Store:
                            conv_id, peer_uid, status, attempts, updated_ms)
                        VALUES (?,?,?,?,?,?,?,?,?)""",
                     (campaign_id, seq, platform, account, conv_id,
-                     it.get('peer_uid') or '', 'queued', 0, now))
+                     peer_uid, 'queued', 0, now))
                 queued += 1
             self._db.commit()
         return {'queued': queued, 'deduped': deduped}
+
+    def set_item_conv(self, campaign_id, seq, conv_id):
+        """冷建联项发出去后回填真实 conv_id（审计、后续查询才有会话可关联）。"""
+        with self._lock:
+            self._db.execute(
+                'UPDATE dispatch_items SET conv_id=? WHERE campaign_id=? AND seq=?',
+                (conv_id, campaign_id, seq))
+            self._db.commit()
 
     def next_pending_item(self, campaign_id):
         with self._lock:
