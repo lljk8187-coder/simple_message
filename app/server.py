@@ -134,6 +134,7 @@ class Handler(BaseHTTPRequestHandler):
         ('GET', r'^/api/health$', 'health'),
         ('GET', r'^/api/canary$', 'canary'),
         ('GET', r'^/api/img$', 'img'),
+        ('GET', r'^/api/avatar$', 'avatar'),
     ]
 
     def _dispatch(self, method):
@@ -271,6 +272,48 @@ class Handler(BaseHTTPRequestHandler):
                  else 'image/jpeg' if data[:2] == b'\xff\xd8'
                  else 'application/octet-stream')
         self._send(200, data, ctype, {'Cache-Control': 'public, max-age=86400'})
+
+    def h_avatar(self, q):
+        """TikTok 头像代理（10-27）：tiktokcdn-us 直连与裸请求均不可达
+        （墙 + TLS 指纹拒），浏览器加载不了。由 hub 用 chrome 指纹经代理
+        下载并缓存（头像低频变化，缓存长期有效），前端从本端点取图。
+        acct=账号名（取其平台与代理环境），uid=对端 uid。"""
+        import curl_cffi.requests as cr
+        from .dyconnect import _ascii_ca
+        acct = (q.get('acct') or [''])[0]
+        uid = (q.get('uid') or [''])[0]
+        if not acct or not uid:
+            return self._json({'error': 'acct and uid required'}, 400)
+        cache = os.path.join(self.img_cache_dir, 'avatars',
+                             '%s_%s.img' % (acct, uid))
+        if os.path.exists(cache) and os.path.getsize(cache):
+            data = open(cache, 'rb').read()
+        else:
+            try:
+                plat = self.hub._platform(acct)
+                ad = self.hub.adapter(plat)
+                sess = self.hub.session(acct)
+                prof = (ad._profiles(sess, [uid]) if hasattr(ad, '_profiles')
+                        else {}) or {}
+                url = (prof.get(str(uid)) or {}).get('avatar') or ''
+                if not url:
+                    return self._json({'error': 'no avatar url'}, 404)
+                with cr.Session(impersonate='chrome', proxy=self.client.proxy,
+                                verify=_ascii_ca()) as s:
+                    r = s.get(url, timeout=20)
+                data = r.content
+                if r.status_code != 200 or len(data) < 100:
+                    return self._json({'error': 'avatar download failed'}, 502)
+                os.makedirs(os.path.dirname(cache), exist_ok=True)
+                with open(cache, 'wb') as f:
+                    f.write(data)
+            except Exception as e:
+                return self._json({'error': 'avatar failed: %s' % e}, 502)
+        ctype = ('image/webp' if data[:4] == b'RIFF'
+                 else 'image/png' if data[:8] == b'\x89PNG\r\n\x1a\n'
+                 else 'image/jpeg' if data[:2] == b'\xff\xd8'
+                 else 'application/octet-stream')
+        self._send(200, data, ctype, {'Cache-Control': 'public, max-age=604800'})
 
     def h_get_config(self, q):
         cfg = dict(self.config)
