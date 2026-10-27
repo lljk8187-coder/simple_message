@@ -672,6 +672,9 @@ async function loadMsgs(beforeUs){
       ? (d.messages.length ? '' : '已经到最早了')
       : '';
   } catch (e) {
+    if (!beforeUs && !box.children.length)
+      box.innerHTML = '<div class="hint">消息加载失败：' + esc(e.message) +
+        ' <button class="btn" onclick="loadMsgs()">重试</button></div>';
     toast('消息加载失败：' + e.message, true);
   } finally { LOADING = false; }
 }

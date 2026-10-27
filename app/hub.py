@@ -529,7 +529,10 @@ class Hub(_SyncHub):
         return self._guarded(name, lambda: self._conv_other(plat, name))
 
     def _tiktok_conversations(self, name):
-        self.sync_conversations(name)
+        try:
+            self.sync_conversations(name)      # 链路抖动时失败：降级用库存
+        except Exception as e:
+            import traceback; traceback.print_exc()
         rows = self.store.list_conversations(name)
         # tiktokcdn 浏览器不可达（墙+TLS 指纹拒）：头像统一改走 hub 代理
         # 缓存端点（h_avatar 下载并落盘）（10-27）
@@ -566,14 +569,20 @@ class Hub(_SyncHub):
         if not conv:
             raise KeyError('unknown conversation')
         if before_us is None:
-            self.ensure_history(name, conv_id, conv['short_id'])
+            try:
+                self.ensure_history(name, conv_id, conv['short_id'])
+            except Exception:
+                import traceback; traceback.print_exc()   # 链路抖动：降级用库存
         stored = self.store.list_messages(name, conv_id, limit=limit,
                                           before_us=before_us)
         if len(stored) < limit:
             oldest = min((m['us'] for m in stored), default=before_us or None)
-            fetched, _nc = self.fetch_more(name, conv_id, conv['short_id'],
-                                           before_us=oldest, limit=limit)
-            self.store.save_messages(name, fetched)
+            try:
+                fetched, _nc = self.fetch_more(name, conv_id, conv['short_id'],
+                                               before_us=oldest, limit=limit)
+                self.store.save_messages(name, fetched)
+            except Exception:
+                import traceback; traceback.print_exc()   # 链路抖动：降级用库存
             stored = self.store.list_messages(name, conv_id, limit=limit,
                                               before_us=before_us)
         # 满页 → 返回本页最旧 us 作 next_cursor 驱动前端继续翻页（10-27 修复：
