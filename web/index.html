@@ -900,6 +900,7 @@ $('#btnAdd').onclick = () => {
 // ------------------------------------------------------- campaigns (queue)
 let CAMP_TIMER = null;
 let CAMP_OPEN = null;              // 展开明细的任务 id（同时只展开一个）
+let CAMP_LAST_SIG = null;          // 上次渲染的内容签名（滚动保持，10-27）
 const CAMP_ZH = {queued: '待开始', running: '进行中', paused: '已暂停',
                  done: '已完成', cancelled: '已取消'};
 const ITEM_ZH = {queued: '待发', sending: '发送中', sent: '已发送', failed: '失败',
@@ -911,6 +912,13 @@ async function loadCampaigns(){
   try {
     const d = await jget('/api/campaigns?limit=8');
     const list = d.campaigns || [];
+    // 内容签名对比：数据与展开状态都没变就跳过重建——3 秒轮询不再把
+    // 用户拉好的滚动位置弹回顶部（10-27 用户实测 bug）
+    const sig = JSON.stringify([CAMP_OPEN,
+        list.map(c => [c.campaign_id, c.status, c.text, c.progress || {}])]);
+    if (sig === CAMP_LAST_SIG) return;
+    CAMP_LAST_SIG = sig;
+    const keepScroll = box.scrollTop;   // 有变化才重建；重建后恢复滚动位置
     if (!list.length) { box.innerHTML = '<div class="hint">还没有任务</div>'; return; }
     box.innerHTML = '';
     for (const c of list) {
@@ -952,7 +960,9 @@ async function loadCampaigns(){
         loadCampDetail(c.campaign_id, host);
       }
     }
+    box.scrollTop = keepScroll;       // 恢复用户拉到的滚动位置
   } catch (e) {
+    CAMP_LAST_SIG = null;             // 失败不记签名，下一轮重试渲染
     box.innerHTML = '<div class="hint">任务列表加载失败：' + esc(e.message) + '</div>';
   }
 }
