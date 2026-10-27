@@ -550,8 +550,10 @@ function hookEvents(){
 // ------------------------------------------------------------ conversations
 async function loadConvs(quiet){
   if (!ACCT) return;
+  const acct = ACCT;    // 账号快照：响应返回时若已切换账号则丢弃（10-27 竞态修复）
   try {
-    const d = await jget(`/api/accounts/${encodeURIComponent(ACCT)}/conversations`);
+    const d = await jget(`/api/accounts/${encodeURIComponent(acct)}/conversations`);
+    if (acct !== ACCT) return;
     CONVS = d.conversations || [];
     renderConvs();
     if (!quiet && !CUR && CONVS.length) openConv(CONVS[0]);
@@ -612,12 +614,14 @@ async function loadMsgs(beforeUs){
   if (!ACCT || !CUR || LOADING) return;
   LOADING = true;
   const box = $('#msgs');
+  const acct = ACCT, cur = CUR;   // 快照：响应返回时账号/会话已切换则丢弃
   try {
-    const q = new URLSearchParams({ conv_id: CUR.conv_id, limit: 30 });
+    const q = new URLSearchParams({ conv_id: cur.conv_id, limit: 30 });
     if (beforeUs) q.set('before_us', String(beforeUs));
     if (!beforeUs) box.innerHTML = '';
     const prevH = box.scrollHeight, prevTop = box.scrollTop;
-    const d = await jget(`/api/accounts/${encodeURIComponent(ACCT)}/messages?` + q);
+    const d = await jget(`/api/accounts/${encodeURIComponent(acct)}/messages?` + q);
+    if (acct !== ACCT || cur !== CUR) { LOADING = false; return; }
     const frag = document.createDocumentFragment();
     d.messages.forEach(m => appendMsg(frag, m));
     if (beforeUs && d.messages.length) {
@@ -821,6 +825,7 @@ function appendOptimistic(text){
   return el;
 }
 function onIncoming(e){
+  if (e.account && e.account !== ACCT) return;   // 旧账号流残留事件丢弃
   const involve = CUR && e.conv_id === CUR.conv_id;
   if (involve) {
     const box = $('#msgs');
