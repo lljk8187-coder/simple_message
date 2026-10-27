@@ -485,27 +485,63 @@ async function jdel(u){ const r=await fetch(u,{method:'DELETE',headers:authHeade
   if(j.error) throw new Error(j.error + (j.detail? ' · '+j.detail : '')); return j; }
 
 // ---------------------------------------------------------------- accounts
-async function loadAccounts(select) {
-  const d = await jget('/api/accounts');
-  ACCOUNTS = d.accounts || [];
-  const sel = $('#acctSel');
+const PLAT_ZH = {tiktok: 'TikTok', douyin: '抖音', x: 'X',
+                 instagram: 'Instagram', facebook: 'Facebook'};
+let CANARY = {};                   // {name: {authN, authBad}} 登录态画像（金丝雀）
+
+function acctLabel(a){
+  const plat = PLAT_ZH[a.platform] || a.platform || '';
+  const nm = a.nickname || a.username || a.name;
+  const c = CANARY[a.name];
+  return (plat ? plat + ' ' : '') + nm + (c && c.authBad ? ' ⚠ 登录过期' : '');
+}
+function renderAcctOptions(){
+  const sel = $('#acctSel'); if (!sel) return;
+  const cur = sel.value;
   sel.innerHTML = ACCOUNTS.length ? '' : '<option value="">（无账号）</option>';
   ACCOUNTS.forEach(a => {
     const o = document.createElement('option');
     o.value = a.name;
-    if (a.platform === 'x') {
-      o.textContent = (a.nickname || a.username || a.name) + ' · X' + (a.writable ? ' · 可发' : ' · 未连');
-    } else if (a.platform === 'instagram') {
-      o.textContent = (a.nickname || a.username || a.name) + ' · IG' + (a.writable ? ' · 可发' : ' · 未连');
-    } else if (a.platform === 'facebook') {
-      o.textContent = (a.nickname || a.username || a.name) + ' · FB' + (a.writable ? ' · 可发' : ' · 未连');
-    } else {
-      const mode = a.write_tier ? ' · 档位' + a.write_tier
-                 : (a.writable ? ' · 可发' : ' · 只读');
-      o.textContent = (a.nickname || a.username || a.name) + ' · ' + a.uid.slice(-6) + mode;
-    }
+    o.textContent = acctLabel(a);
     sel.appendChild(o);
   });
+  if (cur) sel.value = cur;
+}
+function updateAuthBanner(){
+  const cur = ACCOUNTS.find(a => a.name === ACCT);
+  const c = cur && CANARY[cur.name];
+  let bar = $('#authBanner');
+  if (c && c.authBad) {
+    if (!bar) {
+      bar = document.createElement('div');
+      bar.id = 'authBanner';
+      bar.style.cssText = 'background:#fff3cd;color:#856404;border-bottom:1px solid #ffeeba;'
+        + 'padding:8px 14px;font-size:13px';
+      document.querySelector('header').insertAdjacentElement('afterend', bar);
+    }
+    bar.textContent = '⚠ ' + ACCT + ' 登录态可能已过期（最近 auth 错误 ' + c.authN
+      + ' 次）——请重新执行登录收割后再操作该账号';
+    bar.style.display = '';
+  } else if (bar) bar.style.display = 'none';
+}
+async function refreshCanary(){
+  try {
+    const d = await jget('/api/canary');
+    const out = {};
+    for (const [name, h] of Object.entries(d.accounts || {})) {
+      const authN = (h.counts || {}).auth || 0;
+      const err = h.last_error || {};
+      out[name] = { authN, authBad: authN > 0 && err.class === 'auth' };
+    }
+    const changed = JSON.stringify(out) !== JSON.stringify(CANARY);
+    CANARY = out;
+    if (changed) { renderAcctOptions(); updateAuthBanner(); }
+  } catch (e) { /* canary 不可达时保留上次画像 */ }
+}
+async function loadAccounts(select) {
+  const d = await jget('/api/accounts');
+  ACCOUNTS = d.accounts || [];
+  renderAcctOptions();
   const want = select || ACCT || (ACCOUNTS[0] && ACCOUNTS[0].name);
   if (want && ACCOUNTS.some(a => a.name === want)) { sel.value = want; await switchAccount(want); }
   else { ACCT = null; renderWelcome(); }
@@ -1463,7 +1499,7 @@ $('#msgs').addEventListener('scroll', () => {
 
 (async () => {
   try { await loadAccounts(); } catch (e) { toast('读取账号失败：' + e.message, true); renderWelcome(); }
-  POLL = setInterval(() => { if (ACCT) loadConvs(true); }, 30000);
+  POLL = setInterval(() => { if (ACCT) loadConvs(true); refreshCanary(); }, 30000);
 })();
 </script>
 </body>
