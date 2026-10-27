@@ -226,6 +226,7 @@ class TikTokAdapter(PlatformAdapter):
                 peer_uid=str(c.get('peer_uid') or ''),
                 peer_nickname=prof.get('nickname') or '',
                 peer_unique=prof.get('unique_id') or '',
+                peer_avatar=prof.get('avatar') or '',
                 last_text=last.get('text') or '',
                 last_ms=int(last.get('ms') or 0),
                 unread=int(c.get('unread') or 0)))
