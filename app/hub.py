@@ -530,7 +530,14 @@ class Hub(_SyncHub):
 
     def _tiktok_conversations(self, name):
         self.sync_conversations(name)
-        return self.store.list_conversations(name)
+        rows = self.store.list_conversations(name)
+        # tiktokcdn 浏览器不可达（墙+TLS 指纹拒）：头像统一改走 hub 代理
+        # 缓存端点（h_avatar 下载并落盘）（10-27）
+        for r in rows:
+            if r.get('peer_uid'):
+                r['peer_avatar'] = ('/api/avatar?acct=%s&uid=%s'
+                                    % (name, r['peer_uid']))
+        return rows
 
     def _conv_other(self, plat, name):
         ad = self.adapter(plat)
