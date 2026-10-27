@@ -562,14 +562,17 @@ class Hub(_SyncHub):
             self.ensure_history(name, conv_id, conv['short_id'])
         stored = self.store.list_messages(name, conv_id, limit=limit,
                                           before_us=before_us)
-        cursor = None
         if len(stored) < limit:
             oldest = min((m['us'] for m in stored), default=before_us or None)
-            fetched, cursor = self.fetch_more(name, conv_id, conv['short_id'],
-                                              before_us=oldest, limit=limit)
+            fetched, _nc = self.fetch_more(name, conv_id, conv['short_id'],
+                                           before_us=oldest, limit=limit)
             self.store.save_messages(name, fetched)
             stored = self.store.list_messages(name, conv_id, limit=limit,
                                               before_us=before_us)
+        # 满页 → 返回本页最旧 us 作 next_cursor 驱动前端继续翻页（10-27 修复：
+        # 原逻辑 cursor 恒 None，前端以为到底——TikTok 历史消息翻不上去）
+        cursor = (min(int(m['us']) for m in stored)
+                  if len(stored) >= limit else None)
         # TikTok 私有媒体代理需要账号会话 cookie：附件的 /api/img URL 补 acct
         for m in stored:
             for a in (m.get('attachments') or []):
