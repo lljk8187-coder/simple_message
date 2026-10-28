@@ -200,7 +200,9 @@ class Hub:
 
     def sync_conversations(self, name):
         sess = self.sessions[name]
-        convs, meta = api.list_conversations(self.client, sess)
+        # max_pages=25（~250 会话）：接口是服务端有状态分页（10-28 实测，页间
+        # 零交集），单页只回 ~10 个会话——掉出第一页的老会话此前在 hub 永久不可见
+        convs, meta = api.list_conversations(self.client, sess, max_pages=25)
         self.store.save_conversations(name, convs)
 
         # The list payload carries each conversation's most recent message. Ingest

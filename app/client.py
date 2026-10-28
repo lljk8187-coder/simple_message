@@ -388,51 +388,74 @@ def parse_message(entry, my_uid):
     }
 
 
-def list_conversations(client, sess):
-    """cmd 203 / sub 10001 -> conversations + their latest messages."""
-    body = envelope(203, pb.vint(1, 0), sess)
-    _, raw, _ = client.post(IM_API + '/v2/message/get_by_user_init',
-                            headers=_proto_headers(sess), body=body)
-    payload, meta = unwrap(raw, 203)
-    if payload is None:
-        raise ApiError('conversation list: %s' % (meta.get('biz_msg') or 'no payload'),
-                       biz_code=meta.get('biz_code'))
+def list_conversations(client, sess, max_pages=1):
+    """cmd 203 / sub 10001 -> conversations + their latest messages.
 
-    newest = {}
-    for entry in pb.all_of(payload, 1):
-        m = parse_message(entry[3], sess.uid)
-        if not m or not m['conv_id']:
-            continue
-        cur = newest.get(m['conv_id'])
-        if cur is None or m['ms'] > cur['ms']:
-            newest[m['conv_id']] = m
+    分页机制（10-28 实测）：官方网页连发 N 次相同请求、服务端按会话有状态地
+    逐页返回（每页 ~10 会话，页间零交集，无 cursor 参数）——max_pages>1 时
+    顺序调用直到整页重复（已见过的 conv_id 集合），合并去重返回全部。
+    注意：分页状态在服务端会话上，必须串行调用；页 1 调用即重置游标。"""
+    all_convs = {}
+    seen_ids = set()
+    for page in range(max(1, max_pages)):
+        body = envelope(203, pb.vint(1, 0), sess)
+        _, raw, _ = client.post(IM_API + '/v2/message/get_by_user_init',
+                                headers=_proto_headers(sess), body=body)
+        payload, meta = unwrap(raw, 203)
+        if payload is None:
+            if page == 0:
+                raise ApiError('conversation list: %s' % (meta.get('biz_msg') or 'no payload'),
+                               biz_code=meta.get('biz_code'))
+            break
 
-    convs = []
-    for entry in pb.all_of(payload, 2):
-        it = pb.parse(entry[3])
-        conv_id = pb.text(pb.blob(it, 1)) or ''
-        short_id = pb.one(it, 2)
-        parts = []
-        holder = pb.blob(it, 6)
-        if holder:
-            for p in pb.all_of(pb.parse(holder), 1):
-                u = pb.one(pb.parse(p[3]), 1)
-                if u:
-                    parts.append(str(u))
-        convs.append({
-            'conv_id': conv_id,
-            'short_id': str(short_id) if short_id else '',
-            'peer_uid': peer_of(conv_id, sess.uid),
-            'participants': parts,
-            'updated_ms': int(pb.one(it, 13) or 0),
-            # server-side unread count (badge). Confirmed by diffing two snapshots
-            # around a single incoming message: 40 -> 41, exactly +1, on this and
-            # on v1/conversation/list (2006) which reports the identical value.
-            'unread': int(pb.one(it, 11) or 0),
-            'last': newest.get(conv_id),
-        })
-    convs.sort(key=lambda c: c['updated_ms'], reverse=True)
-    return convs, {'next_cursor': str(pb.one(payload, 3) or ''), 'meta': meta}
+        newest = {}
+        for entry in pb.all_of(payload, 1):
+            m = parse_message(entry[3], sess.uid)
+            if not m or not m['conv_id']:
+                continue
+            cur = newest.get(m['conv_id'])
+            if cur is None or m['ms'] > cur['ms']:
+                newest[m['conv_id']] = m
+
+        page_convs = []
+        for entry in pb.all_of(payload, 2):
+            it = pb.parse(entry[3])
+            conv_id = pb.text(pb.blob(it, 1)) or ''
+            short_id = pb.one(it, 2)
+            parts = []
+            holder = pb.blob(it, 6)
+            if holder:
+                for p in pb.all_of(pb.parse(holder), 1):
+                    u = pb.one(pb.parse(p[3]), 1)
+                    if u:
+                        parts.append(str(u))
+            page_convs.append({
+                'conv_id': conv_id,
+                'short_id': str(short_id) if short_id else '',
+                'peer_uid': peer_of(conv_id, sess.uid),
+                'participants': parts,
+                'updated_ms': int(pb.one(it, 13) or 0),
+                # server-side unread count (badge). Confirmed by diffing two snapshots
+                # around a single incoming message: 40 -> 41, exactly +1, on this and
+                # on v1/conversation/list (2006) which reports the identical value.
+                'unread': int(pb.one(it, 11) or 0),
+                'last': newest.get(conv_id),
+            })
+        # 整页都是已见会话 → 服务端游标已到底，停止翻页
+        page_ids = {c['conv_id'] for c in page_convs}
+        if page_convs and page_ids <= seen_ids:
+            break
+        seen_ids |= page_ids
+        for c in page_convs:
+            prev = all_convs.get(c['conv_id'])
+            if prev is None or c['updated_ms'] > prev['updated_ms']:
+                all_convs[c['conv_id']] = c
+        if not page_convs:
+            break
+
+    convs = sorted(all_convs.values(), key=lambda c: c['updated_ms'], reverse=True)
+    return convs, {'next_cursor': '', 'meta': meta,
+                   'pages': page + 1 if page_convs else page}
 
 
 def combo_poll(client, sess, cursor):
