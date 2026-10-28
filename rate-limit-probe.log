@@ -1,0 +1,20 @@
+2026-10-27T11:39:56+08:00 | probe-A-short | 6903147801267717125 | landed=false | ACK ok but dropped, tier=B
+2026-10-27T11:39:56+08:00 | probe-B-long | 7097794869580006446 | landed=false | ACK ok but dropped, tier=B
+2026-10-27T11:39:56+08:00 | both blocked
+2026-10-27T12:42:53+08:00 | probe-A-short | 6736022897729471493 | landed=false | tier=B ACK ok but dropped, both blocked
+2026-10-27T12:42:53+08:00 | probe-B-long  | 6983022203483194373 | landed=false | tier=B ACK ok but dropped, both blocked
+2026-10-27T12:42:53+08:00 | both blocked
+2026-10-27T12:42:53+08:00 | probe-A-short 累计 2 轮 <4，未降频；队列剩余 0（本轮已消耗 seq 39/40）
+2026-10-27T12:43:05+08:00 | 修正：队列实际剩余 14 条（非 0）
+2026-10-27T13:45:09+08:00 | probe-A-short | 7249099083475239982 | false | ACK ok but dropped tier=B
+2026-10-27T13:45:09+08:00 | probe-B-long | 7252378026347349019 | false | ACK ok but dropped tier=B
+2026-10-27T13:45:09+08:00 | both blocked
+2026-10-27T13:45:30+08:00 | 判定：第3轮 both blocked；probe-A 实际轮次=3（严格格式统计，<4），未降频；队列剩余 12 条
+2026-10-27T15:41:00+08:00 | probe-A-short | 6803023351599449093 | landed=false | ACK ok but dropped, landed=false, tier=B
+2026-10-27T15:41:00+08:00 | probe-B-long | 6984233418293658629 | landed=false | ACK ok but dropped, landed=false, tier=B
+2026-10-27T16:44:03+08:00 | probe-A-short | 6819661164714443781 | landed=false | tier=B ack ok but dropped
+2026-10-27T16:44:03+08:00 | probe-B-long | 7038404259943760901 | landed=false | tier=B ack ok but dropped
+2026-10-27T16:44:03+08:00 | both blocked
+2026-10-28T11:02:00+08:00 | RECOVERED-CONFIRMED | 官方网页 UI 冷发送（jakson→artistmikequinn）10:58 落地（hub 回读确认）
+2026-10-28T11:02:00+08:00 | 恢复窗口: 10-27 16:44（最后确认被拦）→ 10-28 10:58（确认落地）= ≤18.2h；与 24h 滚动窗口假设吻合（10-27 10:03-10:11 的 30 条 +24h 全部过期后配额释放）
+2026-10-28T11:02:00+08:00 | 失败信号线索: 官方长连接消息回声推送含 im_callback_status_code（成功=7192）——红色感叹号疑似该状态码的失败形态（待复现）
