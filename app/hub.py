@@ -652,12 +652,27 @@ class Hub(_SyncHub):
 
     # ------------------------------------------------------- 冷建联（纯协议）
 
+    @staticmethod
+    def _normalize_target(t):
+        """目标规范化：主页 URL → 用户名，剥 @。短链不处理。"""
+        t = str(t or '').strip()
+        if 'tiktok.com/' in t and '/@' in t:
+            handle = t.split('/@', 1)[1]
+            handle = handle.split('?', 1)[0].split('/', 1)[0].strip()
+            if handle:
+                t = handle
+        return t.lstrip('@').strip()
+
     def resolve_target_uid(self, name, target):
         """把"对象"统一成 uid：纯数字直接认，@username / username 走主页 SSR。
 
+        支持直接粘贴主页 URL（10-29）：https://www.tiktok.com/@xxx → xxx
+        （www/m 前缀、query 串、结尾斜杠均兼容）；短链 vm.tiktok.com 无法
+        静态解析，保持原样走失败路径报错。
+
         返回 (uid, error)。不抛异常——队列需要把失败原因写进审计而不是炸掉 worker。
         """
-        t = str(target or '').strip()
+        t = self._normalize_target(target)
         if not t:
             return '', 'target is empty'
         if t.isdigit():
@@ -677,6 +692,7 @@ class Hub(_SyncHub):
         prof = {}
         try:
             from . import client as api
+            target = self._normalize_target(target)
             if str(target or '').isdigit():
                 prof = (api.user_profiles(self.client, self.session(name), [uid])
                         or {}).get(str(uid)) or {}
