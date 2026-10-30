@@ -19,6 +19,7 @@ from . import harvest
 from . import login_browser
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'web')
+BOOT_MS = int(time.time() * 1000)   # 本次启动时间：注入前端 BUILD 戳，重启后旧 tab 自动强刷
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -207,7 +208,8 @@ class Handler(BaseHTTPRequestHandler):
     def h_index(self, q):
         path = os.path.join(WEB_DIR, 'index.html')
         with open(path, 'rb') as f:
-            self._send(200, f.read(), 'text/html; charset=utf-8')
+            body = f.read().replace(b'__BUILD__', str(BOOT_MS).encode())
+        self._send(200, body, 'text/html; charset=utf-8')
 
     def h_health(self, q):
         self._json({'ok': True, 'ts': int(time.time() * 1000),
@@ -673,11 +675,12 @@ class Handler(BaseHTTPRequestHandler):
     # ------------------------------------------------------- TikTok 弹窗登录
 
     def h_login_start(self, q):
-        """{platform} 缺省为 tiktok（兼容旧调用）。平台差异见适配器的
-        popup_login_spec()。"""
+        """{platform, name} 缺省 platform=tiktok（兼容旧调用）。name 为弹窗里
+        填的账号名：用于一账号一浏览器 profile（设备指纹隔离）。"""
         body = self._body()
         platform = (body.get('platform') or 'tiktok').strip()
-        started, state = self.login_flow.start(platform)
+        name_hint = (body.get('name') or '').strip()
+        started, state = self.login_flow.start(platform, name_hint)
         self._json({'started': started, 'state': state})
 
     def h_login_state(self, q):

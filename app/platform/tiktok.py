@@ -64,7 +64,7 @@ class TikTokAdapter(PlatformAdapter):
     display_name = 'TikTok'
     auth_kind = 'cookies'
     capabilities = (CAP_SEND, CAP_MARK_READ, CAP_REALTIME)
-    send_limits = {'min_interval_s': 8, 'daily_cap': 300}
+    send_limits = {'min_interval_s': 1, 'daily_cap': 300}
 
     def __init__(self, config=None):
         super().__init__(config)

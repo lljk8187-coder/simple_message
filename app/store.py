@@ -341,7 +341,8 @@ class Store:
             for sql in ('DELETE FROM accounts WHERE name=?',
                         'DELETE FROM conversations WHERE account=?',
                         'DELETE FROM messages WHERE account=?',
-                        'DELETE FROM profiles WHERE account=?'):
+                        'DELETE FROM profiles WHERE account=?',
+                        'DELETE FROM channel_identities WHERE account=?'):
                 self._db.execute(sql, (name,))
             self._db.commit()
 

@@ -399,6 +399,8 @@ class Hub(_SyncHub):
             last = {}
             seeded = False
             while True:
+                if not self.store.get_account(name):
+                    return          # 账号已删除——轮询线程自然收尾
                 try:
                     convs = sess.conversations()
                     incoming = []
@@ -441,6 +443,8 @@ class Hub(_SyncHub):
             last = {}
             seeded = False
             while True:
+                if not self.store.get_account(name):
+                    return          # 账号已删除——轮询线程自然收尾
                 try:
                     convs = self.conversations(name)
                     changed = False
@@ -480,6 +484,8 @@ class Hub(_SyncHub):
             last = {}
             seeded = False
             while True:
+                if not self.store.get_account(name):
+                    return          # 账号已删除——轮询线程自然收尾
                 try:
                     convs = sess.conversations()
                     changed = False
@@ -818,3 +824,4 @@ class Hub(_SyncHub):
                                        # 删除账号后会话信令继续刷（10-12 实测）
         self.detach(name)
         self.store.delete_account(name)
+        self.store.audit('system', 'account.delete', name, {'platform': plat})

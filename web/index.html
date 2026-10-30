@@ -150,6 +150,7 @@
   <span class="dot" id="statusDot" title="sync status"></span>
   <select id="acctSel" style="min-width:170px"><option value="">（无账号）</option></select>
   <button class="btn" id="btnSync">同步</button>
+  <button class="btn" id="btnDelAcct" title="删除当前选中的账号：清除其登录态、会话与本地消息（发送台账保留），不可恢复">删除账号</button>
   <span class="spacer"></span>
   <span style="font-size:12px;color:var(--fg3)" id="who"></span>
   <button class="btn" id="btnHarvest" title="从已登录的浏览器里取写入凭据">收割凭据</button>
@@ -431,6 +432,14 @@
 </div>
 
 <script>
+const BUILD = '__BUILD__';   // hub 启动时注入；变了说明服务端换过代码
+try {
+  if (localStorage.build !== BUILD) {
+    localStorage.build = BUILD;
+    location.reload();       // 旧 tab 自动强制刷新一次，杜绝旧 JS 驻留
+    throw new Error('stale');
+  }
+} catch (e) { if (e.message === 'stale') throw e; }
 const $ = s => document.querySelector(s);
 let ACCOUNTS = [], ACCT = null, CONVS = [], CUR = null, SEEN = new Set();
 let SEEN_BASE = {}, LOADING = false, ES = null, POLL = null, LAST_REQUESTED_US = null;
@@ -933,6 +942,21 @@ $('#btnSync').onclick = async () => {
   try { const d = await jpost(`/api/accounts/${encodeURIComponent(ACCT)}/sync`); toast('已同步 ' + (d.conversations||0) + ' 个会话'); }
   catch (e) { toast('同步失败：' + e.message, true); }
 };
+$('#btnDelAcct').onclick = async () => {
+  if (!ACCT) { toast('先在左侧下拉选择要删除的账号', true); return; }
+  const meta = ACCOUNTS.find(a => a.name === ACCT) || {};
+  if (!confirm(`删除账号 ${ACCT}（${meta.platform || '?'}）？\n\n`
+    + '将同时清除该账号的本地会话与消息记录，操作不可恢复。\n'
+    + '群发任务的台账记录会保留。')) return;
+  const btn = $('#btnDelAcct'); btn.disabled = true;
+  try {
+    await jdel(`/api/accounts/${encodeURIComponent(ACCT)}`);
+    toast('已删除 ' + ACCT);
+    ACCT = null; CONVS = []; CUR = null;
+    await loadAccounts();
+  } catch (e) { toast('删除失败：' + e.message, true); }
+  finally { btn.disabled = false; }
+};
 $('#btnAdd').onclick = () => {
   $('#modal').classList.add('show');
   $('#btnPopupLogin').disabled = false;
@@ -1252,6 +1276,12 @@ $('#btnBatchGo').onclick = async () => {
              + `，每批 ${batch} 条、批间隔 ${interval} 秒。\n`
              + '任务由服务端排队发送，可随时暂停或取消。继续？')) return;
   const btn = $('#btnBatchGo'); btn.disabled = true;
+  // 后端要给冷建联目标抓主页换 uid（并行 ~十几秒），先明说，别让人以为卡了
+  $('#batchOut').innerHTML = '<span class="hint">正在建立任务：'
+    + `${all.length} 个目标`
+    + (cold.length ? `（含 ${cold.length} 个冷建联对象，正在解析主页…约十几秒）` : '…')
+    + '</span>';
+  btn.textContent = '建立中…';
   try {
     const r = await jpost('/api/campaigns',
                           { text, targets: all, batch_size: batch,
@@ -1267,7 +1297,7 @@ $('#btnBatchGo').onclick = async () => {
   } catch (e) {
     $('#batchOut').textContent = '建立任务失败：' + e.message;
     toast('建立任务失败：' + e.message, true);
-  } finally { btn.disabled = false; }
+  } finally { btn.disabled = false; btn.textContent = '建立任务'; }
 };
 // 浏览器登录：平台差异由后端的 popup_login_spec 决定，这里只放文案与开关
 const POPUP_HINT = {
@@ -1308,7 +1338,8 @@ $('#btnPopupLogin').onclick = async () => {
   };
   btn.disabled = true;
   try {
-    const r = await jpost('/api/login/browser', { platform: plat });
+    const r = await jpost('/api/login/browser',
+                          { platform: plat, name: $('#fName').value.trim() });
     if (r.state && r.state.phase === 'error') {
       btn.disabled = false; show(r.state.detail, true); return;
     }

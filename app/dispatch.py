@@ -12,7 +12,7 @@
   1. **单 worker 串行**，跨账号也不并发 —— "同一文案 → 多个目标"本身就是各平台
      风控的经典特征，并发只会同时抬高频率与突发度。
   2. **限速取更保守者**：任务里把间隔设得再小也没用，平台申报的 `min_interval_s`
-     兜底（TikTok 8s / X 15s / IG 20s）。
+     兜底（TikTok 1s / X 15s / IG 20s）。
   3. **崩在"发送中"的项不自动重发**（标 `unknown` 留给人工）—— 同一个人收到两条
      一样的话，比漏一条更像机器人。
 
@@ -22,6 +22,7 @@
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 TICK_S = 1.0                                    # 空闲时的轮询间隔
 ALREADY_SENT_WINDOW_MS = 7 * 24 * 3600 * 1000   # 已发过滤窗口：7 天
@@ -83,27 +84,49 @@ class Dispatcher:
         if not targets:
             raise ValueError('targets are required')
 
-        items = []
-        for t in targets:
+        def _classify(t):
             if not isinstance(t, dict):
-                continue
+                return None
             account = (t.get('account') or '').strip()
             conv_id = (t.get('conv_id') or '').strip()
             cold_target = str(t.get('target') or t.get('uid')
                               or t.get('username') or '').strip()
             if not account or not (conv_id or cold_target):
-                continue
-            platform = self.hub.platform_of(account)
-            if conv_id:
-                peer_uid = self.hub.resolve_peer(platform, account, conv_id)
+                return None
+            return {'account': account, 'conv_id': conv_id,
+                    'cold_target': cold_target,
+                    'platform': self.hub.platform_of(account)}
+
+        plan = [c for c in map(_classify, targets) if c]
+
+        # 冷目标里 @handle/主页 URL 要抓一次主页换 uid（~1.5s/个），串行时
+        # 几十个目标要等上近一分钟——并行解析。只并行非数字目标（纯数字
+        # resolve 是本地秒回，不值得开线程）。HttpClient 是 urllib opener、
+        # Session 只读 cookie，8 路并发无共享写状态，安全。
+        cold = [c for c in plan if not c['conv_id']
+                and not c['cold_target'].lstrip('@').isdigit()]
+        if cold:
+            with ThreadPoolExecutor(max_workers=min(8, len(cold))) as ex:
+                futs = [ex.submit(self.hub.resolve_target_uid,
+                                  c['account'], c['cold_target'])
+                        for c in cold]
+                for i, f in enumerate(futs):
+                    uid, _err = f.result()
+                    if uid:
+                        cold[i]['peer_uid'] = uid
+
+        items = []
+        for c in plan:
+            if c['conv_id']:
+                peer_uid = self.hub.resolve_peer(c['platform'],
+                                                 c['account'], c['conv_id'])
             else:
-                # 冷建联：对象可能是 uid 或 @username。能解析就先解析，
-                # 解析不了也入队（排水时再试），失败原因会写进审计而不是消失。
-                peer_uid, _err = self.hub.resolve_target_uid(account, cold_target)
-                peer_uid = peer_uid or cold_target
-            items.append({'platform': platform, 'account': account,
-                          'conv_id': conv_id, 'peer_uid': peer_uid,
-                          'cold': not conv_id})
+                # 解析不了的也入队（排水时 send_cold 会再试一次），
+                # 失败原因会写进审计而不是消失。
+                peer_uid = c.get('peer_uid') or c['cold_target']
+            items.append({'platform': c['platform'], 'account': c['account'],
+                          'conv_id': c['conv_id'], 'peer_uid': peer_uid,
+                          'cold': not c['conv_id']})
         if not items:
             raise ValueError('targets are required')
 

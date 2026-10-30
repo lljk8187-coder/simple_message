@@ -74,7 +74,7 @@ class BrowserLogin:
         except Exception:
             return None
 
-    def start(self, platform='tiktok'):
+    def start(self, platform='tiktok', name_hint=''):
         spec = self.spec_for(platform)
         if not spec:
             self._set('error', '%s 不支持浏览器登录' % platform, platform)
@@ -85,7 +85,7 @@ class BrowserLogin:
                 return False, dict(self.state)
             self._cancel.clear()
         self._set('starting', 'launching chrome', platform)
-        threading.Thread(target=self._run, args=(platform, spec),
+        threading.Thread(target=self._run, args=(platform, spec, name_hint),
                          daemon=True).start()
         return True, self.get_state()
 
@@ -95,7 +95,7 @@ class BrowserLogin:
 
     # ----------------------------------------------------------- the flow
 
-    def _run(self, platform, spec):
+    def _run(self, platform, spec, name_hint=''):
         try:
             from playwright.sync_api import sync_playwright       # noqa: F401
         except ImportError:
@@ -118,7 +118,7 @@ class BrowserLogin:
             except Exception:
                 saved_policy = None
         try:
-            self._collect(platform, spec)
+            self._collect(platform, spec, name_hint)
         except Exception as e:
             # 带调用栈：这条链路穿过 playwright 与三个平台库，只报类名无法定位
             #（曾出现消息为空的 NotImplementedError，无法判断是谁抛的）。
@@ -140,7 +140,14 @@ class BrowserLogin:
     def _collect(self, platform, spec):
         from playwright.sync_api import sync_playwright
 
-        profile_dir = os.path.join(self.profile_root, platform)
+        # 一号一档：弹窗里填了账号名就用 <platform>-<名字> 作独立 profile，
+        # 让每个号的浏览器指纹/Cookie 历史彻底隔离（服务端按设备节点做账号
+        # 关联，共用 profile = 多号连坐）。重登同一账号时复用同一档，保持
+        # 环境连续性。没填名字则退回旧行为（<platform> 共档）。
+        safe = ''.join(c for c in (name_hint or '').strip()
+                       if c.isalnum() or c in '-_')[:40]
+        profile_dir = os.path.join(
+            self.profile_root, platform + ('-' + safe if safe else ''))
         os.makedirs(profile_dir, exist_ok=True)
         self._set('starting', 'launching chrome', platform)
         with sync_playwright() as p:
