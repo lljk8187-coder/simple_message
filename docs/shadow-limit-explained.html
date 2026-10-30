@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TikTok 影子限流 · 图解</title>
+<style>
+  :root{
+    --bg:#f6f7f9; --card:#ffffff; --ink:#1f2937; --ink2:#6b7280;
+    --green:#16a34a; --red:#dc2626; --amber:#d97706; --blue:#2563eb;
+    --line:#e5e7eb;
+  }
+  *{box-sizing:border-box; margin:0; padding:0;}
+  body{font-family:"Microsoft YaHei","PingFang SC",sans-serif; background:var(--bg); color:var(--ink); padding:32px 16px; line-height:1.6;}
+  .wrap{max-width:980px; margin:0 auto;}
+  h1{font-size:26px; margin-bottom:6px;}
+  .sub{color:var(--ink2); font-size:14px; margin-bottom:28px;}
+  h2{font-size:20px; margin:36px 0 6px; padding-left:10px; border-left:4px solid var(--blue);}
+  .desc{color:var(--ink2); font-size:14px; margin-bottom:14px;}
+  .card{background:var(--card); border:1px solid var(--line); border-radius:12px; padding:22px; margin-bottom:20px; box-shadow:0 1px 3px rgba(0,0,0,.04);}
+
+  /* 消息旅程 */
+  .journey{display:flex; align-items:stretch; gap:0; flex-wrap:wrap;}
+  .stop{flex:1; min-width:130px; text-align:center; padding:14px 8px; position:relative;}
+  .stop .ico{font-size:30px;}
+  .stop .t{font-weight:bold; font-size:14px; margin-top:4px;}
+  .stop .d{font-size:12px; color:var(--ink2); margin-top:2px;}
+  .arrow{display:flex; align-items:center; font-size:20px; color:#9ca3af; padding-top:22px;}
+  .ok{color:var(--green);} .bad{color:var(--red);}
+
+  /* 信用账户对比 */
+  .accounts{display:flex; gap:18px; flex-wrap:wrap;}
+  .acct{flex:1; min-width:280px; border-radius:12px; padding:20px; color:#fff;}
+  .acct.old{background:linear-gradient(135deg,#16a34a,#15803d);}
+  .acct.new{background:linear-gradient(135deg,#dc2626,#b91c1c);}
+  .acct h3{font-size:17px; margin-bottom:8px;}
+  .acct .balance{font-size:34px; font-weight:800; margin:6px 0;}
+  .acct ul{list-style:none; font-size:13px;}
+  .acct li{padding:3px 0; border-top:1px solid rgba(255,255,255,.25);}
+  .verdict{margin-top:12px; background:rgba(255,255,255,.18); border-radius:8px; padding:8px 12px; font-size:13px; font-weight:bold;}
+
+  /* 状态机 */
+  .states{display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px;}
+  .state{flex:1; min-width:150px; border-radius:10px; padding:14px; text-align:center; border:2px solid;}
+  .state .name{font-weight:800; font-size:16px;}
+  .state .exp{font-size:12px; margin-top:4px; color:var(--ink2);}
+  .s-ok{border-color:var(--green); background:#f0fdf4;}
+  .s-shadow{border-color:var(--amber); background:#fffbeb;}
+  .s-ban{border-color:var(--red); background:#fef2f2;}
+  .flow-arrow{font-size:18px; color:#9ca3af; text-align:center;}
+  .loopback{font-size:12px; color:var(--green); text-align:center; margin-top:10px; font-weight:bold;}
+
+  /* 表格 */
+  table{width:100%; border-collapse:collapse; font-size:13px;}
+  th,td{padding:8px 10px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top;}
+  th{background:#f3f4f6; font-size:12px; color:var(--ink2);}
+  .pill{display:inline-block; padding:2px 10px; border-radius:99px; font-size:12px; font-weight:bold;}
+  .p-ok{background:#dcfce7; color:var(--green);}
+  .p-no{background:#fee2e2; color:var(--red);}
+
+  /* 养号路线 */
+  .steps{counter-reset:step;}
+  .step{display:flex; gap:14px; padding:10px 0; border-bottom:1px dashed var(--line); align-items:flex-start;}
+  .step:last-child{border-bottom:none;}
+  .num{counter-increment:step; flex-shrink:0; width:30px; height:30px; border-radius:50%; background:var(--blue); color:#fff; font-weight:bold; display:flex; align-items:center; justify-content:center;}
+  .num::before{content:counter(step);}
+  .step .b{font-size:14px;}
+  .step .b small{display:block; color:var(--ink2); font-size:12px;}
+  .foot{margin-top:30px; font-size:12px; color:var(--ink2); text-align:center;}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>TikTok 为什么"吞"了你的消息？</h1>
+  <div class="sub">2026-10-30 对照实验图解 · 一条消息从发出到落地，到底经历了什么</div>
+
+  <!-- 1 消息旅程 -->
+  <h2>① 一条消息的生命旅程</h2>
+  <div class="desc">你点"发送"之后，消息其实走了 4 站。前 3 站都成功，死在第 4 站——而它死的时候，你的界面上看不到任何提示。</div>
+  <div class="card">
+    <div class="journey">
+      <div class="stop"><div class="ico">📤</div><div class="t">第1站 · 发送</div><div class="d">消息打包，带上<br>"工牌"（签名）</div></div>
+      <div class="arrow">→</div>
+      <div class="stop"><div class="ico">🛂</div><div class="t">第2站 · 网关验签</div><div class="d">检查工牌真假<br>（只查真伪，不看内容）</div></div>
+      <div class="arrow">→</div>
+      <div class="stop"><div class="ico">✅</div><div class="t">第3站 · ACK 回执</div><div class="d">服务器说"收到了"<br><span class="ok">这就是 ACK ok</span></div></div>
+      <div class="arrow">→</div>
+      <div class="stop"><div class="ico">⚖️</div><div class="t">第4站 · 风控审判</div><div class="d">查"信用账户"余额<br><span class="bad">余额不足 → 静默丢掉</span></div></div>
+    </div>
+    <div style="margin-top:14px; padding:10px 14px; background:#fef2f2; border-radius:8px; font-size:13px;">
+      💡 <b>为什么叫"影子"限流：</b>第 3 站和第 4 站之间没有任何反馈。消息被吞 = 像被影子吃掉，客户端一切正常，只有过 12 秒"回读"检查才发现没送到。
+    </div>
+  </div>
+
+  <!-- 2 信用账户 -->
+  <h2>② 关键发现：每个设备有一本"信用存折"</h2>
+  <div class="desc">服务端不看你"是不是好人"，只看你这本存折里攒了多少使用历史。存折 = ttwid（设备标识），开户时间越长、正常使用越多，余额越高。</div>
+  <div class="accounts">
+    <div class="acct old">
+      <h3>💰 obb815（老号）</h3>
+      <div class="balance">余额充足</div>
+      <ul>
+        <li>存折年龄：<b>33 天</b>，天天在用</li>
+        <li>签名档位：tier B（长期工牌）</li>
+        <li>出口 IP：Vortex（和 gb 一样）</li>
+        <li>发的文案：和 gb <b>一字不差</b></li>
+      </ul>
+      <div class="verdict">✅ 同样的消息 → 成功落地（18:10 实测）</div>
+    </div>
+    <div class="acct new">
+      <h3>🆕 gb_innerchild（新号）</h3>
+      <div class="balance">余额 0</div>
+      <ul>
+        <li>存折年龄：<b>今天开户</b>，零使用历史</li>
+        <li>签名档位：tier B（今天刚领的工牌）</li>
+        <li>出口 IP：Vortex（和 obb 一样）</li>
+        <li>发的文案：和 obb <b>一字不差</b></li>
+      </ul>
+      <div class="verdict">❌ 同样的消息 → 3 条全被静默吞掉</div>
+    </div>
+  </div>
+  <div class="desc" style="margin-top:12px;">两个号<b style="color:var(--ink)">唯一的区别</b>就是存折的年龄。IP 一样、签名一样、文案一样——所以锁定：平台按"设备使用历史"打分，新存折余额为零，"给陌生人发第一条消息"这种最高危操作直接全额拒绝。</div>
+
+  <!-- 3 实验表 -->
+  <h2>③ 今天 7 组实验怎么排除其他嫌疑的</h2>
+  <div class="card">
+    <table>
+      <tr><th>我们试了什么</th><th>想验证的嫌疑</th><th>结果</th><th>结论</th></tr>
+      <tr><td>补上缺的 msToken</td><td>是不是少了凭证？</td><td><span class="pill p-no">仍被吞</span></td><td>不是凭证缺失</td></tr>
+      <tr><td>修正 cookie 转义错字</td><td>是不是格式坏了？</td><td><span class="pill p-no">仍被吞</span></td><td>不是格式问题</td></tr>
+      <tr><td>jakson 的设备标识 + gb 的账号</td><td>设备和账号必须配套？</td><td><span class="pill p-ok">握手通过</span></td><td>不硬绑定，看设备自己的历史</td></tr>
+      <tr><td>换成登录浏览器的原生 UA</td><td>是不是浏览器指纹对不上？</td><td><span class="pill p-no">仍被吞</span></td><td>不是 UA 问题</td></tr>
+      <tr><td>从同一 IP 现签一个全新设备标识</td><td>是不是 IP 变了？</td><td><span class="pill p-no">仍被吞</span></td><td>新开户零余额照样不行</td></tr>
+      <tr><td>obb815 冷发同文案</td><td>终极对照</td><td><span class="pill p-ok">成功落地</span></td><td><b>就是存折年龄</b></td></tr>
+    </table>
+  </div>
+
+  <!-- 4 状态机 -->
+  <h2>④ 账号的几种"体检状态"</h2>
+  <div class="card">
+    <div class="states">
+      <div class="state s-ok"><div class="name">😎 正常</div><div class="exp">每天有约 30 条<br>"陌生人消息"预算</div></div>
+      <div class="flow-arrow">→<br>预算花完</div>
+      <div class="state s-shadow"><div class="name">🫥 影子限流</div><div class="exp">消息静默被吞<br>无任何提示</div></div>
+      <div class="flow-arrow">→<br>持续作死</div>
+      <div class="state s-ban"><div class="name">⛔ 封禁</div><div class="exp">彻底结束</div></div>
+    </div>
+    <div class="loopback">⬆ 影子状态是可逆的：实测约 18 小时自动回血，恢复正常预算</div>
+    <div style="margin-top:14px; padding:10px 14px; background:#eff6ff; border-radius:8px; font-size:13px;">
+      💡 把"预算"想成话费：jakson 账上有 33 天余额，每天 30 条是"日套餐"；gb 是新办的卡、余额为零，第一条就欠费——但<b>欠费不是销户</b>，正常使用会一点点充值回来。
+    </div>
+  </div>
+
+  <!-- 5 养号 -->
+  <h2>⑤ gb_innerchild 的"充值"路线</h2>
+  <div class="card steps">
+    <div class="step"><div class="num"></div><div class="b">今天：只养不发<small>刷刷视频、看看主页，让账号产生"正常人类"的行为记录</small></div></div>
+    <div class="step"><div class="num"></div><div class="b">明天：试水温<small>给 1 个陌生人单发 1 条，过 12 秒看是否落地</small></div></div>
+    <div class="step"><div class="num"></div><div class="b">后天：小步放量<small>落地正常 → 2 条 → 5 条 → 10 条，每次加量前确认上一批都到了</small></div></div>
+    <div class="step"><div class="num"></div><div class="b">任何时候：落地失败就回退<small>不落地 = 余额不足，立即停手等回血，反复重试只会让画像更差</small></div></div>
+  </div>
+
+  <div class="foot">simple-message · 影子限流研究图解 · 数据来自 2026-09-30 ~ 10-30 的对照实验与回读验证</div>
+</div>
+</body>
+</html>
